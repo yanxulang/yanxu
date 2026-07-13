@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPOSITORY="${YANXU_REPOSITORY:-YanXuLang/language}"
+REPOSITORY="${YANXU_REPOSITORY:-YanXuLang/yanxu}"
 VERSION="${YANXU_VERSION:-latest}"
 INSTALL_DIR="${YANXU_INSTALL_DIR:-$HOME/.local/bin}"
 

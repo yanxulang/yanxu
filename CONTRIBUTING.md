@@ -24,7 +24,7 @@ cargo clippy --all-targets -- -D warnings
 cargo run -- examples/初见.yx
 ```
 
-文档、官网和编辑器扩展分别维护在 `YanXuLang/docs`、`YanXuLang/website` 与 `YanXuLang/vscode`。跨项目改动请在对应仓库分别提交，并在总控仓库更新 Submodule 指针。
+文档、官网和编辑器扩展分别维护在 `YanXuLang/docs`、`YanXuLang/website` 与 `YanXuLang/vscode-extension`。跨项目改动请在对应仓库分别提交。
 
 ## 提交约定
 

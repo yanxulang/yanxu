@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Repository = if ($env:YANXU_REPOSITORY) { $env:YANXU_REPOSITORY } else { "YanXuLang/language" }
+$Repository = if ($env:YANXU_REPOSITORY) { $env:YANXU_REPOSITORY } else { "YanXuLang/yanxu" }
 $Version = if ($env:YANXU_VERSION) { $env:YANXU_VERSION } else { "latest" }
 $InstallDir = if ($env:YANXU_INSTALL_DIR) { $env:YANXU_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\Yanxu\bin" }
 
