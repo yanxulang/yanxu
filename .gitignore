@@ -1,0 +1,10 @@
+/target/
+*.yx~
+.DS_Store
+.idea/
+.vscode/
+*.vsix
+node_modules/
+npm-debug.log*
+coverage/
+dist/

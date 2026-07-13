@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: 准备 Rust 工具链
+        run: rustup component add rustfmt clippy
+      - name: 检查格式
+        run: cargo fmt --check
+      - name: 运行测试
+        run: cargo test --all-targets --locked
+      - name: 运行 Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  installer:
+    name: 安装器静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sh -n scripts/install.sh
+      - shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install.ps1), [ref]$null, [ref]$errors
+          )
+          if ($errors.Count) { $errors | Format-List; exit 1 }

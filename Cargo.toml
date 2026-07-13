@@ -1,0 +1,32 @@
+[package]
+name = "yanxu"
+version = "0.3.0-alpha.1"
+edition = "2024"
+description = "言序：以 Rust 编写的文言风格解释型编程语言"
+license = "MIT"
+repository = "https://github.com/YanXuLang/language"
+homepage = "https://yanxulang.github.io/website/"
+documentation = "https://yanxulang.github.io/docs/"
+readme = "README.md"
+keywords = ["language", "interpreter", "chinese", "programming-language"]
+categories = ["compilers", "command-line-utilities"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/examples/**",
+]
+
+[lib]
+name = "yanxu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yanxu"
+path = "src/main.rs"
+
+[dependencies]
