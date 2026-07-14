@@ -16,6 +16,16 @@ use url::Url;
 pub const API_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const BYTES_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
 pub const SECURE_RANDOM_MAX_BYTES: usize = 1024 * 1024;
+pub const PROCESS_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+pub const PROCESS_MAX_TIMEOUT_MILLIS: u64 = 300_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOutput {
+    pub status: i32,
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
 
 pub fn api_manifest() -> Result<serde_json::Value, serde_json::Error> {
     serde_json::from_str(include_str!("../stdlib/api-v1.json"))
@@ -32,6 +42,99 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 #[cfg(not(target_family = "wasm"))]
 use std::time::{Duration, Instant};
+
+#[cfg(not(target_family = "wasm"))]
+pub fn process_run(
+    program: &str,
+    arguments: &[String],
+    directory: Option<&str>,
+    timeout_millis: u64,
+) -> Result<ProcessOutput, String> {
+    use std::process::{Command, Stdio};
+    if program.trim().is_empty() {
+        return Err("PROCESS_PROGRAM：程序名不可为空".into());
+    }
+    if !(1..=PROCESS_MAX_TIMEOUT_MILLIS).contains(&timeout_millis) {
+        return Err(format!(
+            "PROCESS_TIMEOUT：超时须在 1..={PROCESS_MAX_TIMEOUT_MILLIS} 毫秒之间"
+        ));
+    }
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("PROCESS_SPAWN：不能启动“{program}”：{error}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout_reader = thread::spawn(move || read_process_output(stdout));
+    let stderr_reader = thread::spawn(move || read_process_output(stderr));
+    let deadline = Instant::now() + Duration::from_millis(timeout_millis);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("PROCESS_WAIT：等候子进程失败：{error}"))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("PROCESS_TIMEOUT：子进程超过 {timeout_millis} 毫秒"));
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "PROCESS_READ：读取标准输出的线程异常".to_owned())??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "PROCESS_READ：读取标准错误的线程异常".to_owned())??;
+    Ok(ProcessOutput {
+        status: status.code().unwrap_or(-1),
+        success: status.success(),
+        stdout: String::from_utf8(stdout)
+            .map_err(|_| "PROCESS_UTF8：标准输出不是 UTF-8 文字".to_owned())?,
+        stderr: String::from_utf8(stderr)
+            .map_err(|_| "PROCESS_UTF8：标准错误不是 UTF-8 文字".to_owned())?,
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn read_process_output(mut reader: impl Read) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let length = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("PROCESS_READ：读取子进程输出失败：{error}"))?;
+        if length == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len().saturating_add(length) > PROCESS_MAX_OUTPUT_BYTES {
+            return Err(format!(
+                "PROCESS_LIMIT：单个输出流不得超过 {PROCESS_MAX_OUTPUT_BYTES} 字节"
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..length]);
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub fn process_run(
+    _program: &str,
+    _arguments: &[String],
+    _directory: Option<&str>,
+    _timeout_millis: u64,
+) -> Result<ProcessOutput, String> {
+    Err("PROCESS_UNSUPPORTED：WASI 不支持启动宿主进程".into())
+}
 
 pub fn path_join(left: &str, right: &str) -> String {
     Path::new(left).join(right).to_string_lossy().into_owned()
@@ -105,6 +208,29 @@ pub fn path_normalize(path: &str) -> String {
     } else {
         normalized.to_string_lossy().into_owned()
     }
+}
+
+pub fn create_directory(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("不能创建目录“{}”：{error}", path.display()))
+}
+
+pub fn remove_path(path: &Path, recursive: bool) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("不能取得“{}”状态：{error}", path.display()))?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return std::fs::remove_file(path)
+            .map_err(|error| format!("不能删除文卷“{}”：{error}", path.display()));
+    }
+    if metadata.is_dir() {
+        return if recursive {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_dir(path)
+        }
+        .map_err(|error| format!("不能删除目录“{}”：{error}", path.display()));
+    }
+    Err(format!("不可删除特殊文件“{}”", path.display()))
 }
 
 pub fn sha256(text: &str) -> String {
@@ -3031,7 +3157,7 @@ mod tests {
         let manifest = api_manifest().unwrap();
         assert_eq!(manifest["schema_version"], API_MANIFEST_SCHEMA_VERSION);
         let modules = manifest["modules"].as_array().unwrap();
-        assert_eq!(modules.len(), 23);
+        assert_eq!(modules.len(), 25);
         let socket_module = modules
             .iter()
             .find(|module| module["name"] == "套接字")

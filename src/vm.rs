@@ -441,6 +441,8 @@ enum StandardNative {
     FileStatus,
     PathExists,
     ReadDirectory,
+    CreateDirectory,
+    RemovePath,
     JsonParse,
     JsonStringify,
     HttpGet,
@@ -480,6 +482,10 @@ enum StandardNative {
     Os,
     Arch,
     Arguments,
+    ProcessRun,
+    ResourceReadBytes,
+    ResourceReadText,
+    ResourceList,
     Sha256,
     HmacSha256,
     ConstantTimeEqual,
@@ -585,6 +591,10 @@ pub struct Vm {
     module_cache: HashMap<PathBuf, Rc<VmModule>>,
     bytecode_cache: HashMap<PathBuf, CachedChunk>,
     loading_modules: Vec<PathBuf>,
+    application_modules: HashMap<String, Rc<crate::application::ApplicationModule>>,
+    application_module_cache: HashMap<String, Rc<VmModule>>,
+    loading_application_modules: Vec<String>,
+    application_resources: Option<Rc<std::collections::BTreeMap<String, Vec<u8>>>>,
     package_root: Option<PathBuf>,
     package_module_roots: Vec<PathBuf>,
     permissions: crate::permissions::PermissionSet,
@@ -642,6 +652,10 @@ impl Vm {
             module_cache: HashMap::new(),
             bytecode_cache: HashMap::new(),
             loading_modules: Vec::new(),
+            application_modules: HashMap::new(),
+            application_module_cache: HashMap::new(),
+            loading_application_modules: Vec::new(),
+            application_resources: None,
             package_root: None,
             package_module_roots: Vec::new(),
             permissions: crate::permissions::PermissionSet::unrestricted(),
@@ -742,6 +756,51 @@ impl Vm {
         );
         self.package_root = previous_package_root;
         self.package_module_roots = previous_package_module_roots;
+        result
+    }
+
+    pub fn execute_application(
+        &mut self,
+        archive: &crate::application::ApplicationArchive,
+    ) -> Result<VmValue, VmError> {
+        crate::application::serialize(archive)
+            .map_err(|runtime_error| error(&Span::synthetic(), runtime_error.to_string()))?;
+        let entry = archive
+            .modules
+            .get(&archive.entry_module)
+            .ok_or_else(|| error(&Span::synthetic(), "YXB 应用缺少入口模块"))?;
+        let resources = crate::application::decode_resources(archive)
+            .map_err(|runtime_error| error(&Span::synthetic(), runtime_error.to_string()))?;
+        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let previous_permissions = std::mem::replace(
+            &mut self.permissions,
+            archive.permissions.to_permissions(&directory),
+        );
+        let previous_modules = std::mem::replace(
+            &mut self.application_modules,
+            archive
+                .modules
+                .iter()
+                .map(|(id, module)| (id.clone(), Rc::new(module.clone())))
+                .collect(),
+        );
+        let previous_cache = std::mem::take(&mut self.application_module_cache);
+        let previous_loading = std::mem::take(&mut self.loading_application_modules);
+        let previous_resources = self.application_resources.replace(resources);
+        self.resources.reset();
+        let result = self.run_chunk(
+            Rc::new(entry.chunk.clone()),
+            self.globals.clone(),
+            format!("应用“{}”", archive.package.name),
+            Span::synthetic(),
+            directory,
+            None,
+        );
+        self.permissions = previous_permissions;
+        self.application_modules = previous_modules;
+        self.application_module_cache = previous_cache;
+        self.loading_application_modules = previous_loading;
+        self.application_resources = previous_resources;
         result
     }
 
@@ -2350,6 +2409,25 @@ impl Vm {
                 entries.sort_by(compare_values_for_sort);
                 Ok(VmValue::List(Rc::new(RefCell::new(entries))))
             }
+            Std::CreateDirectory => {
+                let path = vm_string(&arguments[0], "文件.创建目录", span)?;
+                self.permissions
+                    .check_file(path)
+                    .map_err(|permission| error(span, permission.to_string()))?;
+                crate::stdlib::create_directory(Path::new(path))
+                    .map(|()| VmValue::Nil)
+                    .map_err(|message| error(span, message))
+            }
+            Std::RemovePath => {
+                let path = vm_string(&arguments[0], "文件.删除", span)?;
+                let recursive = vm_bool(&arguments[1], "文件.删除", span)?;
+                self.permissions
+                    .check_file(path)
+                    .map_err(|permission| error(span, permission.to_string()))?;
+                crate::stdlib::remove_path(Path::new(path), recursive)
+                    .map(|()| VmValue::Nil)
+                    .map_err(|message| error(span, message))
+            }
             Std::JsonParse => {
                 let json = serde_json::from_str(vm_string(&arguments[0], "JSON.解析", span)?)
                     .map_err(|runtime_error| {
@@ -2730,6 +2808,93 @@ impl Vm {
                     .map(VmValue::String)
                     .collect(),
             )))),
+            Std::ProcessRun => {
+                self.permissions
+                    .check_process()
+                    .map_err(|permission| error(span, permission.to_string()))?;
+                let program = vm_string(&arguments[0], "进程.执行", span)?;
+                let process_arguments = vm_string_sequence(&arguments[1], "进程.执行", span)?;
+                let directory = match &arguments[2] {
+                    VmValue::Nil => None,
+                    VmValue::String(directory) => Some(directory.as_str()),
+                    value => {
+                        return Err(error(
+                            span,
+                            format!("“进程.执行”第三参数须为文或空，不可为{}", value.type_name()),
+                        ));
+                    }
+                };
+                let timeout = vm_nonnegative_safe_u64(&arguments[3], "进程.执行", span)?;
+                let output =
+                    crate::stdlib::process_run(program, &process_arguments, directory, timeout)
+                        .map_err(|message| error(span, message))?;
+                Ok(vm_string_key_map(vec![
+                    ("状态", VmValue::Number(f64::from(output.status))),
+                    ("成功", VmValue::Bool(output.success)),
+                    ("标准输出", VmValue::String(output.stdout)),
+                    ("标准错误", VmValue::String(output.stderr)),
+                ]))
+            }
+            Std::ResourceReadBytes | Std::ResourceReadText => {
+                let requested = vm_string(&arguments[0], "资源.读取", span)?;
+                let bytes = if let Some(resources) = &self.application_resources {
+                    let key = crate::application::normalize_resource_key(requested)
+                        .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+                    resources
+                        .get(&key)
+                        .cloned()
+                        .ok_or_else(|| error(span, format!("YXB 中没有资源“{requested}”")))?
+                } else {
+                    let path = crate::application::resolve_declared_resource(
+                        self.package_root.as_deref(),
+                        requested,
+                    )
+                    .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+                    crate::stdlib::read_file_bytes(&path)
+                        .map_err(|runtime_error| error(span, format!("{runtime_error:?}")))?
+                };
+                if matches!(function, Std::ResourceReadBytes) {
+                    Ok(VmValue::Bytes(Rc::new(bytes)))
+                } else {
+                    String::from_utf8(bytes)
+                        .map(VmValue::String)
+                        .map_err(|_| error(span, "资源不是 UTF-8 文字"))
+                }
+            }
+            Std::ResourceList => {
+                let requested = vm_string(&arguments[0], "资源.目录", span)?;
+                let mut names: Vec<String> = if let Some(resources) = &self.application_resources {
+                    let key = crate::application::normalize_resource_key(requested)
+                        .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+                    let prefix = format!("{}/", key.trim_end_matches('/'));
+                    resources
+                        .keys()
+                        .filter_map(|path| {
+                            path.strip_prefix(&prefix)
+                                .and_then(|rest| rest.split('/').next())
+                                .map(str::to_owned)
+                        })
+                        .collect()
+                } else {
+                    let path = crate::application::resolve_declared_resource(
+                        self.package_root.as_deref(),
+                        requested,
+                    )
+                    .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+                    fs::read_dir(path)
+                        .map_err(|runtime_error| error(span, runtime_error.to_string()))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|runtime_error| error(span, runtime_error.to_string()))?
+                        .into_iter()
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .collect()
+                };
+                names.sort();
+                names.dedup();
+                Ok(VmValue::List(Rc::new(RefCell::new(
+                    names.into_iter().map(VmValue::String).collect(),
+                ))))
+            }
             Std::Sha256 => Ok(VmValue::String(crate::stdlib::sha256(vm_string(
                 &arguments[0],
                 "SHA256",
@@ -2997,6 +3162,9 @@ impl Vm {
         if let Some(name) = requested.strip_prefix("标准:") {
             return self.standard_module(name, span);
         }
+        if let Some(id) = requested.strip_prefix("归档:") {
+            return self.load_application_module(id, directory, span);
+        }
         let joined = if let Some(name) = requested.strip_prefix("包:") {
             let dependency = crate::package::resolve_dependency_scoped(
                 self.package_root.as_deref(),
@@ -3105,6 +3273,63 @@ impl Vm {
         Ok(module)
     }
 
+    fn load_application_module(
+        &mut self,
+        id: &str,
+        directory: &Path,
+        span: &Span,
+    ) -> Result<Rc<VmModule>, VmError> {
+        if let Some(module) = self.application_module_cache.get(id) {
+            self.cache_stats.module_hits += 1;
+            return Ok(module.clone());
+        }
+        if let Some(start) = self
+            .loading_application_modules
+            .iter()
+            .position(|loading| loading == id)
+        {
+            let mut chain = self.loading_application_modules[start..].to_vec();
+            chain.push(id.to_owned());
+            return Err(error(
+                span,
+                format!("归档模块循环相引：{}", chain.join(" → ")),
+            ));
+        }
+        let application_module = self
+            .application_modules
+            .get(id)
+            .cloned()
+            .ok_or_else(|| error(span, format!("YXB 未包含归档模块“{id}”")))?;
+        self.loading_application_modules.push(id.to_owned());
+        self.cache_stats.module_misses += 1;
+        let environment = self.child_env(self.globals.clone());
+        let execution = self.run_chunk(
+            Rc::new(application_module.chunk.clone()),
+            environment.clone(),
+            format!("归档模块“{}”", application_module.display_path),
+            span.clone(),
+            directory.to_path_buf(),
+            None,
+        );
+        self.loading_application_modules.pop();
+        execution?;
+        let name = application_module
+            .display_path
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.strip_suffix(".yx"))
+            .unwrap_or("无名")
+            .to_owned();
+        let module = Rc::new(VmModule {
+            name,
+            environment,
+            exports: application_module.chunk.exports.iter().cloned().collect(),
+        });
+        self.application_module_cache
+            .insert(id.to_owned(), module.clone());
+        Ok(module)
+    }
+
     fn standard_module(&mut self, name: &str, span: &Span) -> Result<Rc<VmModule>, VmError> {
         let environment = self.child_env(self.globals.clone());
         let definitions: &[(&str, usize, NativeKind)] = match name {
@@ -3192,6 +3417,12 @@ impl Vm {
                     1,
                     NativeKind::Standard(StandardNative::ReadDirectory),
                 ),
+                (
+                    "创建目录",
+                    1,
+                    NativeKind::Standard(StandardNative::CreateDirectory),
+                ),
+                ("删除", 2, NativeKind::Standard(StandardNative::RemovePath)),
             ],
             "JSON" | "json" => &[
                 ("解析", 1, NativeKind::Standard(StandardNative::JsonParse)),
@@ -3339,6 +3570,24 @@ impl Vm {
                 ("系统", 0, NativeKind::Standard(StandardNative::Os)),
                 ("架构", 0, NativeKind::Standard(StandardNative::Arch)),
                 ("参数", 0, NativeKind::Standard(StandardNative::Arguments)),
+            ],
+            "进程" => &[("执行", 4, NativeKind::Standard(StandardNative::ProcessRun))],
+            "资源" => &[
+                (
+                    "读取字节",
+                    1,
+                    NativeKind::Standard(StandardNative::ResourceReadBytes),
+                ),
+                (
+                    "读取文字",
+                    1,
+                    NativeKind::Standard(StandardNative::ResourceReadText),
+                ),
+                (
+                    "目录",
+                    1,
+                    NativeKind::Standard(StandardNative::ResourceList),
+                ),
             ],
             "哈希" => &[
                 ("SHA256", 1, NativeKind::Standard(StandardNative::Sha256)),

@@ -9,6 +9,34 @@ use yanxu::{parse, parse_named, repl, run_file_with};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if let Ok(executable) = env::current_exe() {
+        match yanxu::application::read_embedded(&executable) {
+            Ok(Some(archive)) => return run_archive(&archive, &args),
+            Ok(None) => {}
+            Err(error) => return fail(error.to_string()),
+        }
+    }
+    if args
+        .first()
+        .is_some_and(|command| command == "编" || command == "compile")
+    {
+        return compile_command(&args[1..]);
+    }
+    if args
+        .first()
+        .is_some_and(|command| command == "行" || command == "run")
+    {
+        return application_run_command(&args[1..]);
+    }
+    if args
+        .first()
+        .is_some_and(|command| command == "包" || command == "package")
+        && args
+            .get(1)
+            .is_some_and(|action| action == "协议" || action == "protocol")
+    {
+        return package_protocol_command(&args[2..]);
+    }
     if args
         .first()
         .is_some_and(|command| command == "试" || command == "test")
@@ -31,9 +59,18 @@ fn main() -> ExitCode {
         [] => interactive_repl(),
         [flag] if flag == "-h" || flag == "--help" || flag == "助" => success(help),
         [flag] if flag == "-V" || flag == "--version" || flag == "版" => success(version),
+        [command, flag]
+            if (command == "version" || command == "版本" || command == "版")
+                && flag == "--json" =>
+        {
+            version_json()
+        }
         [command] if command == "标准库" || command == "stdlib" => standard_library_info(false),
         [command, flag] if (command == "标准库" || command == "stdlib") && flag == "--json" => {
             standard_library_info(true)
+        }
+        [command, flag] if (command == "原生" || command == "native") && flag == "--json" => {
+            native_abi_info()
         }
         [command, path] if command == "查" || command == "check" => check_file(path),
         [command] if command == "包" || command == "package" => package_info("."),
@@ -259,16 +296,167 @@ fn standard_library_info(json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn native_abi_info() -> ExitCode {
+    match serde_json::to_string_pretty(&yanxu::native_abi::capabilities()) {
+        Ok(document) => {
+            println!("{document}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!("不能生成原生 ABI 能力：{error}")),
+    }
+}
+
 fn package_run(path: &str, arguments: &[String]) -> ExitCode {
     let manifest = match yanxu::package::discover(path) {
         Ok(Some(manifest)) => manifest,
         Ok(None) => return fail(format!("未找到 {}", yanxu::package::MANIFEST_NAME)),
         Err(error) => return fail(error.to_string()),
     };
+    if let Err(error) = yanxu::package::ensure_lock(&manifest, false) {
+        return fail(error.to_string());
+    }
     let entry = manifest.root.join(&manifest.entry);
     let mut interpreter = Interpreter::with_permissions(manifest.permissions);
     interpreter.set_arguments(arguments.to_vec());
     match run_file_with(&mut interpreter, entry) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => fail(error.to_string()),
+    }
+}
+
+fn package_protocol_command(arguments: &[String]) -> ExitCode {
+    let Some(request) = arguments.first() else {
+        return fail("用法：yanxu package protocol '<JSON请求>'");
+    };
+    if arguments.len() != 1 {
+        return fail("工程协议只接收一个 JSON 请求参数");
+    }
+    let request: serde_json::Value = match serde_json::from_str(request) {
+        Ok(request) => request,
+        Err(error) => return fail(format!("工程协议 JSON 无效：{error}")),
+    };
+    let response = yanxu::engineering::response(&request);
+    match serde_json::to_string(&response) {
+        Ok(document) => println!("{document}"),
+        Err(error) => return fail(format!("不能生成工程协议响应：{error}")),
+    }
+    if response["ok"].as_bool() == Some(true) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn compile_command(arguments: &[String]) -> ExitCode {
+    let Some(input) = arguments.first() else {
+        return fail("用法：yanxu compile <文卷或包目录> [-o 输出] [--release] [--standalone]");
+    };
+    let mut output = None;
+    let mut profile = "debug";
+    let mut standalone = false;
+    let mut index = 1;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "-o" | "--output" | "--输出" => {
+                index += 1;
+                let Some(path) = arguments.get(index) else {
+                    return fail("-o 后须给出输出路径");
+                };
+                output = Some(PathBuf::from(path));
+            }
+            "--release" | "--发布" => profile = "release",
+            "--standalone" | "--独立" => standalone = true,
+            option => return fail(format!("不识构建选项“{option}”")),
+        }
+        index += 1;
+    }
+    let archive = match yanxu::application::compile_application(input, profile) {
+        Ok(archive) => archive,
+        Err(error) => return fail(error.to_string()),
+    };
+    let output = output.unwrap_or_else(|| default_application_output(input, standalone));
+    if !standalone
+        && yanxu::application::read_archive(&output)
+            .is_ok_and(|existing| existing.content_checksum == archive.content_checksum)
+    {
+        println!("构建缓存命中：{}", output.display());
+        return ExitCode::SUCCESS;
+    }
+    let result = if standalone {
+        env::current_exe()
+            .map_err(|error| yanxu::application::ApplicationError {
+                message: format!("不能定位言序运行时：{error}"),
+            })
+            .and_then(|runtime| yanxu::application::write_standalone(runtime, &archive, &output))
+    } else {
+        yanxu::application::write_archive(&archive, &output)
+    };
+    match result {
+        Ok(()) => {
+            println!(
+                "已生成{}：{}",
+                if standalone {
+                    "独立应用"
+                } else {
+                    " YXB 应用"
+                },
+                output.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error.to_string()),
+    }
+}
+
+fn default_application_output(input: &str, standalone: bool) -> PathBuf {
+    let path = Path::new(input);
+    let name = if path.is_dir() {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("应用")
+    } else {
+        path.file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("应用")
+    };
+    if standalone {
+        let suffix = env::consts::EXE_SUFFIX;
+        PathBuf::from(format!("{name}{suffix}"))
+    } else {
+        PathBuf::from(format!("{name}.yxb"))
+    }
+}
+
+fn application_run_command(arguments: &[String]) -> ExitCode {
+    let Some(path) = arguments.first() else {
+        return fail("用法：yanxu run <应用.yxb、文卷或包目录> [-- 参数...]");
+    };
+    let program_arguments = match arguments.get(1) {
+        None => &[][..],
+        Some(delimiter) if delimiter == "--" => &arguments[2..],
+        Some(option) => return fail(format!("不识运行选项“{option}”")),
+    };
+    let archive = if Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == "yxb")
+    {
+        match yanxu::application::read_archive(path) {
+            Ok(archive) => archive,
+            Err(error) => return fail(error.to_string()),
+        }
+    } else {
+        match yanxu::application::compile_application(path, "debug") {
+            Ok(archive) => archive,
+            Err(error) => return fail(error.to_string()),
+        }
+    };
+    run_archive(&archive, program_arguments)
+}
+
+fn run_archive(archive: &yanxu::application::ApplicationArchive, arguments: &[String]) -> ExitCode {
+    let mut vm = yanxu::vm::Vm::new();
+    vm.set_arguments(arguments.to_vec());
+    match vm.execute_application(archive) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(error.to_string()),
     }
@@ -704,6 +892,27 @@ fn version() {
     println!("言序 {}", env!("CARGO_PKG_VERSION"));
 }
 
+fn version_json() -> ExitCode {
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "version": env!("CARGO_PKG_VERSION"),
+        "manifest_formats": yanxu::package::SUPPORTED_MANIFEST_FORMATS,
+        "lock_formats": yanxu::package::SUPPORTED_LOCK_FORMATS,
+        "bytecode_formats": [yanxu::bytecode::BYTECODE_FORMAT_VERSION],
+        "yxb_formats": [1],
+        "native_abi": [1],
+        "native_capabilities": yanxu::native_abi::capabilities(),
+        "target": yanxu::package::current_target(),
+    });
+    match serde_json::to_string_pretty(&document) {
+        Ok(document) => {
+            println!("{document}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!("不能生成版本握手：{error}")),
+    }
+}
+
 fn help() {
     println!(
         r#"言序——文言风格的解释型编程语言
@@ -712,15 +921,21 @@ fn help() {
   yanxu [文卷.yx] [-- 参数...]  以树解释器执行（兼容模式，不限制宿主能力）
   yanxu 查 <文卷>        静态类型检查并报告弃用
   yanxu 字节 <文卷> [-- 参数...]  以字节码 VM 执行
+  yanxu 编 <文卷或包目录> [-o 输出] [--release] [--standalone]
+                         编译完整 YXB 应用或当前平台独立应用
+  yanxu 行 <应用.yxb、文卷或包目录> [-- 参数...]
+                         以字节码 VM 运行预编译应用
   yanxu 格 [--写] <文卷>  格式化
   yanxu 试 [目录] [--筛 词] [--并发 N] [--超时 ms] [--json]
                          运行 .yx 规格测试
   yanxu 兼容 [目录] [--json]  对照树解释器与 VM 的版本语料
   yanxu 迁 [--检查|--差异|--写] <文卷>  检查或应用弃用迁移
   yanxu 标准库 [--json]   显示版本化标准库 API 清单
+  yanxu 原生 --json       显示原生扩展 ABI v1 能力
   yanxu 包 [路径]          显示包清单
   yanxu 包 运行 [路径] [-- 参数...]  按清单权限运行包入口
   yanxu 包 锁 [--离线] [路径]  生成或验证锁文件
+  yanxu 包 协议 '<JSON>'   言包使用的版本化工程协议
   yanxu 文 <文卷> [输出]  生成公开 API 文档
   yanxu 调 <文卷>          执行并输出踪迹
   yanxu 调试服务          启动 DAP 调试适配器

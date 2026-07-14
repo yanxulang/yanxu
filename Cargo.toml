@@ -1,6 +1,6 @@
 [package]
 name = "yanxu"
-version = "1.1.4-A"
+version = "1.1.5"
 edition = "2024"
 description = "言序：以 Rust 编写的文言风格解释型编程语言"
 license = "MIT"
@@ -12,6 +12,7 @@ keywords = ["language", "interpreter", "chinese", "programming-language"]
 categories = ["compilers", "command-line-utilities"]
 include = [
     "/src/**",
+    "/crates/**",
     "/tests/**",
     "/Cargo.toml",
     "/Cargo.lock",
@@ -36,6 +37,10 @@ include = [
     "/言序.toml",
 ]
 
+[workspace]
+members = ["crates/yanxu-package", "examples/native-extension-rust"]
+resolver = "3"
+
 [lib]
 name = "yanxu"
 path = "src/lib.rs"
@@ -59,7 +64,9 @@ sha2 = "0.10"
 toml = "0.8"
 tar = "0.4"
 url = "2"
+yanxu-package = { path = "crates/yanxu-package", version = "1.1.5" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+libloading = "0.8"
 rustyline = "18.0.1"
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }

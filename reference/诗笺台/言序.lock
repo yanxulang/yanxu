@@ -1,9 +1,24 @@
-lock_version = 1
-manifest_checksum = "1be3a3975433215ba74d9633f6eb7de8225526d584bd13125b2093accc89e24c"
+lock_version = 2
+manifest_checksum = "3f382774400ac821a723af7b5f97c4de6c11f82b6b8daa650dc79dabf4574970"
+target = "aarch64-apple-darwin"
+generator = "1.1.5"
+
+[root_dependencies]
+"共享工具" = "共享工具@1.1.5#7f1d956fbd6e-886b5a3049976d59"
+
+[root_dev_dependencies]
 
 [[package]]
+id = "共享工具@1.1.5#7f1d956fbd6e-886b5a3049976d59"
 name = "共享工具"
-version = "1.0.0"
+version = "1.1.5"
 source = "path:../共享工具"
-checksum = "fee763443055364b1029c8446a11e46de72151eecae655adc3dc130dbba0f98e"
+checksum = "886b5a3049976d59e1523a8b15ad0edde904820cac731be13e2984faaf086869"
 entry = "主.yx"
+target = "aarch64-apple-darwin"
+minimum_yanxu = ">=1.1.5"
+
+[package.dependencies]
+
+[package.exports]
+"默认" = "主.yx"

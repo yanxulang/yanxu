@@ -1605,6 +1605,18 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                     Box::new(TypeSet::any()),
                 )),
             );
+            insert_std_function(
+                &mut shape,
+                "创建目录",
+                vec![TypeSet::named("文")],
+                TypeSet::named("空"),
+            );
+            insert_std_function(
+                &mut shape,
+                "删除",
+                vec![TypeSet::named("文"), TypeSet::named("理")],
+                TypeSet::named("空"),
+            );
         }
         "JSON" | "json" => {
             insert_std_function(
@@ -1867,6 +1879,42 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 insert_std_function(&mut shape, function, vec![], TypeSet::named("文"));
             }
             insert_std_function(&mut shape, "参数", vec![], TypeSet::named("列"));
+        }
+        "进程" => {
+            insert_std_function(
+                &mut shape,
+                "执行",
+                vec![
+                    TypeSet::named("文"),
+                    TypeSet::named("列"),
+                    TypeSet::union(vec![TypeSet::named("文"), TypeSet::named("空")]),
+                    TypeSet::named("数"),
+                ],
+                TypeSet::single(StaticType::Map(
+                    Box::new(TypeSet::named("文")),
+                    Box::new(TypeSet::any()),
+                )),
+            );
+        }
+        "资源" => {
+            insert_std_function(
+                &mut shape,
+                "读取字节",
+                vec![TypeSet::named("文")],
+                TypeSet::named("字节串"),
+            );
+            insert_std_function(
+                &mut shape,
+                "读取文字",
+                vec![TypeSet::named("文")],
+                TypeSet::named("文"),
+            );
+            insert_std_function(
+                &mut shape,
+                "目录",
+                vec![TypeSet::named("文")],
+                TypeSet::named("列"),
+            );
         }
         "哈希" => {
             insert_std_function(

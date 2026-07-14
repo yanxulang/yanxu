@@ -58,7 +58,9 @@
         {"name":"追加字节","signature":"法（文，字节串）：数","errors":["权限","I/O"]},
         {"name":"状态","signature":"法（文）：典<文，任意>","errors":["权限","I/O"]},
         {"name":"存在","signature":"法（文）：理","errors":["权限"]},
-        {"name":"目录","signature":"法（文）：列<文>","errors":["权限","I/O"]}
+        {"name":"目录","signature":"法（文）：列<文>","errors":["权限","I/O"]},
+        {"name":"创建目录","signature":"法（文）：空","errors":["权限","I/O"]},
+        {"name":"删除","signature":"法（文，递归：理）：空","errors":["权限","I/O","特殊文件"]}
       ]
     },
     {
@@ -123,6 +125,20 @@
         {"name":"存在","signature":"法（文）：理","errors":["权限"]},
         {"name":"当前目录","signature":"法（）：文"},{"name":"系统","signature":"法（）：文"},{"name":"架构","signature":"法（）：文"},
         {"name":"参数","signature":"法（）：列<文>"}
+      ]
+    },
+    {
+      "name": "进程", "permissions": ["process"], "platforms": ["native"], "deterministic": false,
+      "members": [
+        {"name":"执行","signature":"法（程序：文，参数：列<文>，工作目录：文?，超时毫秒：数）：典<文，任意>","errors":["PROCESS_PROGRAM","PROCESS_SPAWN","PROCESS_WAIT","PROCESS_TIMEOUT","PROCESS_LIMIT","PROCESS_READ","PROCESS_UTF8","PROCESS_UNSUPPORTED"]}
+      ]
+    },
+    {
+      "name": "资源", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"读取字节","signature":"法（包内相对路径：文）：字节串","errors":["未声明","I/O","BYTES_LIMIT"]},
+        {"name":"读取文字","signature":"法（包内相对路径：文）：文","errors":["未声明","I/O","非 UTF-8"]},
+        {"name":"目录","signature":"法（包内相对路径：文）：列<文>","errors":["未声明","I/O"]}
       ]
     },
     {

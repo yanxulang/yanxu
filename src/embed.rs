@@ -59,8 +59,8 @@ pub struct Engine {
 }
 
 enum Runtime {
-    Tree(Interpreter),
-    Bytecode(Vm),
+    Tree(Box<Interpreter>),
+    Bytecode(Box<Vm>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,12 +107,12 @@ impl Engine {
 
     fn build_runtime(config: &EngineConfig) -> Runtime {
         let mut runtime = match config.backend {
-            Backend::Tree => Runtime::Tree(Interpreter::silent_with_permissions(
+            Backend::Tree => Runtime::Tree(Box::new(Interpreter::silent_with_permissions(
                 config.permissions.clone(),
-            )),
-            Backend::Bytecode => {
-                Runtime::Bytecode(Vm::silent_with_permissions(config.permissions.clone()))
-            }
+            ))),
+            Backend::Bytecode => Runtime::Bytecode(Box::new(Vm::silent_with_permissions(
+                config.permissions.clone(),
+            ))),
         };
         match &mut runtime {
             Runtime::Tree(interpreter) => {

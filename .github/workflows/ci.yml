@@ -21,11 +21,11 @@ jobs:
       - name: 准备 Rust 工具链
         run: rustup component add rustfmt clippy
       - name: 检查格式
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
       - name: 运行测试
-        run: cargo test --all-targets --locked
+        run: cargo test --workspace --all-targets --locked
       - name: 运行 Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   wasi:
     name: WASI 嵌入构建
@@ -35,6 +35,8 @@ jobs:
       - name: 准备 WASI 目标
         run: rustup target add wasm32-wasip1
       - name: 检查 WASI 库
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo check --target wasm32-wasip1 --lib --locked
 
   embedding:
@@ -81,11 +83,21 @@ jobs:
         run: |
           set -euo pipefail
           target/debug/yanxu 标准库 --json > stdlib.json
-          jq -e '.schema_version == 1 and (.modules | length) == 23' stdlib.json >/dev/null
+          jq -e '.schema_version == 1 and (.modules | length) == 25' stdlib.json >/dev/null
+      - name: 校验 1.1.5 工程能力握手
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/debug/yanxu version --json > version.json
+          jq -e '.version == "1.1.5" and (.manifest_formats | index(2)) and (.lock_formats | index(2)) and (.yxb_formats | index(1)) and (.native_abi | index(1))' version.json >/dev/null
+          target/debug/yanxu package protocol '{"protocol_version":1,"operation":"handshake"}' > engineering.json
+          jq -e '.ok and .result.yanxu_version == "1.1.5" and (.result.operations | index("vendor"))' engineering.json >/dev/null
       - name: 编译模糊测试目标
         run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
-      - name: 隔离验证 Cargo 发布包
-        run: cargo package --locked
+      - name: 验证共享包发布制品与核心 release 构建
+        run: |
+          cargo package -p yanxu-package --locked
+          cargo build -p yanxu --release --locked
       - name: 安装 Tree-sitter 工具
         run: npm --prefix tree-sitter-yanxu ci
       - name: 生成并测试 Tree-sitter

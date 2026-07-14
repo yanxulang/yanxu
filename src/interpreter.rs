@@ -49,6 +49,8 @@ enum GuardedNative {
     FileStatus,
     PathExists,
     ReadDirectory,
+    CreateDirectory,
+    RemovePath,
     HttpGet,
     HttpPost,
     HttpRequest,
@@ -74,6 +76,10 @@ enum GuardedNative {
     EnvRead,
     EnvExists,
     Arguments,
+    ProcessRun,
+    ResourceReadBytes,
+    ResourceReadText,
+    ResourceList,
 }
 
 #[derive(Clone)]
@@ -1674,6 +1680,27 @@ impl Interpreter {
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 native_read_directory(arguments)
             }
+            GuardedNative::CreateDirectory => {
+                let path = string_argument(arguments, 0, "文件.创建目录")?;
+                self.permissions
+                    .check_file(path)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                crate::stdlib::create_directory(Path::new(path))
+                    .map(|()| Value::Nil)
+                    .map_err(RuntimeError::new)
+            }
+            GuardedNative::RemovePath => {
+                let path = string_argument(arguments, 0, "文件.删除")?;
+                self.permissions
+                    .check_file(path)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                crate::stdlib::remove_path(
+                    Path::new(path),
+                    bool_argument(arguments, 1, "文件.删除")?,
+                )
+                .map(|()| Value::Nil)
+                .map_err(RuntimeError::new)
+            }
             GuardedNative::HttpGet => native_http_get(arguments, &self.permissions),
             GuardedNative::HttpPost => native_http_post(arguments, &self.permissions),
             GuardedNative::HttpRequest => native_http_request(arguments, &self.permissions),
@@ -1725,6 +1752,51 @@ impl Interpreter {
             GuardedNative::Arguments => Ok(Value::List(Rc::new(RefCell::new(
                 self.arguments.iter().cloned().map(Value::String).collect(),
             )))),
+            GuardedNative::ProcessRun => {
+                self.permissions
+                    .check_process()
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                native_process_run(arguments)
+            }
+            GuardedNative::ResourceReadBytes | GuardedNative::ResourceReadText => {
+                let requested = string_argument(arguments, 0, "资源.读取")?;
+                let path = crate::application::resolve_declared_resource(
+                    self.package_root.as_deref(),
+                    requested,
+                )
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let bytes = crate::stdlib::read_file_bytes(&path).map_err(|error| {
+                    RuntimeError::new(format!("不能读取资源“{requested}”：{error:?}"))
+                })?;
+                if matches!(function, GuardedNative::ResourceReadBytes) {
+                    Ok(Value::Bytes(Rc::new(bytes)))
+                } else {
+                    String::from_utf8(bytes)
+                        .map(Value::String)
+                        .map_err(|_| RuntimeError::new("资源不是 UTF-8 文字"))
+                }
+            }
+            GuardedNative::ResourceList => {
+                let requested = string_argument(arguments, 0, "资源.目录")?;
+                let path = crate::application::resolve_declared_resource(
+                    self.package_root.as_deref(),
+                    requested,
+                )
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let mut entries = fs::read_dir(path)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                entries.sort_by_key(std::fs::DirEntry::file_name);
+                Ok(Value::List(Rc::new(RefCell::new(
+                    entries
+                        .into_iter()
+                        .map(|entry| {
+                            Value::String(entry.file_name().to_string_lossy().into_owned())
+                        })
+                        .collect(),
+                ))))
+            }
         }
     }
 
@@ -2546,6 +2618,8 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
                 ("写入字节", 2, GuardedNative::WriteBytes),
                 ("追加字节", 2, GuardedNative::AppendBytes),
                 ("状态", 1, GuardedNative::FileStatus),
+                ("创建目录", 1, GuardedNative::CreateDirectory),
+                ("删除", 2, GuardedNative::RemovePath),
             ] {
                 define_export_intrinsic(
                     &environment,
@@ -2694,6 +2768,30 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
                 0,
                 NativeKind::Guarded(GuardedNative::Arguments),
             );
+        }
+        "进程" => {
+            define_export_intrinsic(
+                &environment,
+                &mut exports,
+                "执行",
+                4,
+                NativeKind::Guarded(GuardedNative::ProcessRun),
+            );
+        }
+        "资源" => {
+            for (name, function) in [
+                ("读取字节", GuardedNative::ResourceReadBytes),
+                ("读取文字", GuardedNative::ResourceReadText),
+                ("目录", GuardedNative::ResourceList),
+            ] {
+                define_export_intrinsic(
+                    &environment,
+                    &mut exports,
+                    name,
+                    1,
+                    NativeKind::Guarded(function),
+                );
+            }
         }
         "哈希" => {
             define_export_native(&environment, &mut exports, "SHA256", 1, native_sha256);
@@ -3103,6 +3201,30 @@ fn native_os(_: &[Value]) -> Result<Value, RuntimeError> {
 
 fn native_arch(_: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::String(std::env::consts::ARCH.into()))
+}
+
+fn native_process_run(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let program = string_argument(arguments, 0, "进程.执行")?;
+    let process_arguments = string_sequence_argument(arguments, 1, "进程.执行")?;
+    let directory = match &arguments[2] {
+        Value::Nil => None,
+        Value::String(directory) => Some(directory.as_str()),
+        value => {
+            return Err(RuntimeError::new(format!(
+                "“进程.执行”第三参数须为文或空，不可为{}",
+                value.type_name()
+            )));
+        }
+    };
+    let timeout = nonnegative_safe_u64_argument(arguments, 3, "进程.执行")?;
+    let output = crate::stdlib::process_run(program, &process_arguments, directory, timeout)
+        .map_err(RuntimeError::new)?;
+    Ok(string_key_map(vec![
+        ("状态", Value::Number(f64::from(output.status))),
+        ("成功", Value::Bool(output.success)),
+        ("标准输出", Value::String(output.stdout)),
+        ("标准错误", Value::String(output.stderr)),
+    ]))
 }
 
 fn native_sha256(arguments: &[Value]) -> Result<Value, RuntimeError> {
@@ -4417,6 +4539,37 @@ fn number_sequence_argument(
             Value::Number(number) if number.is_finite() => Ok(*number),
             other => Err(RuntimeError::new(format!(
                 "“{function}”数据第 {} 项须为有限数，不可为{}",
+                item_index + 1,
+                other.type_name()
+            ))),
+        })
+        .collect()
+}
+
+fn string_sequence_argument(
+    arguments: &[Value],
+    index: usize,
+    function: &str,
+) -> Result<Vec<String>, RuntimeError> {
+    let values: Vec<Value> = match &arguments[index] {
+        Value::List(values) => values.borrow().clone(),
+        Value::Tuple(values) => values.as_ref().clone(),
+        value => {
+            return Err(RuntimeError::new(format!(
+                "“{function}”第 {} 参数须为文列，不可为{}",
+                index + 1,
+                value.type_name()
+            )));
+        }
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(item_index, value)| match value {
+            Value::String(text) => Ok(text.clone()),
+            other => Err(RuntimeError::new(format!(
+                "“{function}”第 {} 参数第 {} 项须为文，不可为{}",
+                index + 1,
                 item_index + 1,
                 other.type_name()
             ))),

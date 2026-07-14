@@ -4,7 +4,7 @@
 //! 包括补全、定义、引用、重命名、悬停和文档符号。
 
 use crate::semantic::{SemanticIndex, Symbol, SymbolKind};
-use crate::source::Span;
+use crate::source::{SourceFile, Span};
 use crate::token::TokenKind;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -136,11 +136,17 @@ fn semantic_response(method: &str, uri: &str, source: &str, request: &Value) -> 
     let column = character_column(source, line, utf16_column);
     let Ok(index) = SemanticIndex::build(source, uri) else {
         return if method == "textDocument/completion" {
-            completion_items(
-                None,
+            with_package_completions(
+                completion_items(
+                    None,
+                    line,
+                    column,
+                    standard_module_at_completion(source, line, column).as_deref(),
+                ),
+                uri,
+                source,
                 line,
                 column,
-                standard_module_at_completion(source, line, column).as_deref(),
             )
         } else if method == "textDocument/documentSymbol" {
             json!([])
@@ -149,11 +155,17 @@ fn semantic_response(method: &str, uri: &str, source: &str, request: &Value) -> 
         };
     };
     match method {
-        "textDocument/completion" => completion_items(
-            Some(&index),
+        "textDocument/completion" => with_package_completions(
+            completion_items(
+                Some(&index),
+                line,
+                column,
+                standard_module_at_completion(source, line, column).as_deref(),
+            ),
+            uri,
+            source,
             line,
             column,
-            standard_module_at_completion(source, line, column).as_deref(),
         ),
         "textDocument/definition" => definition(&index, uri, source, line, column),
         "textDocument/references" => references(
@@ -173,6 +185,102 @@ fn semantic_response(method: &str, uri: &str, source: &str, request: &Value) -> 
         "textDocument/documentSymbol" => document_symbols(&index, source),
         _ => Value::Null,
     }
+}
+
+fn with_package_completions(
+    mut completion: Value,
+    uri: &str,
+    source: &str,
+    line: usize,
+    column: usize,
+) -> Value {
+    if let Some(items) = completion["items"].as_array_mut() {
+        items.extend(package_completion_items(uri, source, line, column));
+    }
+    completion
+}
+
+fn package_completion_items(uri: &str, source: &str, line: usize, column: usize) -> Vec<Value> {
+    let prefix = source
+        .lines()
+        .nth(line.saturating_sub(1))
+        .unwrap_or("")
+        .chars()
+        .take(column.saturating_sub(1))
+        .collect::<String>();
+    let Some(typed) = prefix
+        .rsplit('「')
+        .next()
+        .and_then(|text| text.strip_prefix("包:"))
+    else {
+        return Vec::new();
+    };
+    let Some(path) = uri_file_path(uri) else {
+        return Vec::new();
+    };
+    let Some(manifest) = crate::package::discover(&path).ok().flatten() else {
+        return Vec::new();
+    };
+    let lock = crate::package::read_lock(manifest.root.join(crate::package::LOCK_NAME)).ok();
+    let (requested_alias, export_prefix) = typed
+        .split_once('/')
+        .map_or((typed, None), |(alias, export)| (alias, Some(export)));
+    if let Some(export_prefix) = export_prefix {
+        let Some(lock) = lock else { return Vec::new() };
+        let id = lock
+            .root_dependencies
+            .get(requested_alias)
+            .or_else(|| lock.root_dev_dependencies.get(requested_alias));
+        let Some(package) =
+            id.and_then(|id| lock.packages.iter().find(|package| &package.id == id))
+        else {
+            return Vec::new();
+        };
+        return package
+            .exports
+            .keys()
+            .filter(|name| name.starts_with(export_prefix))
+            .map(|name| {
+                json!({
+                    "label": name,
+                    "insertText": name,
+                    "kind": 9,
+                    "detail": format!("{} {} 的公开导出", package.name, package.version),
+                    "documentation": format!("包:{requested_alias}/{name}"),
+                    "sortText": format!("0-package-export-{name}")
+                })
+            })
+            .collect();
+    }
+    manifest
+        .dependencies
+        .iter()
+        .chain(manifest.dev_dependencies.iter())
+        .filter(|(alias, _)| alias.starts_with(requested_alias))
+        .map(|(alias, dependency)| {
+            let locked = lock.as_ref().and_then(|lock| {
+                lock.root_dependencies
+                    .get(alias)
+                    .or_else(|| lock.root_dev_dependencies.get(alias))
+                    .and_then(|id| lock.packages.iter().find(|package| &package.id == id))
+            });
+            json!({
+                "label": alias,
+                "insertText": alias,
+                "kind": 9,
+                "detail": locked.map_or_else(
+                    || dependency.to_string(),
+                    |package| format!("{} {} · {}", package.name, package.version, package.source)
+                ),
+                "documentation": format!("包:{alias}；输入 / 可选择公开子模块"),
+                "sortText": format!("0-package-{alias}")
+            })
+        })
+        .collect()
+}
+
+fn uri_file_path(uri: &str) -> Option<std::path::PathBuf> {
+    url::Url::parse(uri).ok()?.to_file_path().ok()
 }
 
 fn completion_items(
@@ -398,12 +506,41 @@ pub fn diagnostics(source: &str, name: &str) -> Vec<Value> {
     if let Err(error) = crate::resolver::resolve(&statements) {
         return vec![diagnostic(&error.span, source, &error.message, 1)];
     }
-    crate::type_checker::check(&statements)
+    let mut diagnostics = crate::type_checker::check(&statements)
         .err()
         .unwrap_or_default()
         .into_iter()
         .map(|error| diagnostic(&error.span, source, &error.message, 1))
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(path) = uri_file_path(name)
+        && let Ok(Some(manifest)) = crate::package::discover(&path)
+    {
+        if let Err(error) = crate::package::validate_lock(&manifest) {
+            let span = Span::new(SourceFile::new(name, source), 1, 1, 1, 1);
+            diagnostics.push(diagnostic(&span, source, &error.to_string(), 2));
+        }
+        if let Ok(tokens) = crate::lexer::scan_named(source, name) {
+            for pair in tokens.windows(2) {
+                if matches!(pair[0].kind, TokenKind::Import)
+                    && let TokenKind::String(import) = &pair[1].kind
+                    && let Some(package) = import.strip_prefix("包:")
+                {
+                    let alias = package.split('/').next().unwrap_or(package);
+                    if !manifest.dependencies.contains_key(alias)
+                        && !manifest.dev_dependencies.contains_key(alias)
+                    {
+                        diagnostics.push(diagnostic(
+                            &pair[1].span,
+                            source,
+                            &format!("未声明包依赖别名“{alias}”；请先执行 yanbao add {alias}"),
+                            1,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    diagnostics
 }
 
 fn diagnostic(span: &Span, source: &str, message: &str, severity: u8) -> Value {
@@ -714,5 +851,68 @@ mod tests {
         assert_eq!(capabilities["definitionProvider"], true);
         assert_eq!(capabilities["renameProvider"]["prepareProvider"], true);
         assert_eq!(capabilities["positionEncoding"], "utf-16");
+    }
+
+    #[test]
+    fn completes_locked_package_aliases_exports_and_reports_package_drift() {
+        let root = std::env::temp_dir().join(format!(
+            "yanxu-lsp-package-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = root.join("app");
+        let dependency = root.join("dependency");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        std::fs::write(
+            dependency.join(crate::package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具包'\n版本='1.2.0'\n入口='src/主.yx'\n[导出]\n默认='src/主.yx'\n配置='src/配置.yx'\n",
+        )
+        .unwrap();
+        std::fs::write(dependency.join("src/主.yx"), "公 定 值 为 1；").unwrap();
+        std::fs::write(dependency.join("src/配置.yx"), "公 定 名 为「配置」；").unwrap();
+        std::fs::write(
+            app.join(crate::package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='src/主.yx'\n[依赖]\n工具别名={包='工具包',路径='../dependency'}\n",
+        )
+        .unwrap();
+        let entry = app.join("src/主.yx");
+        std::fs::write(&entry, "").unwrap();
+        let manifest = crate::package::load(app.join(crate::package::MANIFEST_NAME)).unwrap();
+        crate::package::ensure_lock(&manifest, false).unwrap();
+        let uri = url::Url::from_file_path(&entry).unwrap().to_string();
+
+        let alias_source = "引「包:工";
+        let aliases =
+            package_completion_items(&uri, alias_source, 1, alias_source.chars().count() + 1);
+        assert!(aliases.iter().any(|item| {
+            item["label"] == "工具别名" && item["detail"].as_str().unwrap().contains("1.2.0")
+        }));
+        let export_source = "引「包:工具别名/配";
+        let exports =
+            package_completion_items(&uri, export_source, 1, export_source.chars().count() + 1);
+        assert!(exports.iter().any(|item| item["label"] == "配置"));
+
+        let source = "引「包:未声明」为 未知；";
+        std::fs::write(
+            app.join(crate::package::MANIFEST_NAME),
+            std::fs::read_to_string(app.join(crate::package::MANIFEST_NAME)).unwrap() + "\n",
+        )
+        .unwrap();
+        let findings = diagnostics(source, &uri);
+        assert!(
+            findings
+                .iter()
+                .any(|item| item["message"].as_str().unwrap().contains("未声明包依赖"))
+        );
+        assert!(findings.iter().any(|item| {
+            item["message"]
+                .as_str()
+                .unwrap()
+                .contains("锁文件与清单不一致")
+        }));
+        std::fs::remove_dir_all(root).ok();
     }
 }

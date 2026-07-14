@@ -271,6 +271,98 @@ fn relative_modules_have_matching_exports_and_single_initialization() {
 }
 
 #[test]
+fn format_two_package_alias_exports_and_transitive_isolation_match_both_runtimes() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("yanxu-package-parity-{unique}"));
+    let app = root.join("app");
+    let tool = root.join("tool");
+    let core = root.join("core");
+    for directory in [&app, &tool, &core] {
+        fs::create_dir_all(directory.join("src")).unwrap();
+    }
+    fs::write(
+        core.join("言序.toml"),
+        r#"[包]
+格式 = 2
+名称 = "内核库"
+版本 = "1.0.0"
+言序 = ">=1.1.5"
+入口 = "src/主.yx"
+[导出]
+默认 = "src/主.yx"
+"#,
+    )
+    .unwrap();
+    fs::write(core.join("src/主.yx"), "公 定 基数：数 为 40；").unwrap();
+    fs::write(
+        tool.join("言序.toml"),
+        r#"[包]
+格式 = 2
+名称 = "工具库"
+版本 = "1.0.0"
+言序 = ">=1.1.5"
+入口 = "src/主.yx"
+[依赖]
+内核 = { 包 = "内核库", 路径 = "../core", 版 = "^1" }
+[导出]
+默认 = "src/主.yx"
+公开 = "src/公开.yx"
+"#,
+    )
+    .unwrap();
+    fs::write(tool.join("src/主.yx"), "公 定 名：文 为「工具」；").unwrap();
+    fs::write(
+        tool.join("src/公开.yx"),
+        "引「包:内核」为 内核；公 法 答案（）：数 则 归 内核.基数 加 2；终",
+    )
+    .unwrap();
+    fs::write(
+        app.join("言序.toml"),
+        r#"[包]
+格式 = 2
+名称 = "应用"
+版本 = "1.0.0"
+言序 = ">=1.1.5"
+入口 = "src/主.yx"
+[依赖]
+工具别名 = { 包 = "工具库", 路径 = "../tool", 版 = "^1" }
+"#,
+    )
+    .unwrap();
+    let manifest = yanxu::package::load(app.join("言序.toml")).unwrap();
+    let graph = yanxu::package::ensure_lock_with_dev(&manifest, true).unwrap();
+    assert_eq!(graph.packages.len(), 2);
+
+    let source = "引「包:工具别名/公开」为 工具；言 工具.答案（）；";
+    let statements =
+        yanxu::parse_named(source, app.join("src/主.yx").display().to_string()).unwrap();
+    yanxu::type_checker::check_in_directory(&statements, app.join("src")).unwrap();
+    let (tree, vm) = execute_both(source, &app.join("src"));
+    assert_eq!(tree, ["42"]);
+    assert_eq!(tree, vm);
+
+    let forbidden = yanxu::parse("引「包:内核」为 内核；").unwrap();
+    let mut interpreter = Interpreter::silent();
+    let tree_error = interpreter
+        .execute_in_directory(&forbidden, &app.join("src"))
+        .unwrap_err()
+        .to_string();
+    let chunk = bytecode::compile(&forbidden).unwrap();
+    let mut vm = Vm::silent();
+    let vm_error = vm
+        .execute_in_directory(&chunk, &app.join("src"))
+        .unwrap_err()
+        .to_string();
+    for error in [tree_error, vm_error] {
+        assert!(error.contains("未声明依赖别名“内核”"), "{error}");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn shared_runtime_failures_retain_the_same_error_category() {
     let source = "法 加一（值：数）：数 则 归 值 加 1；终 加一（「错」）；";
     let statements = yanxu::parse(source).unwrap();
@@ -568,6 +660,29 @@ fn file_standard_module_mutations_match_in_isolated_directories() {
         "甲乙"
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn guarded_process_execution_matches_both_runtimes() {
+    let executable = source_path(&std::env::current_exe().unwrap());
+    let source = format!(
+        "引「标准:进程」为 进程；定 结果 为 进程.执行（「{executable}」，【「--list」】，空，30000）；言 结果【「成功」】；言 结果【「状态」】；"
+    );
+    let statements = yanxu::parse(&source).unwrap();
+    yanxu::type_checker::check(&statements).unwrap();
+    let mut interpreter = Interpreter::silent();
+    interpreter.execute(&statements).unwrap();
+    let chunk = bytecode::compile(&statements).unwrap();
+    let mut vm = Vm::silent();
+    vm.execute(&chunk).unwrap();
+    assert_eq!(interpreter.output(), &["真", "0"]);
+    assert_eq!(interpreter.output(), vm.output());
+
+    let permissions = yanxu::permissions::PermissionSet::sandboxed();
+    let mut interpreter = Interpreter::silent_with_permissions(permissions.clone());
+    assert!(interpreter.execute(&statements).is_err());
+    let mut vm = Vm::silent_with_permissions(permissions);
+    assert!(vm.execute(&chunk).is_err());
 }
 
 #[test]
