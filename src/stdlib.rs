@@ -5,19 +5,23 @@
 //! 类型转换和报错。
 
 use base64::Engine as _;
+use hmac::{Hmac, Mac};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 pub const API_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const BYTES_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
+pub const SECURE_RANDOM_MAX_BYTES: usize = 1024 * 1024;
 
 pub fn api_manifest() -> Result<serde_json::Value, serde_json::Error> {
     serde_json::from_str(include_str!("../stdlib/api-v1.json"))
 }
 #[cfg(not(target_family = "wasm"))]
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(not(target_family = "wasm"))]
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(not(target_family = "wasm"))]
@@ -106,6 +110,159 @@ pub fn path_normalize(path: &str) -> String {
 pub fn sha256(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn bytes_from_numbers(numbers: &[f64]) -> Result<Vec<u8>, String> {
+    if numbers.len() > BYTES_MAX_VALUE_BYTES {
+        return Err(format!("字节数列不得超过 {BYTES_MAX_VALUE_BYTES} 项"));
+    }
+    numbers
+        .iter()
+        .enumerate()
+        .map(|(index, number)| {
+            if number.is_finite()
+                && number.fract() == 0.0
+                && (0.0..=f64::from(u8::MAX)).contains(number)
+            {
+                Ok(*number as u8)
+            } else {
+                Err(format!("字节数列第 {} 项须为 0..255 的整数", index + 1))
+            }
+        })
+        .collect()
+}
+
+pub fn bytes_find(source: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    source
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+pub fn bytes_slice(source: &[u8], start: usize, end: usize) -> Result<Vec<u8>, String> {
+    if start > end || end > source.len() {
+        return Err(format!(
+            "字节切片范围 {start}..{end} 超出 0..{}",
+            source.len()
+        ));
+    }
+    Ok(source[start..end].to_vec())
+}
+
+pub fn bytes_concat(left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
+    let length = left
+        .len()
+        .checked_add(right.len())
+        .ok_or_else(|| "字节拼接长度溢出".to_string())?;
+    if length > BYTES_MAX_VALUE_BYTES {
+        return Err(format!("字节拼接结果不得超过 {BYTES_MAX_VALUE_BYTES} 字节"));
+    }
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(left);
+    bytes.extend_from_slice(right);
+    Ok(bytes)
+}
+
+pub fn secure_random_bytes(length: usize) -> Result<Vec<u8>, String> {
+    if length > SECURE_RANDOM_MAX_BYTES {
+        return Err(format!(
+            "安全随机字节长度不得超过 {SECURE_RANDOM_MAX_BYTES}"
+        ));
+    }
+    let mut bytes = vec![0; length];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| format!("操作系统安全随机源不可用：{error}"))?;
+    Ok(bytes)
+}
+
+pub fn hmac_sha256(key: &[u8], body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).map_err(|_| "HMAC-SHA256 密钥无效".to_string())?;
+    mac.update(body);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+pub fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        let left = left.get(index).copied().unwrap_or(0);
+        let right = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
+}
+
+pub fn format_http_date(unix_millis: u64) -> Result<String, String> {
+    const YEAR_9999_UNIX_MILLIS: u64 = 253_402_300_800_000;
+    if unix_millis >= YEAR_9999_UNIX_MILLIS {
+        return Err("HTTP 日期须早于公元 9999 年".into());
+    }
+    Ok(httpdate::fmt_http_date(
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(unix_millis),
+    ))
+}
+
+pub fn parse_http_date(text: &str) -> Option<u64> {
+    httpdate::parse_http_date(text)
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStatus {
+    pub kind: &'static str,
+    pub bytes: u64,
+    pub readonly: bool,
+    pub modified_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileBytesError {
+    Io(String),
+    Limit(String),
+}
+
+pub fn file_status(path: &Path) -> Result<FileStatus, String> {
+    let metadata = std::fs::metadata(path).map_err(|error| format!("不能读取文件状态：{error}"))?;
+    let kind = if metadata.is_file() {
+        "文件"
+    } else if metadata.is_dir() {
+        "目录"
+    } else {
+        "其他"
+    };
+    let modified_millis = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    Ok(FileStatus {
+        kind,
+        bytes: metadata.len(),
+        readonly: metadata.permissions().readonly(),
+        modified_millis,
+    })
+}
+
+pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>, FileBytesError> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| FileBytesError::Io(format!("不能读取文件：{error}")))?;
+    let limit = BYTES_MAX_VALUE_BYTES as u64 + 1;
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| FileBytesError::Io(format!("不能读取文件：{error}")))?;
+    if bytes.len() > BYTES_MAX_VALUE_BYTES {
+        return Err(FileBytesError::Limit(format!(
+            "文件超过 {BYTES_MAX_VALUE_BYTES} 字节上限"
+        )));
+    }
+    Ok(bytes)
 }
 
 pub fn hex_encode(text: &str) -> String {
@@ -948,6 +1105,12 @@ pub enum SocketHandle {
     Closed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketRead {
+    pub bytes: Vec<u8>,
+    pub eof: bool,
+}
+
 #[cfg(target_family = "wasm")]
 #[derive(Debug)]
 pub struct SocketHandle;
@@ -1178,12 +1341,20 @@ pub fn socket_send(
     text: &str,
     timeout_millis: u64,
 ) -> Result<u64, SocketError> {
+    socket_send_bytes(handle, text.as_bytes(), timeout_millis)
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_send_bytes(
+    handle: &mut SocketHandle,
+    bytes: &[u8],
+    timeout_millis: u64,
+) -> Result<u64, SocketError> {
     let timeout = socket_timeout(timeout_millis)?;
     let SocketHandle::TcpStream(stream_handle) = handle else {
-        return Err(socket_state(handle, "发送", "TCP流"));
+        return Err(socket_state(handle, "发送字节", "TCP流"));
     };
     let deadline = Instant::now() + timeout;
-    let bytes = text.as_bytes();
     let mut written = 0;
     while written < bytes.len() {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1206,7 +1377,7 @@ pub fn socket_send(
         }
         written += count;
     }
-    Ok(text.len() as u64)
+    Ok(bytes.len() as u64)
 }
 
 #[cfg(target_family = "wasm")]
@@ -1215,6 +1386,113 @@ pub fn socket_send(
     _text: &str,
     _timeout_millis: u64,
 ) -> Result<u64, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_send_bytes(
+    _handle: &mut SocketHandle,
+    _bytes: &[u8],
+    _timeout_millis: u64,
+) -> Result<u64, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_receive_bytes(
+    handle: &mut SocketHandle,
+    max_bytes: u64,
+    timeout_millis: u64,
+) -> Result<SocketRead, SocketError> {
+    let timeout = socket_timeout(timeout_millis)?;
+    let capacity = socket_read_capacity(max_bytes)?;
+    let SocketHandle::TcpStream(stream_handle) = handle else {
+        return Err(socket_state(handle, "接收字节", "TCP流"));
+    };
+    if !stream_handle.read_buffer.is_empty() {
+        let length = capacity.min(stream_handle.read_buffer.len());
+        let bytes = stream_handle.read_buffer.drain(..length).collect();
+        return Ok(SocketRead { bytes, eof: false });
+    }
+    stream_handle
+        .stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| socket_io_error("SOCKET_READ", "配置 TCP 读超时", error))?;
+    let mut bytes = vec![0; capacity];
+    let length = stream_handle
+        .stream
+        .read(&mut bytes)
+        .map_err(|error| socket_io_error("SOCKET_READ", "读取 TCP 流", error))?;
+    bytes.truncate(length);
+    Ok(SocketRead {
+        bytes,
+        eof: length == 0,
+    })
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_receive_bytes(
+    _handle: &mut SocketHandle,
+    _max_bytes: u64,
+    _timeout_millis: u64,
+) -> Result<SocketRead, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_read_exact_bytes(
+    handle: &mut SocketHandle,
+    byte_count: u64,
+    timeout_millis: u64,
+) -> Result<Vec<u8>, SocketError> {
+    let timeout = socket_timeout(timeout_millis)?;
+    let capacity = socket_read_capacity(byte_count)?;
+    let SocketHandle::TcpStream(stream_handle) = handle else {
+        return Err(socket_state(handle, "精确读取", "TCP流"));
+    };
+    let deadline = Instant::now() + timeout;
+    let mut bytes = Vec::with_capacity(capacity);
+    if !stream_handle.read_buffer.is_empty() {
+        let length = capacity.min(stream_handle.read_buffer.len());
+        bytes.extend(stream_handle.read_buffer.drain(..length));
+    }
+    while bytes.len() < capacity {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SocketError::new(
+                "SOCKET_TIMEOUT",
+                "精确读取 TCP 流已超过超时上限",
+            ));
+        }
+        stream_handle
+            .stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| socket_io_error("SOCKET_READ", "配置 TCP 读超时", error))?;
+        let mut chunk = vec![0; capacity - bytes.len()];
+        let length = stream_handle
+            .stream
+            .read(&mut chunk)
+            .map_err(|error| socket_io_error("SOCKET_READ", "精确读取 TCP 流", error))?;
+        if length == 0 {
+            return Err(SocketError::new(
+                "SOCKET_EOF",
+                format!(
+                    "TCP 流提前结束：需要 {capacity} 字节，只读取 {} 字节",
+                    bytes.len()
+                ),
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..length]);
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_read_exact_bytes(
+    _handle: &mut SocketHandle,
+    _byte_count: u64,
+    _timeout_millis: u64,
+) -> Result<Vec<u8>, SocketError> {
     Err(socket_unsupported())
 }
 
@@ -1366,9 +1644,9 @@ pub fn socket_udp_send_to(
     address: &str,
     timeout_millis: u64,
 ) -> Result<u64, SocketError> {
-    socket_udp_send_to_guarded(
+    socket_udp_send_bytes_to_guarded(
         handle,
-        text,
+        text.as_bytes(),
         address,
         timeout_millis,
         &crate::permissions::PermissionSet::unrestricted(),
@@ -1379,6 +1657,23 @@ pub fn socket_udp_send_to(
 pub fn socket_udp_send_to_guarded(
     handle: &mut SocketHandle,
     text: &str,
+    address: &str,
+    timeout_millis: u64,
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<u64, SocketError> {
+    socket_udp_send_bytes_to_guarded(
+        handle,
+        text.as_bytes(),
+        address,
+        timeout_millis,
+        permissions,
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_udp_send_bytes_to_guarded(
+    handle: &mut SocketHandle,
+    bytes: &[u8],
     address: &str,
     timeout_millis: u64,
     permissions: &crate::permissions::PermissionSet,
@@ -1418,7 +1713,7 @@ pub fn socket_udp_send_to_guarded(
             .socket
             .set_write_timeout(Some(remaining))
             .map_err(|error| socket_io_error("SOCKET_WRITE", "配置 UDP 写超时", error))?;
-        match socket_handle.socket.send_to(text.as_bytes(), address) {
+        match socket_handle.socket.send_to(bytes, address) {
             Ok(written) => return Ok(written as u64),
             Err(error) => last_error = Some(error),
         }
@@ -1451,12 +1746,35 @@ pub fn socket_udp_send_to_guarded(
     Err(socket_unsupported())
 }
 
+#[cfg(target_family = "wasm")]
+pub fn socket_udp_send_bytes_to_guarded(
+    _handle: &mut SocketHandle,
+    _bytes: &[u8],
+    _address: &str,
+    _timeout_millis: u64,
+    _permissions: &crate::permissions::PermissionSet,
+) -> Result<u64, SocketError> {
+    Err(socket_unsupported())
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub fn socket_udp_receive_from(
     handle: &mut SocketHandle,
     max_bytes: u64,
     timeout_millis: u64,
 ) -> Result<(String, String), SocketError> {
+    let (bytes, peer) = socket_udp_receive_bytes_from(handle, max_bytes, timeout_millis)?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| SocketError::new("SOCKET_UTF8", "UDP 数据报不是完整 UTF-8 文字"))?;
+    Ok((text, peer))
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_udp_receive_bytes_from(
+    handle: &mut SocketHandle,
+    max_bytes: u64,
+    timeout_millis: u64,
+) -> Result<(Vec<u8>, String), SocketError> {
     let timeout = socket_timeout(timeout_millis)?;
     let capacity = socket_read_capacity(max_bytes)?;
     let SocketHandle::Udp(socket_handle) = handle else {
@@ -1478,9 +1796,7 @@ pub fn socket_udp_receive_from(
         ));
     }
     bytes.truncate(length);
-    let text = String::from_utf8(bytes)
-        .map_err(|_| SocketError::new("SOCKET_UTF8", "UDP 数据报不是完整 UTF-8 文字"))?;
-    Ok((text, peer.to_string()))
+    Ok((bytes, peer.to_string()))
 }
 
 #[cfg(target_family = "wasm")]
@@ -1489,6 +1805,48 @@ pub fn socket_udp_receive_from(
     _max_bytes: u64,
     _timeout_millis: u64,
 ) -> Result<(String, String), SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_udp_receive_bytes_from(
+    _handle: &mut SocketHandle,
+    _max_bytes: u64,
+    _timeout_millis: u64,
+) -> Result<(Vec<u8>, String), SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_shutdown_write(handle: &mut SocketHandle) -> Result<(), SocketError> {
+    let SocketHandle::TcpStream(stream) = handle else {
+        return Err(socket_state(handle, "关闭写端", "TCP流"));
+    };
+    match stream.stream.shutdown(Shutdown::Write) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+        Err(error) => Err(socket_io_error("SOCKET_STATE", "关闭 TCP 写端", error)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_shutdown_write(_handle: &mut SocketHandle) -> Result<(), SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_set_nodelay(handle: &mut SocketHandle, enabled: bool) -> Result<(), SocketError> {
+    let SocketHandle::TcpStream(stream) = handle else {
+        return Err(socket_state(handle, "TCP无延迟", "TCP流"));
+    };
+    stream
+        .stream
+        .set_nodelay(enabled)
+        .map_err(|error| socket_io_error("SOCKET_STATE", "设置 TCP 无延迟", error))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_set_nodelay(_handle: &mut SocketHandle, _enabled: bool) -> Result<(), SocketError> {
     Err(socket_unsupported())
 }
 
@@ -1670,6 +2028,14 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpBytesResponse {
+    pub status: u16,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 pub fn http_request(method: &str, url: &str, body: Option<&str>) -> Result<String, NetworkError> {
     http_request_with_options(
         method,
@@ -1708,6 +2074,42 @@ pub fn http_request_with_options_guarded(
     max_bytes: u64,
     permissions: &crate::permissions::PermissionSet,
 ) -> Result<HttpResponse, NetworkError> {
+    let headers = vec![
+        ("content-type".into(), "text/plain; charset=utf-8".into()),
+        (
+            "accept".into(),
+            "text/plain, application/json;q=0.9, */*;q=0.1".into(),
+        ),
+    ];
+    let response = http_request_bytes_with_options_guarded(
+        method,
+        url,
+        &headers,
+        body.map(str::as_bytes),
+        timeout_millis,
+        max_bytes,
+        permissions,
+    )?;
+    let body = String::from_utf8(response.body)
+        .map_err(|_| NetworkError::new("NET_UTF8", "HTTP 响应正文不是 UTF-8 文字"))?;
+    Ok(HttpResponse {
+        status: response.status,
+        url: response.url,
+        headers: response.headers,
+        body,
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn http_request_bytes_with_options_guarded(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    timeout_millis: u64,
+    max_bytes: u64,
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<HttpBytesResponse, NetworkError> {
     use ureq::ResponseExt as _;
 
     let mut parsed = Url::parse(url)
@@ -1721,7 +2123,8 @@ pub fn http_request_with_options_guarded(
     }
     let mut method = ureq::http::Method::from_bytes(method.as_bytes())
         .map_err(|error| NetworkError::new("NET_PROTOCOL", format!("HTTP 方法无效：{error}")))?;
-    let mut request_body = body.map(str::as_bytes);
+    let mut request_headers = validate_request_headers(headers)?;
+    let mut request_body = body.map(<[u8]>::to_vec);
     let deadline = Instant::now() + Duration::from_millis(timeout_millis);
     for redirect_count in 0..=HTTP_MAX_REDIRECTS {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1750,12 +2153,14 @@ pub fn http_request_with_options_guarded(
             ureq::unversioned::transport::DefaultConnector::default(),
             resolver,
         );
-        let request = ureq::http::Request::builder()
+        let mut request = ureq::http::Request::builder()
             .method(method.clone())
-            .uri(parsed.as_str())
-            .header("content-type", "text/plain; charset=utf-8")
-            .header("accept", "text/plain, application/json;q=0.9, */*;q=0.1")
-            .body(request_body.unwrap_or_default())
+            .uri(parsed.as_str());
+        for (name, value) in &request_headers {
+            request = request.header(name, value);
+        }
+        let request = request
+            .body(request_body.as_deref().unwrap_or_default())
             .map_err(|error| {
                 NetworkError::new("NET_URL", format!("不能建立 HTTP 请求：{error}"))
             })?;
@@ -1788,12 +2193,21 @@ pub fn http_request_with_options_guarded(
             permissions
                 .check_network(next.as_str())
                 .map_err(network_permission_error)?;
+            if !same_http_origin(&parsed, &next) {
+                request_headers.retain(|(name, _)| {
+                    !matches!(
+                        name.as_str(),
+                        "authorization" | "cookie" | "proxy-authorization"
+                    )
+                });
+            }
             if matches!(status, 301..=303)
                 && method != ureq::http::Method::GET
                 && method != ureq::http::Method::HEAD
             {
                 method = ureq::http::Method::GET;
                 request_body = None;
+                request_headers.retain(|(name, _)| name != "content-type");
             }
             parsed = next;
             continue;
@@ -1825,16 +2239,65 @@ pub fn http_request_with_options_guarded(
             .limit(max_bytes)
             .read_to_vec()
             .map_err(network_error_from_ureq)?;
-        let body = String::from_utf8(bytes)
-            .map_err(|_| NetworkError::new("NET_UTF8", "HTTP 响应正文不是 UTF-8 文字"))?;
-        return Ok(HttpResponse {
+        return Ok(HttpBytesResponse {
             status,
             url: final_url,
             headers,
-            body,
+            body: bytes,
         });
     }
     unreachable!("redirect loop returns at its configured bound")
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn validate_request_headers(
+    headers: &[(String, String)],
+) -> Result<Vec<(String, String)>, NetworkError> {
+    const FORBIDDEN: &[&str] = &[
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    let mut validated = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        let normalized = name.trim().to_ascii_lowercase();
+        if normalized.is_empty() || FORBIDDEN.contains(&normalized.as_str()) {
+            return Err(NetworkError::new(
+                "NET_HEADER",
+                format!("HTTP 请求首部“{name}”不可由调用方设置"),
+            ));
+        }
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            return Err(NetworkError::new(
+                "NET_HEADER",
+                "HTTP 请求首部不得含回车或换行",
+            ));
+        }
+        let header_name = ureq::http::HeaderName::from_bytes(normalized.as_bytes())
+            .map_err(|_| NetworkError::new("NET_HEADER", format!("HTTP 请求首部名“{name}”无效")))?;
+        let header_value = ureq::http::HeaderValue::from_str(value).map_err(|_| {
+            NetworkError::new("NET_HEADER", format!("HTTP 请求首部“{name}”的值无效"))
+        })?;
+        validated.push((
+            header_name.as_str().to_owned(),
+            header_value.to_str().unwrap_or_default().to_owned(),
+        ));
+    }
+    Ok(validated)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn same_http_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1918,6 +2381,22 @@ pub fn http_request_with_options(
 }
 
 #[cfg(target_family = "wasm")]
+pub fn http_request_bytes_with_options_guarded(
+    _method: &str,
+    _url: &str,
+    _headers: &[(String, String)],
+    _body: Option<&[u8]>,
+    _timeout_millis: u64,
+    _max_bytes: u64,
+    _permissions: &crate::permissions::PermissionSet,
+) -> Result<HttpBytesResponse, NetworkError> {
+    Err(NetworkError::new(
+        "NET_PROTOCOL",
+        "WASI 运行时未授予原生网络传输能力",
+    ))
+}
+
+#[cfg(target_family = "wasm")]
 pub fn http_request_with_options_guarded(
     _method: &str,
     _url: &str,
@@ -1981,6 +2460,88 @@ fn network_error_from_ureq(error: ureq::Error) -> NetworkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_primitives_preserve_arbitrary_bytes_and_security_properties() {
+        let bytes = bytes_from_numbers(&[0.0, 0xff as f64, 0x80 as f64, 1.0]).unwrap();
+        assert_eq!(bytes, [0, 255, 128, 1]);
+        assert_eq!(bytes_slice(&bytes, 1, 3).unwrap(), [255, 128]);
+        assert_eq!(bytes_concat(&bytes[..2], &bytes[2..]).unwrap(), bytes);
+        assert_eq!(bytes_find(&bytes, &[255, 128]), Some(1));
+        assert_eq!(bytes_find(&bytes, &[2]), None);
+        assert!(bytes_from_numbers(&[256.0]).is_err());
+
+        let digest = hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog").unwrap();
+        assert_eq!(
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+        assert!(constant_time_equal(&digest, &digest));
+        assert!(!constant_time_equal(&digest, &digest[..31]));
+        assert_eq!(secure_random_bytes(32).unwrap().len(), 32);
+        assert_eq!(
+            format_http_date(0).unwrap(),
+            "Thu, 01 Jan 1970 00:00:00 GMT"
+        );
+        assert!(format_http_date(253_402_300_800_000).is_err());
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn binary_http_request_preserves_headers_body_and_response_bytes() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let length = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..length]);
+                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    && request.len() >= header_end + 4 + 3
+                {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+            assert!(headers.to_ascii_lowercase().contains("x-yanxu: binary"));
+            assert_eq!(&request[header_end + 4..], &[0, 255, 1]);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\xff\x00\x80",
+                )
+                .unwrap();
+        });
+        let permissions = crate::permissions::PermissionSet::unrestricted();
+        let response = http_request_bytes_with_options_guarded(
+            "POST",
+            &format!("http://{address}/binary"),
+            &[("X-Yanxu".into(), "binary".into())],
+            Some(&[0, 255, 1]),
+            1_000,
+            64,
+            &permissions,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, [255, 0, 128]);
+    }
 
     #[test]
     fn normalizes_paths_without_touching_the_file_system() {
@@ -2343,6 +2904,43 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
+    fn tcp_binary_reads_report_eof_and_exact_read_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&[0, 255, 1]).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+        let mut client = socket_tcp_connect(&address.to_string(), 1_000).unwrap();
+        socket_set_nodelay(&mut client, true).unwrap();
+        assert_eq!(
+            socket_read_exact_bytes(&mut client, 3, 1_000).unwrap(),
+            [0, 255, 1]
+        );
+        let eof = socket_receive_bytes(&mut client, 8, 1_000).unwrap();
+        assert!(eof.eof);
+        assert!(eof.bytes.is_empty());
+        server.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&[1, 2]).unwrap();
+        });
+        let mut client = socket_tcp_connect(&address.to_string(), 1_000).unwrap();
+        assert_eq!(
+            socket_read_exact_bytes(&mut client, 3, 1_000)
+                .unwrap_err()
+                .code,
+            "SOCKET_EOF"
+        );
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
     fn socket_quota_limits_resources_and_releases_capacity_on_close() {
         let permissions = crate::permissions::PermissionSet::sandboxed()
             .allow_tcp_listen("127.0.0.1")
@@ -2433,7 +3031,7 @@ mod tests {
         let manifest = api_manifest().unwrap();
         assert_eq!(manifest["schema_version"], API_MANIFEST_SCHEMA_VERSION);
         let modules = manifest["modules"].as_array().unwrap();
-        assert_eq!(modules.len(), 22);
+        assert_eq!(modules.len(), 23);
         let socket_module = modules
             .iter()
             .find(|module| module["name"] == "套接字")

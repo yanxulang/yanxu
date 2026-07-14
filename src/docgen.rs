@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 const BUILTIN_TYPES: &[(&str, &str)] = &[
     ("数", "有限浮点数"),
     ("文", "Unicode 文字"),
+    ("字节串", "不可变的任意二进制数据"),
     ("理", "真或假"),
     ("空", "无值"),
     ("列", "可变有序容器"),
@@ -524,6 +525,16 @@ mod tests {
         assert!(output.contains("[`数`](#类型-数)"));
         assert!(!output.contains("`秘`"));
         assert_eq!(stable_anchor("法", "加一"), "法-加一");
+    }
+
+    #[test]
+    fn links_binary_values_to_the_builtin_type_index() {
+        let output = markdown(
+            "二进制接口",
+            &crate::parse("/// 原始响应。\n公 定 响应：字节串 为 空；").unwrap(),
+        );
+        assert!(output.contains("[`字节串`](#类型-字节串)"));
+        assert!(output.contains("`字节串`：不可变的任意二进制数据"));
     }
 
     #[test]

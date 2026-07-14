@@ -132,19 +132,29 @@ fn initialize_result() -> Value {
 }
 
 fn semantic_response(method: &str, uri: &str, source: &str, request: &Value) -> Value {
+    let (line, utf16_column) = request_position(request);
+    let column = character_column(source, line, utf16_column);
     let Ok(index) = SemanticIndex::build(source, uri) else {
         return if method == "textDocument/completion" {
-            completion_items(None, 1, 1)
+            completion_items(
+                None,
+                line,
+                column,
+                standard_module_at_completion(source, line, column).as_deref(),
+            )
         } else if method == "textDocument/documentSymbol" {
             json!([])
         } else {
             Value::Null
         };
     };
-    let (line, utf16_column) = request_position(request);
-    let column = character_column(source, line, utf16_column);
     match method {
-        "textDocument/completion" => completion_items(Some(&index), line, column),
+        "textDocument/completion" => completion_items(
+            Some(&index),
+            line,
+            column,
+            standard_module_at_completion(source, line, column).as_deref(),
+        ),
         "textDocument/definition" => definition(&index, uri, source, line, column),
         "textDocument/references" => references(
             &index,
@@ -165,7 +175,12 @@ fn semantic_response(method: &str, uri: &str, source: &str, request: &Value) -> 
     }
 }
 
-fn completion_items(index: Option<&SemanticIndex>, line: usize, column: usize) -> Value {
+fn completion_items(
+    index: Option<&SemanticIndex>,
+    line: usize,
+    column: usize,
+    standard_module: Option<&str>,
+) -> Value {
     let mut items = Vec::new();
     if let Some(index) = index {
         for symbol in index.visible_symbols(line, column) {
@@ -186,6 +201,26 @@ fn completion_items(index: Option<&SemanticIndex>, line: usize, column: usize) -
             "sortText": format!("1-{name}")
         }));
     }
+    if let Some(module_name) = standard_module
+        && let Ok(manifest) = crate::stdlib::api_manifest()
+        && let Some(module) = manifest["modules"]
+            .as_array()
+            .and_then(|modules| modules.iter().find(|module| module["name"] == module_name))
+        && let Some(members) = module["members"].as_array()
+    {
+        for member in members {
+            let Some(name) = member["name"].as_str() else {
+                continue;
+            };
+            items.push(json!({
+                "label": name,
+                "kind": if member["kind"] == "constant" { 21 } else { 3 },
+                "detail": member["signature"].as_str().unwrap_or("标准库成员"),
+                "documentation": format!("标准:{module_name}.{name}"),
+                "sortText": format!("0-stdlib-{name}")
+            }));
+        }
+    }
     for keyword in KEYWORDS {
         items.push(json!({
             "label": keyword,
@@ -195,6 +230,49 @@ fn completion_items(index: Option<&SemanticIndex>, line: usize, column: usize) -
         }));
     }
     json!({"isIncomplete": false, "items": items})
+}
+
+fn standard_module_at_completion(source: &str, line: usize, column: usize) -> Option<String> {
+    let prefix = source
+        .lines()
+        .nth(line.saturating_sub(1))?
+        .chars()
+        .take(column.saturating_sub(1))
+        .collect::<String>();
+    let tokens = crate::lexer::scan(&prefix).ok()?;
+    let mut kinds = tokens
+        .iter()
+        .map(|token| &token.kind)
+        .filter(|kind| !matches!(kind, TokenKind::Eof))
+        .rev();
+    if !matches!(kinds.next(), Some(TokenKind::Dot)) {
+        return None;
+    }
+    let Some(TokenKind::Identifier(alias)) = kinds.next() else {
+        return None;
+    };
+    let tokens = crate::lexer::scan(source).ok()?;
+    tokens.windows(4).find_map(|tokens| match tokens {
+        [
+            crate::token::Token {
+                kind: TokenKind::Import,
+                ..
+            },
+            crate::token::Token {
+                kind: TokenKind::String(path),
+                ..
+            },
+            crate::token::Token {
+                kind: TokenKind::Be,
+                ..
+            },
+            crate::token::Token {
+                kind: TokenKind::Identifier(candidate),
+                ..
+            },
+        ] if candidate == alias => path.strip_prefix("标准:").map(str::to_owned),
+        _ => None,
+    })
 }
 
 fn definition(index: &SemanticIndex, uri: &str, source: &str, line: usize, column: usize) -> Value {
@@ -601,6 +679,33 @@ mod tests {
             &request("textDocument/documentSymbol", 0, 0),
         );
         assert_eq!(symbols[0]["name"], "求和");
+    }
+
+    #[test]
+    fn completes_versioned_binary_standard_library_members() {
+        let source = "引「标准:字节」为 字节；\n字节.";
+        assert_eq!(
+            standard_module_at_completion(source, 2, 4).as_deref(),
+            Some("字节")
+        );
+        let completion = semantic_response(
+            "textDocument/completion",
+            "file:///字节.yx",
+            source,
+            &request("textDocument/completion", 1, 3),
+        );
+        let items = completion["items"].as_array().unwrap();
+        for member in ["从文字", "转文字", "切片", "从数列"] {
+            assert!(
+                items.iter().any(|item| {
+                    item["label"] == member
+                        && item["documentation"]
+                            .as_str()
+                            .is_some_and(|detail| detail.starts_with("标准:字节."))
+                }),
+                "缺少字节标准库补全：{member}"
+            );
+        }
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub struct EngineConfig {
     pub permissions: PermissionSet,
     pub static_check: bool,
     pub budget: crate::budget::ExecutionBudget,
+    pub arguments: Vec<String>,
 }
 
 impl EngineConfig {
@@ -30,6 +31,7 @@ impl EngineConfig {
             permissions: PermissionSet::sandboxed(),
             static_check: true,
             budget: crate::budget::ExecutionBudget::default(),
+            arguments: Vec::new(),
         }
     }
 
@@ -39,6 +41,7 @@ impl EngineConfig {
             permissions: PermissionSet::unrestricted(),
             static_check: true,
             budget: crate::budget::ExecutionBudget::default(),
+            arguments: Vec::new(),
         }
     }
 }
@@ -64,6 +67,7 @@ enum Runtime {
 pub struct Execution {
     pub value: String,
     pub value_type: String,
+    pub value_bytes: Option<Vec<u8>>,
     pub output: Vec<String>,
     pub backend: Backend,
 }
@@ -111,8 +115,14 @@ impl Engine {
             }
         };
         match &mut runtime {
-            Runtime::Tree(interpreter) => interpreter.set_budget(config.budget),
-            Runtime::Bytecode(vm) => vm.set_budget(config.budget),
+            Runtime::Tree(interpreter) => {
+                interpreter.set_budget(config.budget);
+                interpreter.set_arguments(config.arguments.clone());
+            }
+            Runtime::Bytecode(vm) => {
+                vm.set_budget(config.budget);
+                vm.set_arguments(config.arguments.clone());
+            }
         }
         runtime
     }
@@ -190,6 +200,7 @@ impl Engine {
                 .map(|value| Execution {
                     value: value.to_string(),
                     value_type: value.type_name(),
+                    value_bytes: value.as_bytes().map(<[u8]>::to_vec),
                     output: interpreter.take_output(),
                     backend: Backend::Tree,
                 })
@@ -202,6 +213,7 @@ impl Engine {
                     .map(|value| Execution {
                         value: value.to_string(),
                         value_type: value.type_name(),
+                        value_bytes: value.as_bytes().map(<[u8]>::to_vec),
                         output: vm.take_output(),
                         backend: Backend::Bytecode,
                     })
@@ -245,6 +257,21 @@ mod tests {
             assert_eq!(first.backend, backend);
             let second = engine.run("置 值 为 值 加 3；言 值；").unwrap();
             assert_eq!(second.output, ["5"]);
+        }
+    }
+
+    #[test]
+    fn embedded_engines_return_binary_values_and_arguments() {
+        for backend in [Backend::Tree, Backend::Bytecode] {
+            let mut config = EngineConfig::sandboxed(backend);
+            config.arguments = vec!["甲".into(), "乙".into()];
+            let mut engine = Engine::new(config);
+            let execution = engine
+                .run("引「标准:环境」为 环境；引「标准:字节」为 字节；言 长度（环境.参数（））；字节.从数列（【0，255，128】）；")
+                .unwrap();
+            assert_eq!(execution.output, ["2"]);
+            assert_eq!(execution.value_type, "字节串");
+            assert_eq!(execution.value_bytes, Some(vec![0, 255, 128]));
         }
     }
 

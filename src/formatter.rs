@@ -464,4 +464,13 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with("公 异 法 求和"));
     }
+
+    #[test]
+    fn preserves_binary_type_annotations_and_standard_calls() {
+        let source = "引「标准:字节」为 字节；定 数据：字节串 为 字节.从数列（【0，255】）；言 字节.长度（数据）；";
+        let formatted = format(&crate::parse(source).unwrap());
+        assert!(formatted.contains("数据：字节串"));
+        assert!(formatted.contains("字节.从数列"));
+        assert_eq!(formatted, format(&crate::parse(&formatted).unwrap()));
+    }
 }

@@ -91,6 +91,7 @@ pub unsafe extern "C" fn yanxu_engine_run(
             "ok": true,
             "value": execution.value,
             "type": execution.value_type,
+            "value_bytes": execution.value_bytes,
             "output": execution.output,
             "backend": backend_name(execution.backend),
         })),

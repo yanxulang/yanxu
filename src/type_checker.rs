@@ -1461,6 +1461,62 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 TypeSet::named("文"),
             );
         }
+        "字节" => {
+            for function in ["从文字", "转文字"] {
+                let (parameter, result) = if function == "从文字" {
+                    ("文", "字节串")
+                } else {
+                    ("字节串", "文")
+                };
+                insert_std_function(
+                    &mut shape,
+                    function,
+                    vec![TypeSet::named(parameter)],
+                    TypeSet::named(result),
+                );
+            }
+            insert_std_function(
+                &mut shape,
+                "长度",
+                vec![TypeSet::named("字节串")],
+                TypeSet::named("数"),
+            );
+            insert_std_function(
+                &mut shape,
+                "切片",
+                vec![
+                    TypeSet::named("字节串"),
+                    TypeSet::named("数"),
+                    TypeSet::named("数"),
+                ],
+                TypeSet::named("字节串"),
+            );
+            for function in ["拼接", "查找"] {
+                insert_std_function(
+                    &mut shape,
+                    function,
+                    vec![TypeSet::named("字节串"), TypeSet::named("字节串")],
+                    if function == "拼接" {
+                        TypeSet::named("字节串")
+                    } else {
+                        TypeSet::union(vec![TypeSet::named("数"), TypeSet::named("空")])
+                    },
+                );
+            }
+            let number_list = TypeSet::single(StaticType::List(Box::new(TypeSet::named("数"))));
+            insert_std_function(
+                &mut shape,
+                "从数列",
+                vec![number_list.clone()],
+                TypeSet::named("字节串"),
+            );
+            insert_std_function(
+                &mut shape,
+                "转数列",
+                vec![TypeSet::named("字节串")],
+                number_list,
+            );
+        }
         "时间" => {
             for function in ["今", "毫秒"] {
                 insert_std_function(&mut shape, function, vec![], TypeSet::named("数"));
@@ -1499,6 +1555,29 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 vec![TypeSet::named("文")],
                 TypeSet::named("列"),
             );
+            insert_std_function(
+                &mut shape,
+                "读取字节",
+                vec![TypeSet::named("文")],
+                TypeSet::named("字节串"),
+            );
+            for function in ["写入字节", "追加字节"] {
+                insert_std_function(
+                    &mut shape,
+                    function,
+                    vec![TypeSet::named("文"), TypeSet::named("字节串")],
+                    TypeSet::named("数"),
+                );
+            }
+            insert_std_function(
+                &mut shape,
+                "状态",
+                vec![TypeSet::named("文")],
+                TypeSet::single(StaticType::Map(
+                    Box::new(TypeSet::named("文")),
+                    Box::new(TypeSet::any()),
+                )),
+            );
         }
         "JSON" | "json" => {
             insert_std_function(
@@ -1534,6 +1613,25 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                     TypeSet::named("文"),
                     TypeSet::named("文"),
                     TypeSet::named("文"),
+                    TypeSet::named("数"),
+                    TypeSet::named("数"),
+                ],
+                TypeSet::single(StaticType::Map(
+                    Box::new(TypeSet::named("文")),
+                    Box::new(TypeSet::any()),
+                )),
+            );
+            insert_std_function(
+                &mut shape,
+                "请求字节",
+                vec![
+                    TypeSet::named("文"),
+                    TypeSet::named("文"),
+                    TypeSet::single(StaticType::Map(
+                        Box::new(TypeSet::named("文")),
+                        Box::new(TypeSet::named("文")),
+                    )),
+                    TypeSet::union(vec![TypeSet::named("字节串"), TypeSet::named("空")]),
                     TypeSet::named("数"),
                     TypeSet::named("数"),
                 ],
@@ -1580,6 +1678,31 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
             );
             insert_std_function(
                 &mut shape,
+                "发送字节",
+                vec![
+                    socket.clone(),
+                    TypeSet::named("字节串"),
+                    TypeSet::named("数"),
+                ],
+                TypeSet::named("数"),
+            );
+            for function in ["接收字节", "精确读取"] {
+                insert_std_function(
+                    &mut shape,
+                    function,
+                    vec![socket.clone(), TypeSet::named("数"), TypeSet::named("数")],
+                    if function == "精确读取" {
+                        TypeSet::named("字节串")
+                    } else {
+                        TypeSet::single(StaticType::Map(
+                            Box::new(TypeSet::named("文")),
+                            Box::new(TypeSet::any()),
+                        ))
+                    },
+                );
+            }
+            insert_std_function(
+                &mut shape,
                 "UDP绑定",
                 vec![TypeSet::named("文")],
                 socket.clone(),
@@ -1606,6 +1729,26 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
             );
             insert_std_function(
                 &mut shape,
+                "UDP发送字节至",
+                vec![
+                    socket.clone(),
+                    TypeSet::named("字节串"),
+                    TypeSet::named("文"),
+                    TypeSet::named("数"),
+                ],
+                TypeSet::named("数"),
+            );
+            insert_std_function(
+                &mut shape,
+                "UDP接收字节自",
+                vec![socket.clone(), TypeSet::named("数"), TypeSet::named("数")],
+                TypeSet::single(StaticType::Map(
+                    Box::new(TypeSet::named("文")),
+                    Box::new(TypeSet::any()),
+                )),
+            );
+            insert_std_function(
+                &mut shape,
                 "本地地址",
                 vec![socket.clone()],
                 TypeSet::named("文"),
@@ -1616,7 +1759,24 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 vec![socket.clone()],
                 TypeSet::union(vec![TypeSet::named("文"), TypeSet::named("空")]),
             );
-            insert_std_function(&mut shape, "关闭", vec![socket], TypeSet::named("空"));
+            insert_std_function(
+                &mut shape,
+                "关闭",
+                vec![socket.clone()],
+                TypeSet::named("空"),
+            );
+            insert_std_function(
+                &mut shape,
+                "关闭写端",
+                vec![socket.clone()],
+                TypeSet::named("空"),
+            );
+            insert_std_function(
+                &mut shape,
+                "TCP无延迟",
+                vec![socket, TypeSet::named("理")],
+                TypeSet::named("空"),
+            );
         }
         "测试" => {
             insert_std_function(
@@ -1679,13 +1839,28 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
             for function in ["当前目录", "系统", "架构"] {
                 insert_std_function(&mut shape, function, vec![], TypeSet::named("文"));
             }
+            insert_std_function(&mut shape, "参数", vec![], TypeSet::named("列"));
         }
-        "哈希" => insert_std_function(
-            &mut shape,
-            "SHA256",
-            vec![TypeSet::named("文")],
-            TypeSet::named("文"),
-        ),
+        "哈希" => {
+            insert_std_function(
+                &mut shape,
+                "SHA256",
+                vec![TypeSet::named("文")],
+                TypeSet::named("文"),
+            );
+            insert_std_function(
+                &mut shape,
+                "HMACSHA256",
+                vec![TypeSet::named("字节串"), TypeSet::named("字节串")],
+                TypeSet::named("字节串"),
+            );
+            insert_std_function(
+                &mut shape,
+                "恒时相等",
+                vec![TypeSet::named("字节串"), TypeSet::named("字节串")],
+                TypeSet::named("理"),
+            );
+        }
         "编码" => {
             for function in ["十六进制", "解十六进制", "百分号", "解百分号"] {
                 insert_std_function(
@@ -1740,6 +1915,12 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 "布尔",
                 vec![TypeSet::named("数")],
                 TypeSet::named("理"),
+            );
+            insert_std_function(
+                &mut shape,
+                "安全字节",
+                vec![TypeSet::named("数")],
+                TypeSet::named("字节串"),
             );
         }
         "标识" => {
@@ -1896,6 +2077,18 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 "相差天数",
                 vec![TypeSet::named("文"), TypeSet::named("文")],
                 TypeSet::named("数"),
+            );
+            insert_std_function(
+                &mut shape,
+                "HTTP日期",
+                vec![TypeSet::named("数")],
+                TypeSet::named("文"),
+            );
+            insert_std_function(
+                &mut shape,
+                "解析HTTP日期",
+                vec![TypeSet::named("文")],
+                TypeSet::union(vec![TypeSet::named("数"), TypeSet::named("空")]),
             );
         }
         _ => return None,

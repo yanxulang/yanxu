@@ -41,13 +41,27 @@ fn main() -> ExitCode {
             if (command == "包" || command == "package")
                 && (action == "运行" || action == "run") =>
         {
-            package_run(".")
+            package_run(".", &[])
+        }
+        [command, action, delimiter, program_arguments @ ..]
+            if (command == "包" || command == "package")
+                && (action == "运行" || action == "run")
+                && delimiter == "--" =>
+        {
+            package_run(".", program_arguments)
         }
         [command, action, path]
             if (command == "包" || command == "package")
                 && (action == "运行" || action == "run") =>
         {
-            package_run(path)
+            package_run(path, &[])
+        }
+        [command, action, path, delimiter, program_arguments @ ..]
+            if (command == "包" || command == "package")
+                && (action == "运行" || action == "run")
+                && delimiter == "--" =>
+        {
+            package_run(path, program_arguments)
         }
         [command, action] if (command == "包" || command == "package") && action == "锁" => {
             package_lock(".", false, false)
@@ -78,12 +92,17 @@ fn main() -> ExitCode {
             package_lock(path, true, false)
         }
         [command, path] if command == "包" || command == "package" => package_info(path),
-        [command, path] if command == "字节" || command == "vm" => run_vm(path, false),
+        [command, path] if command == "字节" || command == "vm" => run_vm(path, false, &[]),
+        [command, path, delimiter, program_arguments @ ..]
+            if (command == "字节" || command == "vm") && delimiter == "--" =>
+        {
+            run_vm(path, false, program_arguments)
+        }
         [command, flag, path]
             if (command == "字节" || command == "vm")
                 && (flag == "--反汇编" || flag == "--disassemble") =>
         {
-            run_vm(path, true)
+            run_vm(path, true, &[])
         }
         [command, path] if command == "格" || command == "fmt" => format_file(path, false),
         [command, flag, path]
@@ -113,7 +132,10 @@ fn main() -> ExitCode {
         [command, path, output] if command == "文" || command == "doc" => {
             document_file(path, Some(output))
         }
-        [path] => run_file(path),
+        [path] => run_file(path, &[]),
+        [path, delimiter, program_arguments @ ..] if delimiter == "--" => {
+            run_file(path, program_arguments)
+        }
         _ => fail("用法有误。可用 `yanxu --help` 查看说明。"),
     }
 }
@@ -128,8 +150,9 @@ fn fail(message: impl AsRef<str>) -> ExitCode {
     ExitCode::from(1)
 }
 
-fn run_file(path: &str) -> ExitCode {
+fn run_file(path: &str, arguments: &[String]) -> ExitCode {
     let mut interpreter = Interpreter::new();
+    interpreter.set_arguments(arguments.to_vec());
     match run_file_with(&mut interpreter, path) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(error.to_string()),
@@ -236,7 +259,7 @@ fn standard_library_info(json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn package_run(path: &str) -> ExitCode {
+fn package_run(path: &str, arguments: &[String]) -> ExitCode {
     let manifest = match yanxu::package::discover(path) {
         Ok(Some(manifest)) => manifest,
         Ok(None) => return fail(format!("未找到 {}", yanxu::package::MANIFEST_NAME)),
@@ -244,6 +267,7 @@ fn package_run(path: &str) -> ExitCode {
     };
     let entry = manifest.root.join(&manifest.entry);
     let mut interpreter = Interpreter::with_permissions(manifest.permissions);
+    interpreter.set_arguments(arguments.to_vec());
     match run_file_with(&mut interpreter, entry) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(error.to_string()),
@@ -275,7 +299,7 @@ fn package_lock(path: &str, update: bool, offline: bool) -> ExitCode {
     }
 }
 
-fn run_vm(path: &str, disassemble: bool) -> ExitCode {
+fn run_vm(path: &str, disassemble: bool, arguments: &[String]) -> ExitCode {
     let (canonical, statements) = match source_file(path) {
         Ok(result) => result,
         Err(error) => return fail(error),
@@ -288,6 +312,7 @@ fn run_vm(path: &str, disassemble: bool) -> ExitCode {
         println!("{}", chunk.disassemble());
     }
     let mut vm = yanxu::vm::Vm::new();
+    vm.set_arguments(arguments.to_vec());
     match vm.execute_in_directory(&chunk, canonical.parent().unwrap_or_else(|| Path::new("."))) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(error.to_string()),
@@ -681,7 +706,29 @@ fn version() {
 
 fn help() {
     println!(
-        "言序——文言风格的解释型编程语言\n\n用法：\n  yanxu [文卷.yx]       以树解释器执行（兼容模式，不限制宿主能力）\n  yanxu 查 <文卷>        静态类型检查并报告弃用\n  yanxu 字节 <文卷>      以字节码 VM 执行\n  yanxu 格 [--写] <文卷>  格式化\n  yanxu 试 [目录] [--筛 词] [--并发 N] [--超时 ms] [--json]\n                         运行 .yx 规格测试\n  yanxu 兼容 [目录] [--json]  对照树解释器与 VM 的版本语料\n  yanxu 迁 [--检查|--差异|--写] <文卷>  检查或应用弃用迁移\n  yanxu 标准库 [--json]   显示版本化标准库 API 清单\n  yanxu 包 [路径]          显示包清单\n  yanxu 包 运行 [路径]     按清单权限运行包入口\n  yanxu 包 锁 [--离线] [路径]  生成或验证锁文件\n  yanxu 文 <文卷> [输出]  生成公开 API 文档\n  yanxu 调 <文卷>          执行并输出踪迹\n  yanxu 调试服务          启动 DAP 调试适配器\n  yanxu 基准 [轮数]       比较树解释器与 VM\n  yanxu 语言服务          启动 LSP stdio 服务\n\n不带参数时进入带历史与补全的多行 REPL。"
+        r#"言序——文言风格的解释型编程语言
+
+用法：
+  yanxu [文卷.yx] [-- 参数...]  以树解释器执行（兼容模式，不限制宿主能力）
+  yanxu 查 <文卷>        静态类型检查并报告弃用
+  yanxu 字节 <文卷> [-- 参数...]  以字节码 VM 执行
+  yanxu 格 [--写] <文卷>  格式化
+  yanxu 试 [目录] [--筛 词] [--并发 N] [--超时 ms] [--json]
+                         运行 .yx 规格测试
+  yanxu 兼容 [目录] [--json]  对照树解释器与 VM 的版本语料
+  yanxu 迁 [--检查|--差异|--写] <文卷>  检查或应用弃用迁移
+  yanxu 标准库 [--json]   显示版本化标准库 API 清单
+  yanxu 包 [路径]          显示包清单
+  yanxu 包 运行 [路径] [-- 参数...]  按清单权限运行包入口
+  yanxu 包 锁 [--离线] [路径]  生成或验证锁文件
+  yanxu 文 <文卷> [输出]  生成公开 API 文档
+  yanxu 调 <文卷>          执行并输出踪迹
+  yanxu 调试服务          启动 DAP 调试适配器
+  yanxu 基准 [轮数]       比较树解释器与 VM
+  yanxu 语言服务          启动 LSP stdio 服务
+
+程序参数通过 `--` 与言序命令分隔，并由 `标准:环境.参数（）` 读取。
+不带参数时进入带历史与补全的多行 REPL。"#
     );
     println!("\n包项目的创建、依赖增删与安装请使用独立官方工具 yanbao。");
 }

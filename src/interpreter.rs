@@ -41,32 +41,46 @@ enum NativeKind {
 #[derive(Clone, Copy)]
 enum GuardedNative {
     ReadFile,
+    ReadBytes,
     WriteFile,
+    WriteBytes,
     AppendFile,
+    AppendBytes,
+    FileStatus,
     PathExists,
     ReadDirectory,
     HttpGet,
     HttpPost,
     HttpRequest,
+    HttpBytesRequest,
     SocketTcpConnect,
     SocketTcpListen,
     SocketAccept,
     SocketSend,
     SocketReceive,
+    SocketSendBytes,
+    SocketReceiveBytes,
+    SocketReadExact,
     SocketUdpBind,
     SocketUdpSendTo,
     SocketUdpReceiveFrom,
+    SocketUdpSendBytesTo,
+    SocketUdpReceiveBytesFrom,
     SocketLocalAddress,
     SocketPeerAddress,
     SocketClose,
+    SocketShutdownWrite,
+    SocketSetNodelay,
     EnvRead,
     EnvExists,
+    Arguments,
 }
 
 #[derive(Clone)]
 pub enum Value {
     Number(f64),
     String(String),
+    Bytes(Rc<Vec<u8>>),
     Bool(bool),
     Nil,
     Function(Rc<Function>),
@@ -96,6 +110,7 @@ impl fmt::Display for Value {
             Self::Number(number) if number.fract() == 0.0 => write!(f, "{number:.0}"),
             Self::Number(number) => write!(f, "{number}"),
             Self::String(text) => write!(f, "{text}"),
+            Self::Bytes(bytes) => write!(f, "<字节串 {} 字节>", bytes.len()),
             Self::Bool(true) => write!(f, "真"),
             Self::Bool(false) => write!(f, "假"),
             Self::Nil => write!(f, "空"),
@@ -145,6 +160,7 @@ impl Value {
         match self {
             Self::Number(_) => "数".into(),
             Self::String(_) => "文".into(),
+            Self::Bytes(_) => "字节串".into(),
             Self::Bool(_) => "理".into(),
             Self::Nil => "空".into(),
             Self::Function(_) | Self::Native(_) => "法".into(),
@@ -164,6 +180,13 @@ impl Value {
 
     fn truthy(&self) -> bool {
         !matches!(self, Self::Nil | Self::Bool(false))
+    }
+
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            _ => None,
+        }
     }
 }
 
@@ -203,11 +226,22 @@ impl RuntimeError {
         }
     }
 
+    fn bytes(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            frames: Vec::new(),
+            span: None,
+        }
+    }
+
     fn category(&self) -> &'static str {
         if self.code.starts_with("NET_") {
             "网络"
         } else if self.code.starts_with("SOCKET_") {
             "套接字"
+        } else if self.code.starts_with("BYTES_") {
+            "字节"
         } else {
             "运行"
         }
@@ -644,6 +678,7 @@ pub struct Interpreter {
     permissions: crate::permissions::PermissionSet,
     socket_quota: crate::stdlib::SocketQuota,
     resources: crate::budget::ResourceMeter,
+    arguments: Vec<String>,
 }
 
 struct ActiveDebugFrame {
@@ -736,7 +771,12 @@ impl Interpreter {
             permissions: crate::permissions::PermissionSet::unrestricted(),
             socket_quota: crate::stdlib::SocketQuota::default(),
             resources: crate::budget::ResourceMeter::new(crate::budget::ExecutionBudget::default()),
+            arguments: Vec::new(),
         }
+    }
+
+    pub fn set_arguments(&mut self, arguments: Vec<String>) {
+        self.arguments = arguments;
     }
 
     pub fn set_budget(&mut self, budget: crate::budget::ExecutionBudget) {
@@ -1567,17 +1607,41 @@ impl Interpreter {
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 native_read_file(arguments)
             }
+            GuardedNative::ReadBytes => {
+                self.permissions
+                    .check_file(string_argument(arguments, 0, "文件.读取字节")?)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                native_read_bytes(arguments)
+            }
             GuardedNative::WriteFile => {
                 self.permissions
                     .check_file(string_argument(arguments, 0, "写入")?)
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 native_write_file(arguments)
             }
+            GuardedNative::WriteBytes => {
+                self.permissions
+                    .check_file(string_argument(arguments, 0, "文件.写入字节")?)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                native_write_bytes(arguments)
+            }
             GuardedNative::AppendFile => {
                 self.permissions
                     .check_file(string_argument(arguments, 0, "追加")?)
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 native_append_file(arguments)
+            }
+            GuardedNative::AppendBytes => {
+                self.permissions
+                    .check_file(string_argument(arguments, 0, "文件.追加字节")?)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                native_append_bytes(arguments)
+            }
+            GuardedNative::FileStatus => {
+                self.permissions
+                    .check_file(string_argument(arguments, 0, "文件.状态")?)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                native_file_status(arguments)
             }
             GuardedNative::PathExists => {
                 self.permissions
@@ -1594,6 +1658,9 @@ impl Interpreter {
             GuardedNative::HttpGet => native_http_get(arguments, &self.permissions),
             GuardedNative::HttpPost => native_http_post(arguments, &self.permissions),
             GuardedNative::HttpRequest => native_http_request(arguments, &self.permissions),
+            GuardedNative::HttpBytesRequest => {
+                native_http_bytes_request(arguments, &self.permissions)
+            }
             GuardedNative::SocketTcpConnect => {
                 native_socket_tcp_connect(arguments, &self.permissions, &self.socket_quota)
             }
@@ -1603,6 +1670,9 @@ impl Interpreter {
             GuardedNative::SocketAccept => native_socket_accept(arguments),
             GuardedNative::SocketSend => native_socket_send(arguments),
             GuardedNative::SocketReceive => native_socket_receive(arguments),
+            GuardedNative::SocketSendBytes => native_socket_send_bytes(arguments),
+            GuardedNative::SocketReceiveBytes => native_socket_receive_bytes(arguments),
+            GuardedNative::SocketReadExact => native_socket_read_exact(arguments),
             GuardedNative::SocketUdpBind => {
                 native_socket_udp_bind(arguments, &self.permissions, &self.socket_quota)
             }
@@ -1610,9 +1680,17 @@ impl Interpreter {
                 native_socket_udp_send_to(arguments, &self.permissions)
             }
             GuardedNative::SocketUdpReceiveFrom => native_socket_udp_receive_from(arguments),
+            GuardedNative::SocketUdpSendBytesTo => {
+                native_socket_udp_send_bytes_to(arguments, &self.permissions)
+            }
+            GuardedNative::SocketUdpReceiveBytesFrom => {
+                native_socket_udp_receive_bytes_from(arguments)
+            }
             GuardedNative::SocketLocalAddress => native_socket_local_address(arguments),
             GuardedNative::SocketPeerAddress => native_socket_peer_address(arguments),
             GuardedNative::SocketClose => native_socket_close(arguments),
+            GuardedNative::SocketShutdownWrite => native_socket_shutdown_write(arguments),
+            GuardedNative::SocketSetNodelay => native_socket_set_nodelay(arguments),
             GuardedNative::EnvRead => {
                 self.permissions
                     .check_environment(string_argument(arguments, 0, "环境.读取")?)
@@ -1625,6 +1703,9 @@ impl Interpreter {
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 native_env_exists(arguments)
             }
+            GuardedNative::Arguments => Ok(Value::List(Rc::new(RefCell::new(
+                self.arguments.iter().cloned().map(Value::String).collect(),
+            )))),
         }
     }
 
@@ -2353,6 +2434,40 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
             define_export_native(&environment, &mut exports, "字符列", 1, native_characters);
             define_export_native(&environment, &mut exports, "联结", 2, native_join);
         }
+        "字节" => {
+            define_export_native(
+                &environment,
+                &mut exports,
+                "从文字",
+                1,
+                native_bytes_from_text,
+            );
+            define_export_native(
+                &environment,
+                &mut exports,
+                "转文字",
+                1,
+                native_bytes_to_text,
+            );
+            define_export_native(&environment, &mut exports, "长度", 1, native_bytes_length);
+            define_export_native(&environment, &mut exports, "切片", 3, native_bytes_slice);
+            define_export_native(&environment, &mut exports, "拼接", 2, native_bytes_concat);
+            define_export_native(&environment, &mut exports, "查找", 2, native_bytes_find);
+            define_export_native(
+                &environment,
+                &mut exports,
+                "从数列",
+                1,
+                native_bytes_from_numbers,
+            );
+            define_export_native(
+                &environment,
+                &mut exports,
+                "转数列",
+                1,
+                native_bytes_to_numbers,
+            );
+        }
         "时间" => {
             define_export_native(&environment, &mut exports, "今", 0, native_clock);
             define_export_native(&environment, &mut exports, "毫秒", 0, native_millis);
@@ -2394,6 +2509,20 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
                 1,
                 NativeKind::Guarded(GuardedNative::ReadDirectory),
             );
+            for (name, arity, function) in [
+                ("读取字节", 1, GuardedNative::ReadBytes),
+                ("写入字节", 2, GuardedNative::WriteBytes),
+                ("追加字节", 2, GuardedNative::AppendBytes),
+                ("状态", 1, GuardedNative::FileStatus),
+            ] {
+                define_export_intrinsic(
+                    &environment,
+                    &mut exports,
+                    name,
+                    arity,
+                    NativeKind::Guarded(function),
+                );
+            }
         }
         "JSON" | "json" => {
             define_export_native(&environment, &mut exports, "解析", 1, native_json_parse);
@@ -2427,6 +2556,13 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
                 5,
                 NativeKind::Guarded(GuardedNative::HttpRequest),
             );
+            define_export_intrinsic(
+                &environment,
+                &mut exports,
+                "请求字节",
+                6,
+                NativeKind::Guarded(GuardedNative::HttpBytesRequest),
+            );
         }
         "套接字" => {
             for (name, arity, function) in [
@@ -2435,12 +2571,19 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
                 ("接受", 2, GuardedNative::SocketAccept),
                 ("发送", 3, GuardedNative::SocketSend),
                 ("接收", 3, GuardedNative::SocketReceive),
+                ("发送字节", 3, GuardedNative::SocketSendBytes),
+                ("接收字节", 3, GuardedNative::SocketReceiveBytes),
+                ("精确读取", 3, GuardedNative::SocketReadExact),
                 ("UDP绑定", 1, GuardedNative::SocketUdpBind),
                 ("UDP发送至", 4, GuardedNative::SocketUdpSendTo),
                 ("UDP接收自", 3, GuardedNative::SocketUdpReceiveFrom),
+                ("UDP发送字节至", 4, GuardedNative::SocketUdpSendBytesTo),
+                ("UDP接收字节自", 3, GuardedNative::SocketUdpReceiveBytesFrom),
                 ("本地地址", 1, GuardedNative::SocketLocalAddress),
                 ("对端地址", 1, GuardedNative::SocketPeerAddress),
                 ("关闭", 1, GuardedNative::SocketClose),
+                ("关闭写端", 1, GuardedNative::SocketShutdownWrite),
+                ("TCP无延迟", 2, GuardedNative::SocketSetNodelay),
             ] {
                 define_export_intrinsic(
                     &environment,
@@ -2512,9 +2655,30 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
             );
             define_export_native(&environment, &mut exports, "系统", 0, native_os);
             define_export_native(&environment, &mut exports, "架构", 0, native_arch);
+            define_export_intrinsic(
+                &environment,
+                &mut exports,
+                "参数",
+                0,
+                NativeKind::Guarded(GuardedNative::Arguments),
+            );
         }
         "哈希" => {
             define_export_native(&environment, &mut exports, "SHA256", 1, native_sha256);
+            define_export_native(
+                &environment,
+                &mut exports,
+                "HMACSHA256",
+                2,
+                native_hmac_sha256,
+            );
+            define_export_native(
+                &environment,
+                &mut exports,
+                "恒时相等",
+                2,
+                native_constant_time_equal,
+            );
         }
         "编码" => {
             define_export_native(&environment, &mut exports, "十六进制", 1, native_hex_encode);
@@ -2561,6 +2725,13 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
             define_export_native(&environment, &mut exports, "小数", 1, native_random_unit);
             define_export_native(&environment, &mut exports, "整数", 3, native_random_integer);
             define_export_native(&environment, &mut exports, "布尔", 1, native_random_bool);
+            define_export_native(
+                &environment,
+                &mut exports,
+                "安全字节",
+                1,
+                native_secure_random_bytes,
+            );
         }
         "标识" => {
             define_export_native(
@@ -2693,6 +2864,14 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
                 "相差天数",
                 2,
                 native_date_days_between,
+            );
+            define_export_native(&environment, &mut exports, "HTTP日期", 1, native_http_date);
+            define_export_native(
+                &environment,
+                &mut exports,
+                "解析HTTP日期",
+                1,
+                native_parse_http_date,
             );
         }
         _ => return Err(RuntimeError::new(format!("未有标准模块“{name}”"))),
@@ -2900,6 +3079,22 @@ fn native_sha256(arguments: &[Value]) -> Result<Value, RuntimeError> {
     )?)))
 }
 
+fn native_hmac_sha256(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let key = bytes_argument(arguments, 0, "哈希.HMACSHA256")?;
+    let body = bytes_argument(arguments, 1, "哈希.HMACSHA256")?;
+    crate::stdlib::hmac_sha256(&key, &body)
+        .map(|bytes| Value::Bytes(Rc::new(bytes)))
+        .map_err(|message| RuntimeError::bytes("BYTES_CRYPTO", message))
+}
+
+fn native_constant_time_equal(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let left = bytes_argument(arguments, 0, "哈希.恒时相等")?;
+    let right = bytes_argument(arguments, 1, "哈希.恒时相等")?;
+    Ok(Value::Bool(crate::stdlib::constant_time_equal(
+        &left, &right,
+    )))
+}
+
 fn native_hex_encode(arguments: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::String(crate::stdlib::hex_encode(string_argument(
         arguments,
@@ -2996,6 +3191,18 @@ fn native_random_bool(arguments: &[Value]) -> Result<Value, RuntimeError> {
     crate::stdlib::seeded_random_bool(number_argument(arguments, 0, "随机.布尔")?)
         .map(Value::Bool)
         .map_err(RuntimeError::new)
+}
+
+fn native_secure_random_bytes(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let length = nonnegative_usize_argument(
+        arguments,
+        0,
+        "随机.安全字节",
+        crate::stdlib::SECURE_RANDOM_MAX_BYTES,
+    )?;
+    crate::stdlib::secure_random_bytes(length)
+        .map(|bytes| Value::Bytes(Rc::new(bytes)))
+        .map_err(|message| RuntimeError::bytes("BYTES_RANDOM", message))
 }
 
 fn native_stable_uuid(arguments: &[Value]) -> Result<Value, RuntimeError> {
@@ -3226,8 +3433,90 @@ fn native_date_days_between(arguments: &[Value]) -> Result<Value, RuntimeError> 
     .map_err(RuntimeError::new)
 }
 
+fn native_http_date(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let millis = nonnegative_safe_u64_argument(arguments, 0, "日期.HTTP日期")?;
+    crate::stdlib::format_http_date(millis)
+        .map(Value::String)
+        .map_err(RuntimeError::new)
+}
+
+fn native_parse_http_date(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(
+        crate::stdlib::parse_http_date(string_argument(arguments, 0, "日期.解析HTTP日期")?)
+            .map_or(Value::Nil, |millis| Value::Number(millis as f64)),
+    )
+}
+
 fn optional_string(value: Option<String>) -> Value {
     value.map_or(Value::Nil, Value::String)
+}
+
+fn native_bytes_from_text(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let text = string_argument(arguments, 0, "字节.从文字")?;
+    if text.len() > crate::stdlib::BYTES_MAX_VALUE_BYTES {
+        return Err(RuntimeError::bytes(
+            "BYTES_LIMIT",
+            format!(
+                "字节串不得超过 {} 字节",
+                crate::stdlib::BYTES_MAX_VALUE_BYTES
+            ),
+        ));
+    }
+    Ok(Value::Bytes(Rc::new(text.as_bytes().to_vec())))
+}
+
+fn native_bytes_to_text(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let bytes = bytes_argument(arguments, 0, "字节.转文字")?;
+    String::from_utf8(bytes.as_ref().clone())
+        .map(Value::String)
+        .map_err(|_| RuntimeError::bytes("BYTES_UTF8", "字节串不是有效的 UTF-8 文字"))
+}
+
+fn native_bytes_length(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::Number(
+        bytes_argument(arguments, 0, "字节.长度")?.len() as f64,
+    ))
+}
+
+fn native_bytes_slice(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let bytes = bytes_argument(arguments, 0, "字节.切片")?;
+    let start = nonnegative_usize_argument(arguments, 1, "字节.切片", bytes.len())?;
+    let end = nonnegative_usize_argument(arguments, 2, "字节.切片", bytes.len())?;
+    crate::stdlib::bytes_slice(&bytes, start, end)
+        .map(|bytes| Value::Bytes(Rc::new(bytes)))
+        .map_err(|message| RuntimeError::bytes("BYTES_RANGE", message))
+}
+
+fn native_bytes_concat(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let left = bytes_argument(arguments, 0, "字节.拼接")?;
+    let right = bytes_argument(arguments, 1, "字节.拼接")?;
+    crate::stdlib::bytes_concat(&left, &right)
+        .map(|bytes| Value::Bytes(Rc::new(bytes)))
+        .map_err(|message| RuntimeError::bytes("BYTES_LIMIT", message))
+}
+
+fn native_bytes_find(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let source = bytes_argument(arguments, 0, "字节.查找")?;
+    let needle = bytes_argument(arguments, 1, "字节.查找")?;
+    Ok(crate::stdlib::bytes_find(&source, &needle)
+        .map_or(Value::Nil, |index| Value::Number(index as f64)))
+}
+
+fn native_bytes_from_numbers(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let numbers = number_sequence_argument(arguments, 0, "字节.从数列")?;
+    crate::stdlib::bytes_from_numbers(&numbers)
+        .map(|bytes| Value::Bytes(Rc::new(bytes)))
+        .map_err(|message| RuntimeError::bytes("BYTES_VALUE", message))
+}
+
+fn native_bytes_to_numbers(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let bytes = bytes_argument(arguments, 0, "字节.转数列")?;
+    Ok(Value::List(Rc::new(RefCell::new(
+        bytes
+            .iter()
+            .map(|byte| Value::Number(f64::from(*byte)))
+            .collect(),
+    ))))
 }
 
 fn native_trim(arguments: &[Value]) -> Result<Value, RuntimeError> {
@@ -3344,11 +3633,33 @@ fn native_read_file(arguments: &[Value]) -> Result<Value, RuntimeError> {
         .map_err(|error| RuntimeError::new(format!("不能读取“{path}”：{error}")))
 }
 
+fn native_read_bytes(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let path = string_argument(arguments, 0, "文件.读取字节")?;
+    crate::stdlib::read_file_bytes(Path::new(path))
+        .map(|bytes| Value::Bytes(Rc::new(bytes)))
+        .map_err(|source| match source {
+            crate::stdlib::FileBytesError::Io(message) => {
+                RuntimeError::new(format!("“{path}”：{message}"))
+            }
+            crate::stdlib::FileBytesError::Limit(message) => {
+                RuntimeError::bytes("BYTES_LIMIT", format!("“{path}”：{message}"))
+            }
+        })
+}
+
 fn native_write_file(arguments: &[Value]) -> Result<Value, RuntimeError> {
     let path = string_argument(arguments, 0, "写入")?;
     let text = string_argument(arguments, 1, "写入")?;
     fs::write(path, text)
         .map(|()| Value::Number(text.len() as f64))
+        .map_err(|error| RuntimeError::new(format!("不能写入“{path}”：{error}")))
+}
+
+fn native_write_bytes(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let path = string_argument(arguments, 0, "文件.写入字节")?;
+    let bytes = bytes_argument(arguments, 1, "文件.写入字节")?;
+    fs::write(path, bytes.as_ref())
+        .map(|()| Value::Number(bytes.len() as f64))
         .map_err(|error| RuntimeError::new(format!("不能写入“{path}”：{error}")))
 }
 
@@ -3363,6 +3674,35 @@ fn native_append_file(arguments: &[Value]) -> Result<Value, RuntimeError> {
     file.write_all(text.as_bytes())
         .map_err(|error| RuntimeError::new(format!("不能追加“{path}”：{error}")))?;
     Ok(Value::Number(text.len() as f64))
+}
+
+fn native_append_bytes(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let path = string_argument(arguments, 0, "文件.追加字节")?;
+    let bytes = bytes_argument(arguments, 1, "文件.追加字节")?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| RuntimeError::new(format!("不能打开“{path}”：{error}")))?;
+    file.write_all(&bytes)
+        .map_err(|error| RuntimeError::new(format!("不能追加“{path}”：{error}")))?;
+    Ok(Value::Number(bytes.len() as f64))
+}
+
+fn native_file_status(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let path = string_argument(arguments, 0, "文件.状态")?;
+    let status = crate::stdlib::file_status(Path::new(path)).map_err(RuntimeError::new)?;
+    Ok(string_key_map(vec![
+        ("种类", Value::String(status.kind.into())),
+        ("字节数", Value::Number(status.bytes as f64)),
+        ("只读", Value::Bool(status.readonly)),
+        (
+            "修改毫秒",
+            status
+                .modified_millis
+                .map_or(Value::Nil, |millis| Value::Number(millis as f64)),
+        ),
+    ]))
 }
 
 fn native_path_exists(arguments: &[Value]) -> Result<Value, RuntimeError> {
@@ -3460,6 +3800,51 @@ fn native_http_request(
     }))))
 }
 
+fn native_http_bytes_request(
+    arguments: &[Value],
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<Value, RuntimeError> {
+    let headers = string_map_argument(arguments, 2, "网络.请求字节")?;
+    let body = match &arguments[3] {
+        Value::Nil => None,
+        Value::Bytes(bytes) => Some(bytes.clone()),
+        value => {
+            return Err(RuntimeError::bytes(
+                "BYTES_TYPE",
+                format!(
+                    "“网络.请求字节”第 4 参数须为字节串或空，不可为{}",
+                    value.type_name()
+                ),
+            ));
+        }
+    };
+    let timeout = positive_u64_argument(arguments, 4, "网络.请求字节", "超时毫秒")?;
+    let max_bytes = socket_max_bytes_argument(arguments, 5, "网络.请求字节")?;
+    let response = crate::stdlib::http_request_bytes_with_options_guarded(
+        string_argument(arguments, 0, "网络.请求字节")?,
+        string_argument(arguments, 1, "网络.请求字节")?,
+        &headers,
+        body.as_deref().map(Vec::as_slice),
+        timeout,
+        max_bytes,
+        permissions,
+    )
+    .map_err(RuntimeError::network)?;
+    let headers = Value::Map(Rc::new(RefCell::new(YanxuMap {
+        entries: response
+            .headers
+            .into_iter()
+            .map(|(name, value)| (Value::String(name), Value::String(value)))
+            .collect(),
+    })));
+    Ok(string_key_map(vec![
+        ("状态", Value::Number(f64::from(response.status))),
+        ("地址", Value::String(response.url)),
+        ("首部", headers),
+        ("正文", Value::Bytes(Rc::new(response.body))),
+    ]))
+}
+
 fn native_socket_tcp_connect(
     arguments: &[Value],
     permissions: &crate::permissions::PermissionSet,
@@ -3512,6 +3897,37 @@ fn native_socket_receive(arguments: &[Value]) -> Result<Value, RuntimeError> {
         .map_err(RuntimeError::socket)
 }
 
+fn native_socket_send_bytes(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let bytes = bytes_argument(arguments, 1, "套接字.发送字节")?;
+    let timeout = socket_timeout_argument(arguments, 2, "套接字.发送字节")?;
+    let socket = socket_argument(arguments, 0, "套接字.发送字节")?;
+    crate::stdlib::socket_send_bytes(&mut socket.borrow_mut(), &bytes, timeout)
+        .map(|written| Value::Number(written as f64))
+        .map_err(RuntimeError::socket)
+}
+
+fn native_socket_receive_bytes(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let max_bytes = socket_max_bytes_argument(arguments, 1, "套接字.接收字节")?;
+    let timeout = socket_timeout_argument(arguments, 2, "套接字.接收字节")?;
+    let socket = socket_argument(arguments, 0, "套接字.接收字节")?;
+    let received =
+        crate::stdlib::socket_receive_bytes(&mut socket.borrow_mut(), max_bytes, timeout)
+            .map_err(RuntimeError::socket)?;
+    Ok(string_key_map(vec![
+        ("数据", Value::Bytes(Rc::new(received.bytes))),
+        ("已结束", Value::Bool(received.eof)),
+    ]))
+}
+
+fn native_socket_read_exact(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let byte_count = socket_max_bytes_argument(arguments, 1, "套接字.精确读取")?;
+    let timeout = socket_timeout_argument(arguments, 2, "套接字.精确读取")?;
+    let socket = socket_argument(arguments, 0, "套接字.精确读取")?;
+    crate::stdlib::socket_read_exact_bytes(&mut socket.borrow_mut(), byte_count, timeout)
+        .map(|bytes| Value::Bytes(Rc::new(bytes)))
+        .map_err(RuntimeError::socket)
+}
+
 fn native_socket_udp_bind(
     arguments: &[Value],
     permissions: &crate::permissions::PermissionSet,
@@ -3555,6 +3971,38 @@ fn native_socket_udp_receive_from(arguments: &[Value]) -> Result<Value, RuntimeE
     ]))
 }
 
+fn native_socket_udp_send_bytes_to(
+    arguments: &[Value],
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<Value, RuntimeError> {
+    let bytes = bytes_argument(arguments, 1, "套接字.UDP发送字节至")?;
+    let address = string_argument(arguments, 2, "套接字.UDP发送字节至")?;
+    let timeout = socket_timeout_argument(arguments, 3, "套接字.UDP发送字节至")?;
+    let socket = socket_argument(arguments, 0, "套接字.UDP发送字节至")?;
+    crate::stdlib::socket_udp_send_bytes_to_guarded(
+        &mut socket.borrow_mut(),
+        &bytes,
+        address,
+        timeout,
+        permissions,
+    )
+    .map(|written| Value::Number(written as f64))
+    .map_err(RuntimeError::socket)
+}
+
+fn native_socket_udp_receive_bytes_from(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let max_bytes = socket_max_bytes_argument(arguments, 1, "套接字.UDP接收字节自")?;
+    let timeout = socket_timeout_argument(arguments, 2, "套接字.UDP接收字节自")?;
+    let socket = socket_argument(arguments, 0, "套接字.UDP接收字节自")?;
+    let (bytes, peer) =
+        crate::stdlib::socket_udp_receive_bytes_from(&mut socket.borrow_mut(), max_bytes, timeout)
+            .map_err(RuntimeError::socket)?;
+    Ok(string_key_map(vec![
+        ("数据", Value::Bytes(Rc::new(bytes))),
+        ("对端", Value::String(peer)),
+    ]))
+}
+
 fn native_socket_local_address(arguments: &[Value]) -> Result<Value, RuntimeError> {
     let socket = socket_argument(arguments, 0, "套接字.本地地址")?;
     crate::stdlib::socket_local_address(&socket.borrow())
@@ -3572,6 +4020,21 @@ fn native_socket_peer_address(arguments: &[Value]) -> Result<Value, RuntimeError
 fn native_socket_close(arguments: &[Value]) -> Result<Value, RuntimeError> {
     let socket = socket_argument(arguments, 0, "套接字.关闭")?;
     crate::stdlib::socket_close(&mut socket.borrow_mut())
+        .map(|()| Value::Nil)
+        .map_err(RuntimeError::socket)
+}
+
+fn native_socket_shutdown_write(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let socket = socket_argument(arguments, 0, "套接字.关闭写端")?;
+    crate::stdlib::socket_shutdown_write(&mut socket.borrow_mut())
+        .map(|()| Value::Nil)
+        .map_err(RuntimeError::socket)
+}
+
+fn native_socket_set_nodelay(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let enabled = bool_argument(arguments, 1, "套接字.TCP无延迟")?;
+    let socket = socket_argument(arguments, 0, "套接字.TCP无延迟")?;
+    crate::stdlib::socket_set_nodelay(&mut socket.borrow_mut(), enabled)
         .map(|()| Value::Nil)
         .map_err(RuntimeError::socket)
 }
@@ -3630,6 +4093,7 @@ fn native_assert_not_nil(arguments: &[Value]) -> Result<Value, RuntimeError> {
 fn native_length(arguments: &[Value]) -> Result<Value, RuntimeError> {
     match &arguments[0] {
         Value::String(text) => Ok(Value::Number(text.chars().count() as f64)),
+        Value::Bytes(bytes) => Ok(Value::Number(bytes.len() as f64)),
         Value::List(items) => Ok(Value::Number(items.borrow().len() as f64)),
         Value::Tuple(items) => Ok(Value::Number(items.len() as f64)),
         Value::Map(map) => Ok(Value::Number(map.borrow().entries.len() as f64)),
@@ -3747,6 +4211,37 @@ fn positive_u64_argument(
     Ok(number as u64)
 }
 
+fn nonnegative_safe_u64_argument(
+    arguments: &[Value],
+    index: usize,
+    function: &str,
+) -> Result<u64, RuntimeError> {
+    let number = number_argument(arguments, index, function)?;
+    if number < 0.0 || number.fract() != 0.0 || number > 9_007_199_254_740_991.0 {
+        return Err(RuntimeError::new(format!(
+            "“{function}”第 {} 参数须为安全非负整数",
+            index + 1
+        )));
+    }
+    Ok(number as u64)
+}
+
+fn nonnegative_usize_argument(
+    arguments: &[Value],
+    index: usize,
+    function: &str,
+    maximum: usize,
+) -> Result<usize, RuntimeError> {
+    let number = number_argument(arguments, index, function)?;
+    if number < 0.0 || number.fract() != 0.0 || number > maximum as f64 {
+        return Err(RuntimeError::bytes(
+            "BYTES_RANGE",
+            format!("“{function}”第 {} 参数须为 0..={maximum} 的整数", index + 1),
+        ));
+    }
+    Ok(number as usize)
+}
+
 fn socket_timeout_argument(
     arguments: &[Value],
     index: usize,
@@ -3802,6 +4297,69 @@ fn string_argument<'a>(
             value.type_name()
         ))),
     }
+}
+
+fn bool_argument(arguments: &[Value], index: usize, function: &str) -> Result<bool, RuntimeError> {
+    match arguments.get(index) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(value) => Err(RuntimeError::new(format!(
+            "“{function}”第 {} 参数须为理，不可为{}",
+            index + 1,
+            value.type_name()
+        ))),
+        None => Err(RuntimeError::new(format!(
+            "“{function}”缺少第 {} 参数",
+            index + 1
+        ))),
+    }
+}
+
+fn bytes_argument(
+    arguments: &[Value],
+    index: usize,
+    function: &str,
+) -> Result<Rc<Vec<u8>>, RuntimeError> {
+    match arguments.get(index) {
+        Some(Value::Bytes(bytes)) => Ok(bytes.clone()),
+        Some(value) => Err(RuntimeError::bytes(
+            "BYTES_TYPE",
+            format!(
+                "“{function}”第 {} 参数须为字节串，不可为{}",
+                index + 1,
+                value.type_name()
+            ),
+        )),
+        None => Err(RuntimeError::bytes(
+            "BYTES_TYPE",
+            format!("“{function}”缺少第 {} 参数", index + 1),
+        )),
+    }
+}
+
+fn string_map_argument(
+    arguments: &[Value],
+    index: usize,
+    function: &str,
+) -> Result<Vec<(String, String)>, RuntimeError> {
+    let Value::Map(map) = &arguments[index] else {
+        return Err(RuntimeError::new(format!(
+            "“{function}”第 {} 参数须为文至文之典，不可为{}",
+            index + 1,
+            arguments[index].type_name()
+        )));
+    };
+    map.borrow()
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(entry_index, (key, value))| match (key, value) {
+            (Value::String(key), Value::String(value)) => Ok((key.clone(), value.clone())),
+            _ => Err(RuntimeError::new(format!(
+                "“{function}”首部第 {} 项之键和值皆须为文",
+                entry_index + 1
+            ))),
+        })
+        .collect()
 }
 
 fn number_sequence_argument(
@@ -4013,6 +4571,7 @@ fn value_matches_type(value: &Value, expected: &TypeKind) -> bool {
             "任意" => true,
             "数" => matches!(value, Value::Number(_)),
             "文" => matches!(value, Value::String(_)),
+            "字节串" => matches!(value, Value::Bytes(_)),
             "理" => matches!(value, Value::Bool(_)),
             "空" => matches!(value, Value::Nil),
             "法" => matches!(value, Value::Function(_) | Value::Native(_)),
@@ -4063,6 +4622,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Number(a), Value::Number(b)) => a == b,
         (Value::String(a), Value::String(b)) => a == b,
+        (Value::Bytes(a), Value::Bytes(b)) => a == b,
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         (Value::Native(a), Value::Native(b)) => Rc::ptr_eq(a, b),
         (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),

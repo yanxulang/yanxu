@@ -81,7 +81,7 @@ jobs:
         run: |
           set -euo pipefail
           target/debug/yanxu 标准库 --json > stdlib.json
-          jq -e '.schema_version == 1 and (.modules | length) == 22' stdlib.json >/dev/null
+          jq -e '.schema_version == 1 and (.modules | length) == 23' stdlib.json >/dev/null
       - name: 编译模糊测试目标
         run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
       - name: 隔离验证 Cargo 发布包

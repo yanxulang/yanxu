@@ -23,6 +23,7 @@ type EnvRef = Rc<RefCell<Environment>>;
 pub enum VmValue {
     Number(f64),
     String(String),
+    Bytes(Rc<Vec<u8>>),
     Bool(bool),
     Nil,
     List(Rc<RefCell<Vec<VmValue>>>),
@@ -62,6 +63,7 @@ impl VmValue {
         match self {
             Self::Number(_) => "数".into(),
             Self::String(_) => "文".into(),
+            Self::Bytes(_) => "字节串".into(),
             Self::Bool(_) => "理".into(),
             Self::Nil => "空".into(),
             Self::List(_) => "列".into(),
@@ -78,6 +80,13 @@ impl VmValue {
             Self::Socket(_) => "套接字".into(),
         }
     }
+
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for VmValue {
@@ -86,6 +95,7 @@ impl fmt::Display for VmValue {
             Self::Number(number) if number.fract() == 0.0 => write!(formatter, "{number:.0}"),
             Self::Number(number) => write!(formatter, "{number}"),
             Self::String(text) => write!(formatter, "{text}"),
+            Self::Bytes(bytes) => write!(formatter, "<字节串 {} 字节>", bytes.len()),
             Self::Bool(true) => formatter.write_str("真"),
             Self::Bool(false) => formatter.write_str("假"),
             Self::Nil => formatter.write_str("空"),
@@ -151,6 +161,8 @@ impl VmError {
             "网络"
         } else if self.code.starts_with("SOCKET_") {
             "套接字"
+        } else if self.code.starts_with("BYTES_") {
+            "字节"
         } else {
             "运行"
         }
@@ -410,11 +422,23 @@ enum StandardNative {
     Lowercase,
     Characters,
     Join,
+    BytesFromText,
+    BytesToText,
+    BytesLength,
+    BytesSlice,
+    BytesConcat,
+    BytesFind,
+    BytesFromNumbers,
+    BytesToNumbers,
     Millis,
     Sleep,
     ReadFile,
+    ReadBytes,
     WriteFile,
+    WriteBytes,
     AppendFile,
+    AppendBytes,
+    FileStatus,
     PathExists,
     ReadDirectory,
     JsonParse,
@@ -422,17 +446,25 @@ enum StandardNative {
     HttpGet,
     HttpPost,
     HttpRequest,
+    HttpBytesRequest,
     SocketTcpConnect,
     SocketTcpListen,
     SocketAccept,
     SocketSend,
     SocketReceive,
+    SocketSendBytes,
+    SocketReceiveBytes,
+    SocketReadExact,
     SocketUdpBind,
     SocketUdpSendTo,
     SocketUdpReceiveFrom,
+    SocketUdpSendBytesTo,
+    SocketUdpReceiveBytesFrom,
     SocketLocalAddress,
     SocketPeerAddress,
     SocketClose,
+    SocketShutdownWrite,
+    SocketSetNodelay,
     Assert,
     AssertEqual,
     AssertNotNil,
@@ -447,7 +479,10 @@ enum StandardNative {
     CurrentDir,
     Os,
     Arch,
+    Arguments,
     Sha256,
+    HmacSha256,
+    ConstantTimeEqual,
     HexEncode,
     HexDecode,
     PercentEncode,
@@ -462,6 +497,7 @@ enum StandardNative {
     RandomUnit,
     RandomInteger,
     RandomBool,
+    SecureRandomBytes,
     StableUuid,
     IsUuid,
     StableShortId,
@@ -491,6 +527,8 @@ enum StandardNative {
     DateIsLeapYear,
     DateAddDays,
     DateDaysBetween,
+    HttpDate,
+    ParseHttpDate,
 }
 
 pub struct VmNative {
@@ -549,6 +587,7 @@ pub struct Vm {
     loading_modules: Vec<PathBuf>,
     permissions: crate::permissions::PermissionSet,
     socket_quota: crate::stdlib::SocketQuota,
+    arguments: Vec<String>,
     resources: crate::budget::ResourceMeter,
 }
 
@@ -603,6 +642,7 @@ impl Vm {
             loading_modules: Vec::new(),
             permissions: crate::permissions::PermissionSet::unrestricted(),
             socket_quota: crate::stdlib::SocketQuota::default(),
+            arguments: Vec::new(),
             resources: crate::budget::ResourceMeter::new(crate::budget::ExecutionBudget::default()),
         };
         for (name, arity, kind) in [
@@ -642,6 +682,10 @@ impl Vm {
 
     pub fn set_budget(&mut self, budget: crate::budget::ExecutionBudget) {
         self.resources.set_budget(budget);
+    }
+
+    pub fn set_arguments(&mut self, arguments: Vec<String>) {
+        self.arguments = arguments;
     }
 
     pub fn budget(&self) -> crate::budget::ExecutionBudget {
@@ -1717,6 +1761,7 @@ impl Vm {
             )),
             NativeKind::Length => match &arguments[0] {
                 VmValue::String(value) => Ok(VmValue::Number(value.chars().count() as f64)),
+                VmValue::Bytes(value) => Ok(VmValue::Number(value.len() as f64)),
                 VmValue::List(value) => Ok(VmValue::Number(value.borrow().len() as f64)),
                 VmValue::Tuple(value) => Ok(VmValue::Number(value.len() as f64)),
                 VmValue::Map(value) => Ok(VmValue::Number(value.borrow().entries.len() as f64)),
@@ -2080,6 +2125,67 @@ impl Vm {
                 let items = vm_string_sequence(&arguments[0], "联结", span)?;
                 Ok(VmValue::String(items.join(separator)))
             }
+            Std::BytesFromText => {
+                let text = vm_string(&arguments[0], "字节.从文字", span)?;
+                if text.len() > crate::stdlib::BYTES_MAX_VALUE_BYTES {
+                    return Err(bytes_error(
+                        span,
+                        "BYTES_LIMIT",
+                        format!(
+                            "字节串不得超过 {} 字节",
+                            crate::stdlib::BYTES_MAX_VALUE_BYTES
+                        ),
+                    ));
+                }
+                Ok(VmValue::Bytes(Rc::new(text.as_bytes().to_vec())))
+            }
+            Std::BytesToText => String::from_utf8(
+                vm_bytes(&arguments[0], "字节.转文字", span)?
+                    .as_ref()
+                    .clone(),
+            )
+            .map(VmValue::String)
+            .map_err(|_| bytes_error(span, "BYTES_UTF8", "字节串不是有效的 UTF-8 文字")),
+            Std::BytesLength => Ok(VmValue::Number(
+                vm_bytes(&arguments[0], "字节.长度", span)?.len() as f64,
+            )),
+            Std::BytesSlice => {
+                let bytes = vm_bytes(&arguments[0], "字节.切片", span)?;
+                let start = vm_nonnegative_usize(&arguments[1], "字节.切片", bytes.len(), span)?;
+                let end = vm_nonnegative_usize(&arguments[2], "字节.切片", bytes.len(), span)?;
+                crate::stdlib::bytes_slice(&bytes, start, end)
+                    .map(|bytes| VmValue::Bytes(Rc::new(bytes)))
+                    .map_err(|message| bytes_error(span, "BYTES_RANGE", message))
+            }
+            Std::BytesConcat => {
+                let left = vm_bytes(&arguments[0], "字节.拼接", span)?;
+                let right = vm_bytes(&arguments[1], "字节.拼接", span)?;
+                crate::stdlib::bytes_concat(&left, &right)
+                    .map(|bytes| VmValue::Bytes(Rc::new(bytes)))
+                    .map_err(|message| bytes_error(span, "BYTES_LIMIT", message))
+            }
+            Std::BytesFind => {
+                let source = vm_bytes(&arguments[0], "字节.查找", span)?;
+                let needle = vm_bytes(&arguments[1], "字节.查找", span)?;
+                Ok(crate::stdlib::bytes_find(&source, &needle)
+                    .map_or(VmValue::Nil, |index| VmValue::Number(index as f64)))
+            }
+            Std::BytesFromNumbers => crate::stdlib::bytes_from_numbers(&vm_number_sequence(
+                &arguments[0],
+                "字节.从数列",
+                span,
+            )?)
+            .map(|bytes| VmValue::Bytes(Rc::new(bytes)))
+            .map_err(|message| bytes_error(span, "BYTES_VALUE", message)),
+            Std::BytesToNumbers => {
+                let bytes = vm_bytes(&arguments[0], "字节.转数列", span)?;
+                Ok(VmValue::List(Rc::new(RefCell::new(
+                    bytes
+                        .iter()
+                        .map(|byte| VmValue::Number(f64::from(*byte)))
+                        .collect(),
+                ))))
+            }
             Std::Millis => Ok(VmValue::Number(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -2105,6 +2211,22 @@ impl Vm {
                         error(span, format!("不能读取“{path}”：{runtime_error}"))
                     })
             }
+            Std::ReadBytes => {
+                let path = vm_string(&arguments[0], "文件.读取字节", span)?;
+                self.permissions
+                    .check_file(path)
+                    .map_err(|permission| error(span, permission.to_string()))?;
+                crate::stdlib::read_file_bytes(Path::new(path))
+                    .map(|bytes| VmValue::Bytes(Rc::new(bytes)))
+                    .map_err(|source| match source {
+                        crate::stdlib::FileBytesError::Io(message) => {
+                            error(span, format!("“{path}”：{message}"))
+                        }
+                        crate::stdlib::FileBytesError::Limit(message) => {
+                            bytes_error(span, "BYTES_LIMIT", format!("“{path}”：{message}"))
+                        }
+                    })
+            }
             Std::WriteFile => {
                 let path = vm_string(&arguments[0], "写入", span)?;
                 let text = vm_string(&arguments[1], "写入", span)?;
@@ -2113,6 +2235,18 @@ impl Vm {
                     .map_err(|permission| error(span, permission.to_string()))?;
                 fs::write(path, text)
                     .map(|()| VmValue::Number(text.len() as f64))
+                    .map_err(|runtime_error| {
+                        error(span, format!("不能写入“{path}”：{runtime_error}"))
+                    })
+            }
+            Std::WriteBytes => {
+                let path = vm_string(&arguments[0], "文件.写入字节", span)?;
+                let bytes = vm_bytes(&arguments[1], "文件.写入字节", span)?;
+                self.permissions
+                    .check_file(path)
+                    .map_err(|permission| error(span, permission.to_string()))?;
+                fs::write(path, bytes.as_ref())
+                    .map(|()| VmValue::Number(bytes.len() as f64))
                     .map_err(|runtime_error| {
                         error(span, format!("不能写入“{path}”：{runtime_error}"))
                     })
@@ -2135,6 +2269,44 @@ impl Vm {
                     error(span, format!("不能追加“{path}”：{runtime_error}"))
                 })?;
                 Ok(VmValue::Number(text.len() as f64))
+            }
+            Std::AppendBytes => {
+                use std::io::Write;
+                let path = vm_string(&arguments[0], "文件.追加字节", span)?;
+                let bytes = vm_bytes(&arguments[1], "文件.追加字节", span)?;
+                self.permissions
+                    .check_file(path)
+                    .map_err(|permission| error(span, permission.to_string()))?;
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|runtime_error| {
+                        error(span, format!("不能打开“{path}”：{runtime_error}"))
+                    })?;
+                file.write_all(&bytes).map_err(|runtime_error| {
+                    error(span, format!("不能追加“{path}”：{runtime_error}"))
+                })?;
+                Ok(VmValue::Number(bytes.len() as f64))
+            }
+            Std::FileStatus => {
+                let path = vm_string(&arguments[0], "文件.状态", span)?;
+                self.permissions
+                    .check_file(path)
+                    .map_err(|permission| error(span, permission.to_string()))?;
+                let status = crate::stdlib::file_status(Path::new(path))
+                    .map_err(|message| error(span, message))?;
+                Ok(vm_string_key_map(vec![
+                    ("种类", VmValue::String(status.kind.into())),
+                    ("字节数", VmValue::Number(status.bytes as f64)),
+                    ("只读", VmValue::Bool(status.readonly)),
+                    (
+                        "修改毫秒",
+                        status
+                            .modified_millis
+                            .map_or(VmValue::Nil, |millis| VmValue::Number(millis as f64)),
+                    ),
+                ]))
             }
             Std::PathExists => {
                 let path = vm_string(&arguments[0], "存在", span)?;
@@ -2235,6 +2407,50 @@ impl Vm {
                     ],
                 }))))
             }
+            Std::HttpBytesRequest => {
+                let method = vm_string(&arguments[0], "网络.请求字节", span)?;
+                let url = vm_string(&arguments[1], "网络.请求字节", span)?;
+                let headers = vm_string_map(&arguments[2], "网络.请求字节", span)?;
+                let body = match &arguments[3] {
+                    VmValue::Nil => None,
+                    VmValue::Bytes(bytes) => Some(bytes.clone()),
+                    value => {
+                        return Err(bytes_error(
+                            span,
+                            "BYTES_TYPE",
+                            format!(
+                                "“网络.请求字节”第 4 参数须为字节串或空，不可为{}",
+                                value.type_name()
+                            ),
+                        ));
+                    }
+                };
+                let timeout = vm_positive_u64(&arguments[4], "网络.请求字节", "超时毫秒", span)?;
+                let max_bytes = vm_socket_max_bytes(&arguments[5], "网络.请求字节", span)?;
+                let response = crate::stdlib::http_request_bytes_with_options_guarded(
+                    method,
+                    url,
+                    &headers,
+                    body.as_deref().map(Vec::as_slice),
+                    timeout,
+                    max_bytes,
+                    &self.permissions,
+                )
+                .map_err(|source| network_error(span, source))?;
+                let headers = VmValue::Map(Rc::new(RefCell::new(VmMap {
+                    entries: response
+                        .headers
+                        .into_iter()
+                        .map(|(name, value)| (VmValue::String(name), VmValue::String(value)))
+                        .collect(),
+                })));
+                Ok(vm_string_key_map(vec![
+                    ("状态", VmValue::Number(f64::from(response.status))),
+                    ("地址", VmValue::String(response.url)),
+                    ("首部", headers),
+                    ("正文", VmValue::Bytes(Rc::new(response.body))),
+                ]))
+            }
             Std::SocketTcpConnect => {
                 let address = vm_string(&arguments[0], "套接字.TCP连接", span)?;
                 let timeout = vm_socket_timeout(&arguments[1], "套接字.TCP连接", span)?;
@@ -2284,6 +2500,41 @@ impl Vm {
                     .map(VmValue::String)
                     .map_err(|source| socket_error(span, source))
             }
+            Std::SocketSendBytes => {
+                let socket = vm_socket(&arguments[0], "套接字.发送字节", span)?;
+                let bytes = vm_bytes(&arguments[1], "套接字.发送字节", span)?;
+                let timeout = vm_socket_timeout(&arguments[2], "套接字.发送字节", span)?;
+                crate::stdlib::socket_send_bytes(&mut socket.borrow_mut(), &bytes, timeout)
+                    .map(|written| VmValue::Number(written as f64))
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketReceiveBytes => {
+                let socket = vm_socket(&arguments[0], "套接字.接收字节", span)?;
+                let max_bytes = vm_socket_max_bytes(&arguments[1], "套接字.接收字节", span)?;
+                let timeout = vm_socket_timeout(&arguments[2], "套接字.接收字节", span)?;
+                let received = crate::stdlib::socket_receive_bytes(
+                    &mut socket.borrow_mut(),
+                    max_bytes,
+                    timeout,
+                )
+                .map_err(|source| socket_error(span, source))?;
+                Ok(vm_string_key_map(vec![
+                    ("数据", VmValue::Bytes(Rc::new(received.bytes))),
+                    ("已结束", VmValue::Bool(received.eof)),
+                ]))
+            }
+            Std::SocketReadExact => {
+                let socket = vm_socket(&arguments[0], "套接字.精确读取", span)?;
+                let byte_count = vm_socket_max_bytes(&arguments[1], "套接字.精确读取", span)?;
+                let timeout = vm_socket_timeout(&arguments[2], "套接字.精确读取", span)?;
+                crate::stdlib::socket_read_exact_bytes(
+                    &mut socket.borrow_mut(),
+                    byte_count,
+                    timeout,
+                )
+                .map(|bytes| VmValue::Bytes(Rc::new(bytes)))
+                .map_err(|source| socket_error(span, source))
+            }
             Std::SocketUdpBind => {
                 let address = vm_string(&arguments[0], "套接字.UDP绑定", span)?;
                 crate::stdlib::socket_udp_bind_guarded(
@@ -2324,6 +2575,36 @@ impl Vm {
                     ("对端", VmValue::String(peer)),
                 ]))
             }
+            Std::SocketUdpSendBytesTo => {
+                let socket = vm_socket(&arguments[0], "套接字.UDP发送字节至", span)?;
+                let bytes = vm_bytes(&arguments[1], "套接字.UDP发送字节至", span)?;
+                let address = vm_string(&arguments[2], "套接字.UDP发送字节至", span)?;
+                let timeout = vm_socket_timeout(&arguments[3], "套接字.UDP发送字节至", span)?;
+                crate::stdlib::socket_udp_send_bytes_to_guarded(
+                    &mut socket.borrow_mut(),
+                    &bytes,
+                    address,
+                    timeout,
+                    &self.permissions,
+                )
+                .map(|written| VmValue::Number(written as f64))
+                .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketUdpReceiveBytesFrom => {
+                let socket = vm_socket(&arguments[0], "套接字.UDP接收字节自", span)?;
+                let max_bytes = vm_socket_max_bytes(&arguments[1], "套接字.UDP接收字节自", span)?;
+                let timeout = vm_socket_timeout(&arguments[2], "套接字.UDP接收字节自", span)?;
+                let (bytes, peer) = crate::stdlib::socket_udp_receive_bytes_from(
+                    &mut socket.borrow_mut(),
+                    max_bytes,
+                    timeout,
+                )
+                .map_err(|source| socket_error(span, source))?;
+                Ok(vm_string_key_map(vec![
+                    ("数据", VmValue::Bytes(Rc::new(bytes))),
+                    ("对端", VmValue::String(peer)),
+                ]))
+            }
             Std::SocketLocalAddress => {
                 let socket = vm_socket(&arguments[0], "套接字.本地地址", span)?;
                 crate::stdlib::socket_local_address(&socket.borrow())
@@ -2339,6 +2620,19 @@ impl Vm {
             Std::SocketClose => {
                 let socket = vm_socket(&arguments[0], "套接字.关闭", span)?;
                 crate::stdlib::socket_close(&mut socket.borrow_mut())
+                    .map(|()| VmValue::Nil)
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketShutdownWrite => {
+                let socket = vm_socket(&arguments[0], "套接字.关闭写端", span)?;
+                crate::stdlib::socket_shutdown_write(&mut socket.borrow_mut())
+                    .map(|()| VmValue::Nil)
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketSetNodelay => {
+                let socket = vm_socket(&arguments[0], "套接字.TCP无延迟", span)?;
+                let enabled = vm_bool(&arguments[1], "套接字.TCP无延迟", span)?;
+                crate::stdlib::socket_set_nodelay(&mut socket.borrow_mut(), enabled)
                     .map(|()| VmValue::Nil)
                     .map_err(|source| socket_error(span, source))
             }
@@ -2416,11 +2710,32 @@ impl Vm {
                 .map_err(|runtime_error| error(span, format!("不能取得当前目录：{runtime_error}"))),
             Std::Os => Ok(VmValue::String(std::env::consts::OS.into())),
             Std::Arch => Ok(VmValue::String(std::env::consts::ARCH.into())),
+            Std::Arguments => Ok(VmValue::List(Rc::new(RefCell::new(
+                self.arguments
+                    .iter()
+                    .cloned()
+                    .map(VmValue::String)
+                    .collect(),
+            )))),
             Std::Sha256 => Ok(VmValue::String(crate::stdlib::sha256(vm_string(
                 &arguments[0],
                 "SHA256",
                 span,
             )?))),
+            Std::HmacSha256 => {
+                let key = vm_bytes(&arguments[0], "哈希.HMACSHA256", span)?;
+                let body = vm_bytes(&arguments[1], "哈希.HMACSHA256", span)?;
+                crate::stdlib::hmac_sha256(&key, &body)
+                    .map(|bytes| VmValue::Bytes(Rc::new(bytes)))
+                    .map_err(|message| bytes_error(span, "BYTES_CRYPTO", message))
+            }
+            Std::ConstantTimeEqual => {
+                let left = vm_bytes(&arguments[0], "哈希.恒时相等", span)?;
+                let right = vm_bytes(&arguments[1], "哈希.恒时相等", span)?;
+                Ok(VmValue::Bool(crate::stdlib::constant_time_equal(
+                    &left, &right,
+                )))
+            }
             Std::HexEncode => Ok(VmValue::String(crate::stdlib::hex_encode(vm_string(
                 &arguments[0],
                 "十六进制",
@@ -2481,6 +2796,17 @@ impl Vm {
             Std::RandomBool => crate::stdlib::seeded_random_bool(number(&arguments[0], span)?)
                 .map(VmValue::Bool)
                 .map_err(|message| error(span, message)),
+            Std::SecureRandomBytes => {
+                let length = vm_nonnegative_usize(
+                    &arguments[0],
+                    "随机.安全字节",
+                    crate::stdlib::SECURE_RANDOM_MAX_BYTES,
+                    span,
+                )?;
+                crate::stdlib::secure_random_bytes(length)
+                    .map(|bytes| VmValue::Bytes(Rc::new(bytes)))
+                    .map_err(|message| bytes_error(span, "BYTES_RANDOM", message))
+            }
             Std::StableUuid => Ok(VmValue::String(crate::stdlib::stable_uuid(vm_string(
                 &arguments[0],
                 "标识.稳定UUID",
@@ -2634,6 +2960,18 @@ impl Vm {
             )
             .map(VmValue::Number)
             .map_err(|message| error(span, message)),
+            Std::HttpDate => {
+                let millis = vm_nonnegative_safe_u64(&arguments[0], "日期.HTTP日期", span)?;
+                crate::stdlib::format_http_date(millis)
+                    .map(VmValue::String)
+                    .map_err(|message| error(span, message))
+            }
+            Std::ParseHttpDate => Ok(crate::stdlib::parse_http_date(vm_string(
+                &arguments[0],
+                "日期.解析HTTP日期",
+                span,
+            )?)
+            .map_or(VmValue::Nil, |millis| VmValue::Number(millis as f64))),
         }
     }
 
@@ -2771,6 +3109,32 @@ impl Vm {
                 ),
                 ("联结", 2, NativeKind::Standard(StandardNative::Join)),
             ],
+            "字节" => &[
+                (
+                    "从文字",
+                    1,
+                    NativeKind::Standard(StandardNative::BytesFromText),
+                ),
+                (
+                    "转文字",
+                    1,
+                    NativeKind::Standard(StandardNative::BytesToText),
+                ),
+                ("长度", 1, NativeKind::Standard(StandardNative::BytesLength)),
+                ("切片", 3, NativeKind::Standard(StandardNative::BytesSlice)),
+                ("拼接", 2, NativeKind::Standard(StandardNative::BytesConcat)),
+                ("查找", 2, NativeKind::Standard(StandardNative::BytesFind)),
+                (
+                    "从数列",
+                    1,
+                    NativeKind::Standard(StandardNative::BytesFromNumbers),
+                ),
+                (
+                    "转数列",
+                    1,
+                    NativeKind::Standard(StandardNative::BytesToNumbers),
+                ),
+            ],
             "时间" => &[
                 ("今", 0, NativeKind::Clock),
                 ("毫秒", 0, NativeKind::Standard(StandardNative::Millis)),
@@ -2778,8 +3142,24 @@ impl Vm {
             ],
             "文件" => &[
                 ("读取", 1, NativeKind::Standard(StandardNative::ReadFile)),
+                (
+                    "读取字节",
+                    1,
+                    NativeKind::Standard(StandardNative::ReadBytes),
+                ),
                 ("写入", 2, NativeKind::Standard(StandardNative::WriteFile)),
+                (
+                    "写入字节",
+                    2,
+                    NativeKind::Standard(StandardNative::WriteBytes),
+                ),
                 ("追加", 2, NativeKind::Standard(StandardNative::AppendFile)),
+                (
+                    "追加字节",
+                    2,
+                    NativeKind::Standard(StandardNative::AppendBytes),
+                ),
+                ("状态", 1, NativeKind::Standard(StandardNative::FileStatus)),
                 ("存在", 1, NativeKind::Standard(StandardNative::PathExists)),
                 (
                     "目录",
@@ -2799,6 +3179,11 @@ impl Vm {
                 ("获取", 1, NativeKind::Standard(StandardNative::HttpGet)),
                 ("发文", 2, NativeKind::Standard(StandardNative::HttpPost)),
                 ("请求", 5, NativeKind::Standard(StandardNative::HttpRequest)),
+                (
+                    "请求字节",
+                    6,
+                    NativeKind::Standard(StandardNative::HttpBytesRequest),
+                ),
             ],
             "套接字" => &[
                 (
@@ -2818,9 +3203,24 @@ impl Vm {
                 ),
                 ("发送", 3, NativeKind::Standard(StandardNative::SocketSend)),
                 (
+                    "发送字节",
+                    3,
+                    NativeKind::Standard(StandardNative::SocketSendBytes),
+                ),
+                (
                     "接收",
                     3,
                     NativeKind::Standard(StandardNative::SocketReceive),
+                ),
+                (
+                    "接收字节",
+                    3,
+                    NativeKind::Standard(StandardNative::SocketReceiveBytes),
+                ),
+                (
+                    "精确读取",
+                    3,
+                    NativeKind::Standard(StandardNative::SocketReadExact),
                 ),
                 (
                     "UDP绑定",
@@ -2838,6 +3238,16 @@ impl Vm {
                     NativeKind::Standard(StandardNative::SocketUdpReceiveFrom),
                 ),
                 (
+                    "UDP发送字节至",
+                    4,
+                    NativeKind::Standard(StandardNative::SocketUdpSendBytesTo),
+                ),
+                (
+                    "UDP接收字节自",
+                    3,
+                    NativeKind::Standard(StandardNative::SocketUdpReceiveBytesFrom),
+                ),
+                (
                     "本地地址",
                     1,
                     NativeKind::Standard(StandardNative::SocketLocalAddress),
@@ -2848,6 +3258,16 @@ impl Vm {
                     NativeKind::Standard(StandardNative::SocketPeerAddress),
                 ),
                 ("关闭", 1, NativeKind::Standard(StandardNative::SocketClose)),
+                (
+                    "关闭写端",
+                    1,
+                    NativeKind::Standard(StandardNative::SocketShutdownWrite),
+                ),
+                (
+                    "TCP无延迟",
+                    2,
+                    NativeKind::Standard(StandardNative::SocketSetNodelay),
+                ),
             ],
             "测试" => &[
                 ("断言", 2, NativeKind::Standard(StandardNative::Assert)),
@@ -2892,8 +3312,21 @@ impl Vm {
                 ),
                 ("系统", 0, NativeKind::Standard(StandardNative::Os)),
                 ("架构", 0, NativeKind::Standard(StandardNative::Arch)),
+                ("参数", 0, NativeKind::Standard(StandardNative::Arguments)),
             ],
-            "哈希" => &[("SHA256", 1, NativeKind::Standard(StandardNative::Sha256))],
+            "哈希" => &[
+                ("SHA256", 1, NativeKind::Standard(StandardNative::Sha256)),
+                (
+                    "HMACSHA256",
+                    2,
+                    NativeKind::Standard(StandardNative::HmacSha256),
+                ),
+                (
+                    "恒时相等",
+                    2,
+                    NativeKind::Standard(StandardNative::ConstantTimeEqual),
+                ),
+            ],
             "编码" => &[
                 (
                     "十六进制",
@@ -2951,6 +3384,11 @@ impl Vm {
                     NativeKind::Standard(StandardNative::RandomInteger),
                 ),
                 ("布尔", 1, NativeKind::Standard(StandardNative::RandomBool)),
+                (
+                    "安全字节",
+                    1,
+                    NativeKind::Standard(StandardNative::SecureRandomBytes),
+                ),
             ],
             "标识" => &[
                 (
@@ -3065,6 +3503,16 @@ impl Vm {
                     "相差天数",
                     2,
                     NativeKind::Standard(StandardNative::DateDaysBetween),
+                ),
+                (
+                    "HTTP日期",
+                    1,
+                    NativeKind::Standard(StandardNative::HttpDate),
+                ),
+                (
+                    "解析HTTP日期",
+                    1,
+                    NativeKind::Standard(StandardNative::ParseHttpDate),
                 ),
             ],
             _ => return Err(error(span, format!("VM 未有标准模块“{name}”"))),
@@ -3273,6 +3721,7 @@ fn values_equal(left: &VmValue, right: &VmValue) -> bool {
         (VmValue::Bool(left), VmValue::Bool(right)) => left == right,
         (VmValue::Number(left), VmValue::Number(right)) => left == right,
         (VmValue::String(left), VmValue::String(right)) => left == right,
+        (VmValue::Bytes(left), VmValue::Bytes(right)) => left == right,
         (VmValue::Tuple(left), VmValue::Tuple(right)) => {
             left.len() == right.len()
                 && left
@@ -3484,6 +3933,7 @@ fn vm_value_matches_type(value: &VmValue, expected: &str) -> bool {
         "任意" => true,
         "数" => matches!(value, VmValue::Number(_)),
         "文" => matches!(value, VmValue::String(_)),
+        "字节串" => matches!(value, VmValue::Bytes(_)),
         "理" => matches!(value, VmValue::Bool(_)),
         "空" => matches!(value, VmValue::Nil),
         "法" => matches!(
@@ -3598,6 +4048,31 @@ fn vm_positive_u64(
     Ok(number as u64)
 }
 
+fn vm_nonnegative_safe_u64(value: &VmValue, function: &str, span: &Span) -> Result<u64, VmError> {
+    let number = number(value, span)?;
+    if number < 0.0 || number.fract() != 0.0 || number > 9_007_199_254_740_991.0 {
+        return Err(error(span, format!("“{function}”参数须为安全非负整数")));
+    }
+    Ok(number as u64)
+}
+
+fn vm_nonnegative_usize(
+    value: &VmValue,
+    function: &str,
+    maximum: usize,
+    span: &Span,
+) -> Result<usize, VmError> {
+    let number = number(value, span)?;
+    if number < 0.0 || number.fract() != 0.0 || number > maximum as f64 {
+        return Err(bytes_error(
+            span,
+            "BYTES_RANGE",
+            format!("“{function}”参数须为 0..={maximum} 的整数"),
+        ));
+    }
+    Ok(number as usize)
+}
+
 fn vm_socket_timeout(value: &VmValue, _function: &str, span: &Span) -> Result<u64, VmError> {
     let number = number(value, span)?;
     if number <= 0.0
@@ -3646,6 +4121,55 @@ fn vm_string<'a>(value: &'a VmValue, function: &str, span: &Span) -> Result<&'a 
             format!("“{function}”参数须为文，不可为{}", value.type_name()),
         )),
     }
+}
+
+fn vm_bool(value: &VmValue, function: &str, span: &Span) -> Result<bool, VmError> {
+    match value {
+        VmValue::Bool(value) => Ok(*value),
+        value => Err(error(
+            span,
+            format!("“{function}”参数须为理，不可为{}", value.type_name()),
+        )),
+    }
+}
+
+fn vm_bytes(value: &VmValue, function: &str, span: &Span) -> Result<Rc<Vec<u8>>, VmError> {
+    match value {
+        VmValue::Bytes(bytes) => Ok(bytes.clone()),
+        value => Err(bytes_error(
+            span,
+            "BYTES_TYPE",
+            format!("“{function}”参数须为字节串，不可为{}", value.type_name()),
+        )),
+    }
+}
+
+fn vm_string_map(
+    value: &VmValue,
+    function: &str,
+    span: &Span,
+) -> Result<Vec<(String, String)>, VmError> {
+    let VmValue::Map(map) = value else {
+        return Err(error(
+            span,
+            format!(
+                "“{function}”参数须为文至文之典，不可为{}",
+                value.type_name()
+            ),
+        ));
+    };
+    map.borrow()
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, (key, value))| match (key, value) {
+            (VmValue::String(key), VmValue::String(value)) => Ok((key.clone(), value.clone())),
+            _ => Err(error(
+                span,
+                format!("“{function}”首部第 {} 项之键和值皆须为文", index + 1),
+            )),
+        })
+        .collect()
 }
 
 fn vm_socket(
@@ -3909,6 +4433,15 @@ fn socket_error(span: &Span, source: crate::stdlib::SocketError) -> VmError {
     VmError {
         code: source.code,
         message: source.message,
+        span: span.clone(),
+        frames: Vec::new(),
+    }
+}
+
+fn bytes_error(span: &Span, code: &'static str, message: impl Into<String>) -> VmError {
+    VmError {
+        code,
+        message: message.into(),
         span: span.clone(),
         frames: Vec::new(),
     }

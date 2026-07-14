@@ -16,6 +16,19 @@
       ]
     },
     {
+      "name": "字节", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"从文字","signature":"法（文）：字节串","errors":["BYTES_LIMIT"]},
+        {"name":"转文字","signature":"法（字节串）：文","errors":["BYTES_UTF8"]},
+        {"name":"长度","signature":"法（字节串）：数"},
+        {"name":"切片","signature":"法（字节串，起点：数，终点：数）：字节串","errors":["BYTES_RANGE"]},
+        {"name":"拼接","signature":"法（字节串，字节串）：字节串","errors":["BYTES_LIMIT"]},
+        {"name":"查找","signature":"法（字节串，字节串）：数?"},
+        {"name":"从数列","signature":"法（列<数>）：字节串","errors":["BYTES_VALUE","BYTES_LIMIT"]},
+        {"name":"转数列","signature":"法（字节串）：列<数>"}
+      ]
+    },
+    {
       "name": "数学",
       "permissions": [], "platforms": ["all"], "deterministic": true,
       "members": [
@@ -40,6 +53,10 @@
         {"name":"读取","signature":"法（文）：文","errors":["权限","I/O","非 UTF-8"]},
         {"name":"写入","signature":"法（文，文）：数","errors":["权限","I/O"]},
         {"name":"追加","signature":"法（文，文）：数","errors":["权限","I/O"]},
+        {"name":"读取字节","signature":"法（文）：字节串","errors":["权限","I/O","BYTES_LIMIT"]},
+        {"name":"写入字节","signature":"法（文，字节串）：数","errors":["权限","I/O"]},
+        {"name":"追加字节","signature":"法（文，字节串）：数","errors":["权限","I/O"]},
+        {"name":"状态","signature":"法（文）：典<文，任意>","errors":["权限","I/O"]},
         {"name":"存在","signature":"法（文）：理","errors":["权限"]},
         {"name":"目录","signature":"法（文）：列<文>","errors":["权限","I/O"]}
       ]
@@ -56,7 +73,8 @@
       "members": [
         {"name":"获取","signature":"法（文）：文","errors":["NET_PERMISSION","NET_URL","NET_DNS","NET_CONNECT","NET_TLS","NET_TIMEOUT","NET_READ","NET_LIMIT","NET_PROTOCOL","NET_STATUS","NET_UTF8"]},
         {"name":"发文","signature":"法（文，文）：文","errors":["NET_PERMISSION","NET_URL","NET_DNS","NET_CONNECT","NET_TLS","NET_TIMEOUT","NET_WRITE","NET_READ","NET_LIMIT","NET_PROTOCOL","NET_STATUS","NET_UTF8"]},
-        {"name":"请求","signature":"法（方法：文，地址：文，正文：文，超时毫秒：数，最大字节：数）：典<文，任意>","errors":["NET_PERMISSION","NET_URL","NET_DNS","NET_CONNECT","NET_TLS","NET_TIMEOUT","NET_WRITE","NET_READ","NET_LIMIT","NET_PROTOCOL","NET_STATUS","NET_UTF8"]}
+        {"name":"请求","signature":"法（方法：文，地址：文，正文：文，超时毫秒：数，最大字节：数）：典<文，任意>","errors":["NET_PERMISSION","NET_URL","NET_DNS","NET_CONNECT","NET_TLS","NET_TIMEOUT","NET_WRITE","NET_READ","NET_LIMIT","NET_PROTOCOL","NET_STATUS","NET_UTF8"]},
+        {"name":"请求字节","signature":"法（方法：文，地址：文，首部：典<文，文>，正文：字节串?，超时毫秒：数，最大字节：数）：典<文，任意>","errors":["NET_PERMISSION","NET_HEADER","NET_URL","NET_DNS","NET_CONNECT","NET_TLS","NET_TIMEOUT","NET_WRITE","NET_READ","NET_LIMIT","NET_PROTOCOL","NET_STATUS"]}
       ]
     },
     {
@@ -67,12 +85,19 @@
         {"name":"接受","signature":"法（监听器：套接字，超时毫秒：数）：典<文，任意>","errors":["SOCKET_ACCEPT","SOCKET_TIMEOUT","SOCKET_LIMIT","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
         {"name":"发送","signature":"法（套接字，正文：文，超时毫秒：数）：数","errors":["SOCKET_TIMEOUT","SOCKET_WRITE","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
         {"name":"接收","signature":"法（套接字，最大字节：数，超时毫秒：数）：文","errors":["SOCKET_TIMEOUT","SOCKET_READ","SOCKET_LIMIT","SOCKET_STATE","SOCKET_UTF8","SOCKET_UNSUPPORTED"]},
+        {"name":"发送字节","signature":"法（套接字，数据：字节串，超时毫秒：数）：数","errors":["SOCKET_TIMEOUT","SOCKET_WRITE","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
+        {"name":"接收字节","signature":"法（套接字，最大字节：数，超时毫秒：数）：典<文，任意>","errors":["SOCKET_TIMEOUT","SOCKET_READ","SOCKET_LIMIT","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
+        {"name":"精确读取","signature":"法（套接字，字节数：数，超时毫秒：数）：字节串","errors":["SOCKET_EOF","SOCKET_TIMEOUT","SOCKET_READ","SOCKET_LIMIT","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
         {"name":"UDP绑定","signature":"法（地址：文）：套接字","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_BIND","SOCKET_LIMIT","SOCKET_UNSUPPORTED"]},
         {"name":"UDP发送至","signature":"法（套接字，正文：文，地址：文，超时毫秒：数）：数","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_TIMEOUT","SOCKET_WRITE","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
         {"name":"UDP接收自","signature":"法（套接字，最大字节：数，超时毫秒：数）：典<文，文>","errors":["SOCKET_TIMEOUT","SOCKET_READ","SOCKET_LIMIT","SOCKET_STATE","SOCKET_UTF8","SOCKET_UNSUPPORTED"]},
+        {"name":"UDP发送字节至","signature":"法（套接字，数据：字节串，地址：文，超时毫秒：数）：数","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_TIMEOUT","SOCKET_WRITE","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
+        {"name":"UDP接收字节自","signature":"法（套接字，最大字节：数，超时毫秒：数）：典<文，任意>","errors":["SOCKET_TIMEOUT","SOCKET_READ","SOCKET_LIMIT","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
         {"name":"本地地址","signature":"法（套接字）：文","errors":["SOCKET_STATE","SOCKET_UNSUPPORTED"]},
         {"name":"对端地址","signature":"法（套接字）：文?","errors":["SOCKET_STATE","SOCKET_UNSUPPORTED"]},
-        {"name":"关闭","signature":"法（套接字）：空","errors":["SOCKET_STATE","SOCKET_UNSUPPORTED"]}
+        {"name":"关闭","signature":"法（套接字）：空","errors":["SOCKET_STATE","SOCKET_UNSUPPORTED"]},
+        {"name":"关闭写端","signature":"法（套接字）：空","errors":["SOCKET_STATE","SOCKET_UNSUPPORTED"]},
+        {"name":"TCP无延迟","signature":"法（套接字，启用：理）：空","errors":["SOCKET_STATE","SOCKET_UNSUPPORTED"]}
       ]
     },
     {
@@ -96,12 +121,17 @@
       "members": [
         {"name":"读取","signature":"法（文）：文?","errors":["权限","非 UTF-8"]},
         {"name":"存在","signature":"法（文）：理","errors":["权限"]},
-        {"name":"当前目录","signature":"法（）：文"},{"name":"系统","signature":"法（）：文"},{"name":"架构","signature":"法（）：文"}
+        {"name":"当前目录","signature":"法（）：文"},{"name":"系统","signature":"法（）：文"},{"name":"架构","signature":"法（）：文"},
+        {"name":"参数","signature":"法（）：列<文>"}
       ]
     },
     {
       "name": "哈希", "permissions": [], "platforms": ["all"], "deterministic": true,
-      "members": [{"name":"SHA256","signature":"法（文）：文"}]
+      "members": [
+        {"name":"SHA256","signature":"法（文）：文"},
+        {"name":"HMACSHA256","signature":"法（密钥：字节串，正文：字节串）：字节串","errors":["BYTES_CRYPTO"]},
+        {"name":"恒时相等","signature":"法（字节串，字节串）：理"}
+      ]
     },
     {
       "name": "编码", "permissions": [], "platforms": ["all"], "deterministic": true,
@@ -126,11 +156,12 @@
       ]
     },
     {
-      "name": "随机", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "name": "随机", "permissions": [], "platforms": ["all"], "deterministic": false,
       "members": [
         {"name":"小数","signature":"法（种子：数）：数","errors":["种子非安全整数"]},
         {"name":"整数","signature":"法（种子：数，下界：数，上界：数）：数","errors":["参数非安全整数","区间为空或过大"]},
         {"name":"布尔","signature":"法（种子：数）：理","errors":["种子非安全整数"]}
+        ,{"name":"安全字节","signature":"法（长度：数）：字节串","deterministic":false,"errors":["BYTES_RANDOM","BYTES_RANGE"]}
       ]
     },
     {
@@ -194,7 +225,9 @@
         {"name":"是否合法","signature":"法（文）：理"},
         {"name":"是否闰年","signature":"法（年：数）：理","errors":["年份非安全整数或超出 1..9999"]},
         {"name":"加天","signature":"法（日期：文，天数：数）：文","errors":["非法日期","天数非安全整数","结果越界"]},
-        {"name":"相差天数","signature":"法（开始：文，结束：文）：数","errors":["非法日期"]}
+        {"name":"相差天数","signature":"法（开始：文，结束：文）：数","errors":["非法日期"]},
+        {"name":"HTTP日期","signature":"法（Unix毫秒：数）：文","errors":["Unix 毫秒非安全非负整数或超出 IMF-fixdate 范围"]},
+        {"name":"解析HTTP日期","signature":"法（文）：数?"}
       ]
     }
   ]

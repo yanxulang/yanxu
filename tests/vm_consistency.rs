@@ -63,6 +63,54 @@ fn standard_library_manifest_matches_types_and_both_runtimes() {
     }
 }
 
+#[test]
+fn binary_file_and_cli_arguments_match_both_runtimes() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("yanxu-binary-consistency-{unique}"));
+    fs::create_dir_all(&root).unwrap();
+
+    let run = |path: &Path, backend: &str| {
+        let path = source_path(path);
+        let source = format!(
+            r#"
+            引「标准:字节」为 字节；引「标准:文件」为 文件；引「标准:环境」为 环境；
+            文件.写入字节（「{path}」，字节.从数列（【0，255】））；
+            文件.追加字节（「{path}」，字节.从文字（「言序」））；
+            定 数据：字节串 为 文件.读取字节（「{path}」）；
+            言 字节.长度（数据）；言 字节.转数列（字节.切片（数据，0，2））；
+            言 文件.状态（「{path}」）【「字节数」】；言 环境.参数（）；
+            "#
+        );
+        let statements = yanxu::parse_named(&source, format!("<{backend}-二进制>")).unwrap();
+        yanxu::type_checker::check(&statements).unwrap();
+        if backend == "tree" {
+            let mut interpreter = Interpreter::silent();
+            interpreter.set_arguments(vec!["甲".into(), "--值".into()]);
+            interpreter
+                .execute_in_directory(&statements, &root)
+                .unwrap();
+            interpreter.take_output()
+        } else {
+            let chunk = bytecode::compile(&statements).unwrap();
+            let mut vm = Vm::silent();
+            vm.set_arguments(vec!["甲".into(), "--值".into()]);
+            vm.execute_in_directory(&chunk, &root).unwrap();
+            vm.take_output()
+        }
+    };
+
+    let tree_path = root.join("tree.bin");
+    let vm_path = root.join("vm.bin");
+    let tree = run(&tree_path, "tree");
+    let vm = run(&vm_path, "vm");
+    assert_eq!(tree, vm);
+    assert_eq!(fs::read(tree_path).unwrap(), fs::read(vm_path).unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn source_path(path: &Path) -> String {
     path.display()
         .to_string()
