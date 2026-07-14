@@ -138,6 +138,8 @@ struct RegistryRelease {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDependency {
     pub locked: LockedPackage,
+    /// 已经规范化并通过清单、版本与内容校验的包根目录。
+    pub root: PathBuf,
     pub entry: PathBuf,
 }
 
@@ -202,6 +204,14 @@ pub fn load(path: impl AsRef<Path>) -> Result<Manifest, ManifestError> {
 }
 
 pub fn resolve_dependency(base: &Path, name: &str) -> Result<PathBuf, ManifestError> {
+    resolve_dependency_info(base, name).map(|dependency| dependency.entry)
+}
+
+/// 解析依赖并同时返回它经过锁文件校验的包根与入口。
+pub fn resolve_dependency_info(
+    base: &Path,
+    name: &str,
+) -> Result<ResolvedDependency, ManifestError> {
     let manifest = discover(base)?.ok_or_else(|| {
         manifest_error(
             base,
@@ -213,8 +223,31 @@ pub fn resolve_dependency(base: &Path, name: &str) -> Result<PathBuf, ManifestEr
     let resolved = ensure_lock(&manifest, offline)?;
     resolved
         .get(name)
-        .map(|dependency| dependency.entry.clone())
+        .cloned()
         .ok_or_else(|| manifest_error(&manifest.path, None, format!("未声明依赖“{name}”")))
+}
+
+/// 在一次顶层包执行或检查中解析依赖。
+///
+/// 顶层清单显式声明的同名依赖优先，以保证整个执行使用顶层锁文件固定的
+/// 版本；若顶层没有声明，则回退到当前依赖包自己的清单，保留传递依赖。
+pub fn resolve_dependency_scoped(
+    package_root: Option<&Path>,
+    current_base: &Path,
+    name: &str,
+) -> Result<ResolvedDependency, ManifestError> {
+    if let Some(package_root) = package_root
+        && let Some(manifest) = discover(package_root)?
+        && manifest.dependencies.contains_key(name)
+    {
+        let offline = std::env::var_os("YANXU_OFFLINE").is_some();
+        let resolved = ensure_lock(&manifest, offline)?;
+        return resolved
+            .get(name)
+            .cloned()
+            .ok_or_else(|| manifest_error(&manifest.path, None, format!("未声明依赖“{name}”")));
+    }
+    resolve_dependency_info(current_base, name)
 }
 
 /// 解析全部依赖并写入或验证 `言序.lock`。
@@ -602,6 +635,7 @@ fn lock_local(
             checksum,
             entry: dependency_manifest.entry.to_string_lossy().into_owned(),
         },
+        root: root.to_path_buf(),
         entry: root.join(dependency_manifest.entry),
     })
 }
@@ -611,6 +645,12 @@ fn resolve_git(
     revision: &str,
     offline: bool,
 ) -> Result<(PathBuf, String), ManifestError> {
+    if revision.is_empty()
+        || revision.starts_with('-')
+        || revision.chars().any(|character| character.is_control())
+    {
+        return Err(manifest_error(Path::new(url), None, "Git 修订名称不合法"));
+    }
     let cache = cache_root().join("git").join(short_hash(url));
     if !cache.join(".git").is_dir() {
         if offline {
@@ -637,13 +677,44 @@ fn resolve_git(
             "克隆 Git 依赖",
         )?;
     }
+    let exact_revision =
+        revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let exact_cached = exact_revision
+        && Command::new("git")
+            .arg("-C")
+            .arg(&cache)
+            .arg("cat-file")
+            .arg("-e")
+            .arg(format!("{revision}^{{commit}}"))
+            .status()
+            .is_ok_and(|status| status.success());
+    let checkout_revision = if !offline && (!exact_revision || !exact_cached) {
+        run_command(
+            Command::new("git")
+                .arg("-C")
+                .arg(&cache)
+                .arg("fetch")
+                .arg("--quiet")
+                .arg("--force")
+                .arg("origin")
+                .arg("--")
+                .arg(revision),
+            &cache,
+            "更新 Git 依赖",
+        )?;
+        "FETCH_HEAD"
+    } else {
+        revision
+    };
     run_command(
         Command::new("git")
             .arg("-C")
             .arg(&cache)
             .arg("checkout")
             .arg("--quiet")
-            .arg(revision),
+            .arg("--force")
+            .arg("--detach")
+            .arg(checkout_revision),
         &cache,
         "检出 Git 修订",
     )?;
@@ -1511,6 +1582,57 @@ mod tests {
     }
 
     #[test]
+    fn package_modules_use_top_level_lock_without_file_permission() {
+        let workspace = temp("package-module-permission");
+        let application = workspace.join("应用");
+        let first = workspace.join("甲");
+        let selected_second = workspace.join("乙");
+
+        write(
+            &first.join(MANIFEST_NAME),
+            "[包]\n名='甲'\n版='1.0.0'\n入口='src/甲.yx'\n[依赖]\n乙={路径='../不存在的乙',版='^1'}\n",
+        );
+        write(
+            &first.join("src/甲.yx"),
+            "引「包:乙」为 乙；\n公 法 结果（）：数 则 归 乙.答；终\n",
+        );
+        write(
+            &selected_second.join(MANIFEST_NAME),
+            "[包]\n名='乙'\n版='1.2.0'\n入口='src/乙.yx'\n",
+        );
+        write(&selected_second.join("src/乙.yx"), "公 定 答：数 为 42；\n");
+        write(
+            &application.join(MANIFEST_NAME),
+            "[包]\n名='应用'\n版='0.1.0'\n入口='src/主.yx'\n[依赖]\n甲={路径='../甲',版='^1'}\n乙={路径='../乙',版='^1'}\n[权限]\n文件=['src']\n",
+        );
+        let source = "引「包:甲」为 甲；\n言 甲.结果（）；\n";
+        write(&application.join("src/主.yx"), source);
+
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        assert!(
+            manifest
+                .permissions
+                .check_file(first.join("src/甲.yx"))
+                .is_err()
+        );
+        let statements = crate::parse_named(source, "src/主.yx").unwrap();
+        crate::type_checker::check_in_directory_with_permissions(
+            &statements,
+            application.join("src"),
+            manifest.permissions.clone(),
+        )
+        .unwrap();
+        let mut interpreter =
+            crate::interpreter::Interpreter::silent_with_permissions(manifest.permissions);
+        interpreter
+            .execute_in_directory(&statements, &application.join("src"))
+            .unwrap();
+        assert_eq!(interpreter.output(), ["42"]);
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
     fn selects_highest_matching_local_registry_version() {
         let root = temp("registry");
         for version in ["1.0.0", "1.5.0", "2.0.0"] {
@@ -1554,10 +1676,23 @@ mod tests {
             assert!(status.success());
         }
         let url = root.to_string_lossy();
-        let (cache, revision) = resolve_git(&url, "HEAD", false).unwrap();
-        assert_eq!(revision.len(), 40);
-        let (_, offline_revision) = resolve_git(&url, &revision, true).unwrap();
-        assert_eq!(revision, offline_revision);
+        let (cache, first_revision) = resolve_git(&url, "HEAD", false).unwrap();
+        assert_eq!(first_revision.len(), 40);
+
+        write(&root.join("主.yx"), "公 定 答：数 为 2；\n");
+        for arguments in [vec!["add", "."], vec!["commit", "--quiet", "-m", "second"]] {
+            let status = Command::new("git")
+                .args(arguments)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let (_, second_revision) = resolve_git(&url, "HEAD", false).unwrap();
+        assert_ne!(first_revision, second_revision);
+        let (_, offline_revision) = resolve_git(&url, &second_revision, true).unwrap();
+        assert_eq!(second_revision, offline_revision);
         fs::remove_dir_all(cache).ok();
         fs::remove_dir_all(root).ok();
     }

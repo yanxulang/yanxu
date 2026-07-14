@@ -667,6 +667,8 @@ pub struct Interpreter {
     output: Vec<String>,
     echo: bool,
     current_dir: PathBuf,
+    package_root: Option<PathBuf>,
+    package_module_roots: Vec<PathBuf>,
     module_cache: HashMap<PathBuf, Rc<YanxuModule>>,
     loading_modules: Vec<PathBuf>,
     initialization_order: Vec<PathBuf>,
@@ -760,6 +762,8 @@ impl Interpreter {
             output: Vec::new(),
             echo,
             current_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            package_root: None,
+            package_module_roots: Vec::new(),
             module_cache: HashMap::new(),
             loading_modules: Vec::new(),
             initialization_order: Vec::new(),
@@ -816,6 +820,15 @@ impl Interpreter {
         self.resources.reset();
         let previous = directory
             .map(|directory| std::mem::replace(&mut self.current_dir, directory.to_path_buf()));
+        let previous_package_root = directory.map(|directory| {
+            let package_root = crate::package::discover(directory)
+                .ok()
+                .flatten()
+                .map(|manifest| manifest.root);
+            std::mem::replace(&mut self.package_root, package_root)
+        });
+        let previous_package_module_roots =
+            directory.map(|_| std::mem::take(&mut self.package_module_roots));
         let owns_debug_frame = self.debug_hook.is_some() && self.debug_frames.is_empty();
         if owns_debug_frame {
             self.debug_frames.push(ActiveDebugFrame {
@@ -836,6 +849,12 @@ impl Interpreter {
         }
         if let Some(previous) = previous {
             self.current_dir = previous;
+        }
+        if let Some(previous) = previous_package_root {
+            self.package_root = previous;
+        }
+        if let Some(previous) = previous_package_module_roots {
+            self.package_module_roots = previous;
         }
         result
     }
@@ -2285,8 +2304,16 @@ impl Interpreter {
             return standard_module(name);
         }
         let joined = if let Some(name) = requested.strip_prefix("包:") {
-            crate::package::resolve_dependency(&self.current_dir, name)
-                .map_err(|error| RuntimeError::new(error.to_string()))?
+            let dependency = crate::package::resolve_dependency_scoped(
+                self.package_root.as_deref(),
+                &self.current_dir,
+                name,
+            )
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+            if !self.package_module_roots.contains(&dependency.root) {
+                self.package_module_roots.push(dependency.root);
+            }
+            dependency.entry
         } else {
             let requested_path = Path::new(requested);
             if requested_path.is_absolute() {
@@ -2298,9 +2325,14 @@ impl Interpreter {
         let canonical = fs::canonicalize(&joined).map_err(|error| {
             RuntimeError::new(format!("不能载入模块“{}”：{error}", joined.display()))
         })?;
-        self.permissions
-            .check_file(&canonical)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Err(error) = self.permissions.check_file(&canonical)
+            && !self
+                .package_module_roots
+                .iter()
+                .any(|root| canonical.starts_with(root))
+        {
+            return Err(RuntimeError::new(error.to_string()));
+        }
 
         if let Some(module) = self.module_cache.get(&canonical) {
             return Ok(module.clone());

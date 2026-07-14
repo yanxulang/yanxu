@@ -585,6 +585,8 @@ pub struct Vm {
     module_cache: HashMap<PathBuf, Rc<VmModule>>,
     bytecode_cache: HashMap<PathBuf, CachedChunk>,
     loading_modules: Vec<PathBuf>,
+    package_root: Option<PathBuf>,
+    package_module_roots: Vec<PathBuf>,
     permissions: crate::permissions::PermissionSet,
     socket_quota: crate::stdlib::SocketQuota,
     arguments: Vec<String>,
@@ -640,6 +642,8 @@ impl Vm {
             module_cache: HashMap::new(),
             bytecode_cache: HashMap::new(),
             loading_modules: Vec::new(),
+            package_root: None,
+            package_module_roots: Vec::new(),
             permissions: crate::permissions::PermissionSet::unrestricted(),
             socket_quota: crate::stdlib::SocketQuota::default(),
             arguments: Vec::new(),
@@ -722,14 +726,23 @@ impl Vm {
         directory: &Path,
     ) -> Result<VmValue, VmError> {
         self.resources.reset();
-        self.run_chunk(
+        let package_root = crate::package::discover(directory)
+            .ok()
+            .flatten()
+            .map(|manifest| manifest.root);
+        let previous_package_root = std::mem::replace(&mut self.package_root, package_root);
+        let previous_package_module_roots = std::mem::take(&mut self.package_module_roots);
+        let result = self.run_chunk(
             Rc::new(chunk.clone()),
             self.globals.clone(),
             "<顶层>".into(),
             Span::synthetic(),
             directory.to_path_buf(),
             None,
-        )
+        );
+        self.package_root = previous_package_root;
+        self.package_module_roots = previous_package_module_roots;
+        result
     }
 
     fn run_chunk(
@@ -2985,8 +2998,16 @@ impl Vm {
             return self.standard_module(name, span);
         }
         let joined = if let Some(name) = requested.strip_prefix("包:") {
-            crate::package::resolve_dependency(directory, name)
-                .map_err(|runtime_error| error(span, runtime_error.to_string()))?
+            let dependency = crate::package::resolve_dependency_scoped(
+                self.package_root.as_deref(),
+                directory,
+                name,
+            )
+            .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+            if !self.package_module_roots.contains(&dependency.root) {
+                self.package_module_roots.push(dependency.root);
+            }
+            dependency.entry
         } else {
             let path = Path::new(requested);
             if path.is_absolute() {
@@ -3001,9 +3022,14 @@ impl Vm {
                 format!("不能载入模块“{}”：{runtime_error}", joined.display()),
             )
         })?;
-        self.permissions
-            .check_file(&canonical)
-            .map_err(|permission| error(span, permission.to_string()))?;
+        if let Err(permission) = self.permissions.check_file(&canonical)
+            && !self
+                .package_module_roots
+                .iter()
+                .any(|root| canonical.starts_with(root))
+        {
+            return Err(error(span, permission.to_string()));
+        }
         if let Some(module) = self.module_cache.get(&canonical) {
             self.cache_stats.module_hits += 1;
             return Ok(module.clone());

@@ -1,6 +1,6 @@
 [package]
 name = "yanxu"
-version = "1.1.4"
+version = "1.1.4-A"
 edition = "2024"
 description = "言序：以 Rust 编写的文言风格解释型编程语言"
 license = "MIT"

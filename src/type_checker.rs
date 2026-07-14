@@ -320,7 +320,12 @@ pub fn check_in_directory(
     directory: impl AsRef<Path>,
 ) -> Result<(), Vec<TypeError>> {
     let mut checker = Checker::new();
-    checker.current_dir = Some(directory.as_ref().to_path_buf());
+    let directory = directory.as_ref();
+    checker.current_dir = Some(directory.to_path_buf());
+    checker.package_root = crate::package::discover(directory)
+        .ok()
+        .flatten()
+        .map(|manifest| manifest.root);
     checker.check_scope(statements, Scope::new(), None);
     if checker.errors.is_empty() {
         Ok(())
@@ -335,7 +340,12 @@ pub fn check_in_directory_with_permissions(
     permissions: crate::permissions::PermissionSet,
 ) -> Result<(), Vec<TypeError>> {
     let mut checker = Checker::new();
-    checker.current_dir = Some(directory.as_ref().to_path_buf());
+    let directory = directory.as_ref();
+    checker.current_dir = Some(directory.to_path_buf());
+    checker.package_root = crate::package::discover(directory)
+        .ok()
+        .flatten()
+        .map(|manifest| manifest.root);
     checker.permissions = Some(permissions);
     checker.check_scope(statements, Scope::new(), None);
     if checker.errors.is_empty() {
@@ -354,6 +364,8 @@ struct Checker {
     current_class: Option<String>,
     current_method_static: bool,
     current_dir: Option<PathBuf>,
+    package_root: Option<PathBuf>,
+    package_module_roots: Vec<PathBuf>,
     module_cache: HashMap<PathBuf, ObjectShape>,
     loading_modules: Vec<PathBuf>,
     permissions: Option<crate::permissions::PermissionSet>,
@@ -370,6 +382,8 @@ impl Checker {
             current_class: None,
             current_method_static: false,
             current_dir: None,
+            package_root: None,
+            package_module_roots: Vec::new(),
             module_cache: HashMap::new(),
             loading_modules: Vec::new(),
             permissions: None,
@@ -983,8 +997,17 @@ impl Checker {
         }
         let current_dir = self.current_dir.clone()?;
         let joined = if let Some(name) = requested.strip_prefix("包:") {
-            match crate::package::resolve_dependency(&current_dir, name) {
-                Ok(path) => path,
+            match crate::package::resolve_dependency_scoped(
+                self.package_root.as_deref(),
+                &current_dir,
+                name,
+            ) {
+                Ok(dependency) => {
+                    if !self.package_module_roots.contains(&dependency.root) {
+                        self.package_module_roots.push(dependency.root);
+                    }
+                    dependency.entry
+                }
                 Err(error) => {
                     self.error(error.to_string(), import_span.clone());
                     return None;
@@ -1010,6 +1033,10 @@ impl Checker {
         };
         if let Some(permissions) = &self.permissions
             && let Err(error) = permissions.check_file(&canonical)
+            && !self
+                .package_module_roots
+                .iter()
+                .any(|root| canonical.starts_with(root))
         {
             self.error(error.to_string(), import_span.clone());
             return None;
