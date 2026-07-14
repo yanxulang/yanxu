@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -18,6 +19,28 @@ pub const LOCK_NAME: &str = "言序.lock";
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 pub const LOCK_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_REGISTRY: &str = "https://packages.yanxu.dev/v1";
+pub const ARCHIVE_MAX_COMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
+pub const ARCHIVE_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+pub const ARCHIVE_MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
+pub const ARCHIVE_MAX_ENTRIES: usize = 4_096;
+pub const ARCHIVE_MAX_PATH_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Copy)]
+struct ArchiveLimits {
+    compressed_bytes: u64,
+    file_bytes: u64,
+    expanded_bytes: u64,
+    entries: usize,
+    path_bytes: usize,
+}
+
+const ARCHIVE_LIMITS: ArchiveLimits = ArchiveLimits {
+    compressed_bytes: ARCHIVE_MAX_COMPRESSED_BYTES,
+    file_bytes: ARCHIVE_MAX_FILE_BYTES,
+    expanded_bytes: ARCHIVE_MAX_EXPANDED_BYTES,
+    entries: ARCHIVE_MAX_ENTRIES,
+    path_bytes: ARCHIVE_MAX_PATH_BYTES,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -318,6 +341,12 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         }
         for host in array_alias(table, &["网络", "network"]).unwrap_or_default() {
             permissions = permissions.allow_network(host);
+        }
+        for host in array_alias(table, &["TCP监听", "tcp_listen"]).unwrap_or_default() {
+            permissions = permissions.allow_tcp_listen(host);
+        }
+        for host in array_alias(table, &["UDP绑定", "udp_bind"]).unwrap_or_default() {
+            permissions = permissions.allow_udp_bind(host);
         }
         for variable in array_alias(table, &["环境", "environment"]).unwrap_or_default() {
             permissions = permissions.allow_environment(variable);
@@ -724,23 +753,21 @@ fn resolve_registry(
     }
     fs::create_dir_all(&temporary)
         .map_err(|error| manifest_error(&temporary, None, format!("不能创建临时目录：{error}")))?;
-    validate_archive_paths(&archive)?;
-    run_command(
-        Command::new("tar")
-            .arg("-xzf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&temporary),
-        &archive,
-        "展开索引制品",
-    )?;
-    let unpacked_root = find_manifest_root(&temporary)?;
-    if destination.exists() {
-        fs::remove_dir_all(&destination).map_err(|error| {
-            manifest_error(&destination, None, format!("不能替换旧缓存：{error}"))
-        })?;
+    let extraction = (|| {
+        extract_archive_safely(&archive, &temporary)?;
+        let unpacked_root = find_manifest_root(&temporary)?;
+        if destination.exists() {
+            fs::remove_dir_all(&destination).map_err(|error| {
+                manifest_error(&destination, None, format!("不能替换旧缓存：{error}"))
+            })?;
+        }
+        copy_tree(&unpacked_root, &destination)
+    })();
+    if let Err(error) = extraction {
+        fs::remove_dir_all(&temporary).ok();
+        fs::remove_file(&archive).ok();
+        return Err(error);
     }
-    copy_tree(&unpacked_root, &destination)?;
     fs::remove_dir_all(&temporary).ok();
     fs::remove_file(&archive).ok();
     Ok((destination, version))
@@ -902,6 +929,8 @@ fn download(url: &str, destination: &Path) -> Result<(), ManifestError> {
             .arg("--location")
             .arg("--max-time")
             .arg("30")
+            .arg("--max-filesize")
+            .arg(ARCHIVE_MAX_COMPRESSED_BYTES.to_string())
             .arg("--output")
             .arg(destination)
             .arg(url),
@@ -910,30 +939,151 @@ fn download(url: &str, destination: &Path) -> Result<(), ManifestError> {
     )
 }
 
-fn validate_archive_paths(archive: &Path) -> Result<(), ManifestError> {
-    let output = Command::new("tar")
-        .arg("-tzf")
-        .arg(archive)
-        .output()
-        .map_err(|error| manifest_error(archive, None, format!("不能检查制品：{error}")))?;
-    if !output.status.success() {
-        return Err(manifest_error(archive, None, "索引制品不是有效的 tar.gz"));
+fn extract_archive_safely(archive: &Path, destination: &Path) -> Result<(), ManifestError> {
+    extract_archive_with_limits(archive, destination, ARCHIVE_LIMITS)
+}
+
+fn extract_archive_with_limits(
+    archive: &Path,
+    destination: &Path,
+    limits: ArchiveLimits,
+) -> Result<(), ManifestError> {
+    let compressed_bytes = fs::metadata(archive)
+        .map_err(|error| manifest_error(archive, None, format!("不能检查制品大小：{error}")))?
+        .len();
+    if compressed_bytes > limits.compressed_bytes {
+        return Err(manifest_error(
+            archive,
+            None,
+            format!(
+                "索引制品压缩后为 {compressed_bytes} 字节，超过 {} 字节上限",
+                limits.compressed_bytes
+            ),
+        ));
     }
-    for raw in String::from_utf8_lossy(&output.stdout).lines() {
-        let path = Path::new(raw);
-        if path.is_absolute()
-            || path
-                .components()
-                .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
-        {
+    let file = fs::File::open(archive)
+        .map_err(|error| manifest_error(archive, None, format!("不能打开索引制品：{error}")))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let entries = tar.entries().map_err(|error| {
+        manifest_error(archive, None, format!("索引制品不是有效 tar.gz：{error}"))
+    })?;
+    let mut entry_count = 0_usize;
+    let mut expanded_bytes = 0_u64;
+    for entry in entries {
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > limits.entries {
             return Err(manifest_error(
                 archive,
                 None,
-                format!("索引制品含越界路径“{raw}”"),
+                format!("索引制品条目超过 {} 项上限", limits.entries),
+            ));
+        }
+        let mut entry = entry.map_err(|error| {
+            manifest_error(archive, None, format!("不能读取索引制品条目：{error}"))
+        })?;
+        let relative = entry
+            .path()
+            .map_err(|error| manifest_error(archive, None, format!("索引制品路径无效：{error}")))?
+            .into_owned();
+        validate_archive_relative_path(&relative, limits.path_bytes)
+            .map_err(|message| manifest_error(archive, None, message))?;
+        let destination_path = destination.join(&relative);
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            fs::create_dir_all(&destination_path).map_err(|error| {
+                manifest_error(
+                    &destination_path,
+                    None,
+                    format!("不能创建制品目录：{error}"),
+                )
+            })?;
+            continue;
+        }
+        if !entry_type.is_file() {
+            return Err(manifest_error(
+                archive,
+                None,
+                format!(
+                    "索引制品含不允许的特殊条目“{}”（符号链接、硬链接、设备文件与管道均被拒绝）",
+                    relative.display()
+                ),
+            ));
+        }
+        let file_bytes = entry.size();
+        if file_bytes > limits.file_bytes {
+            return Err(manifest_error(
+                archive,
+                None,
+                format!(
+                    "索引制品文件“{}”为 {file_bytes} 字节，超过 {} 字节上限",
+                    relative.display(),
+                    limits.file_bytes
+                ),
+            ));
+        }
+        expanded_bytes = expanded_bytes
+            .checked_add(file_bytes)
+            .ok_or_else(|| manifest_error(archive, None, "索引制品展开大小溢出"))?;
+        if expanded_bytes > limits.expanded_bytes {
+            return Err(manifest_error(
+                archive,
+                None,
+                format!("索引制品展开后超过 {} 字节上限", limits.expanded_bytes),
+            ));
+        }
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                manifest_error(parent, None, format!("不能创建制品目录：{error}"))
+            })?;
+        }
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination_path)
+            .map_err(|error| {
+                manifest_error(
+                    &destination_path,
+                    None,
+                    format!("不能安全创建制品文件：{error}"),
+                )
+            })?;
+        let copied = io::copy(&mut entry, &mut output).map_err(|error| {
+            manifest_error(
+                &destination_path,
+                None,
+                format!("不能展开制品文件：{error}"),
+            )
+        })?;
+        if copied != file_bytes {
+            return Err(manifest_error(
+                archive,
+                None,
+                format!(
+                    "索引制品文件“{}”声明 {file_bytes} 字节，实际展开 {copied} 字节",
+                    relative.display()
+                ),
             ));
         }
     }
     Ok(())
+}
+
+fn validate_archive_relative_path(path: &Path, max_bytes: usize) -> Result<(), String> {
+    if path.as_os_str().is_empty()
+        || path.as_os_str().as_encoded_bytes().len() > max_bytes
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        Err(format!("索引制品含越界或过长路径“{}”", path.display()))
+    } else {
+        Ok(())
+    }
 }
 
 fn find_manifest_root(directory: &Path) -> Result<PathBuf, ManifestError> {
@@ -962,10 +1112,15 @@ fn find_manifests(directory: &Path, manifests: &mut Vec<PathBuf>) -> Result<(), 
         let entry = entry
             .map_err(|error| manifest_error(directory, None, format!("不能读取展开项：{error}")))?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| manifest_error(&path, None, format!("不能检查展开项类型：{error}")))?;
+        if file_type.is_dir() {
             find_manifests(&path, manifests)?;
-        } else if entry.file_name() == MANIFEST_NAME {
+        } else if file_type.is_file() && entry.file_name() == MANIFEST_NAME {
             manifests.push(path);
+        } else if !file_type.is_file() {
+            return Err(manifest_error(&path, None, "展开制品含特殊文件"));
         }
     }
     Ok(())
@@ -980,12 +1135,17 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), ManifestError> {
         let entry = entry
             .map_err(|error| manifest_error(source, None, format!("不能读取制品项：{error}")))?;
         let destination = destination.join(entry.file_name());
-        if entry.path().is_dir() {
+        let file_type = entry.file_type().map_err(|error| {
+            manifest_error(entry.path(), None, format!("不能检查制品项类型：{error}"))
+        })?;
+        if file_type.is_dir() {
             copy_tree(&entry.path(), &destination)?;
-        } else {
+        } else if file_type.is_file() {
             fs::copy(entry.path(), &destination).map_err(|error| {
                 manifest_error(&destination, None, format!("不能写入制品缓存：{error}"))
             })?;
+        } else {
+            return Err(manifest_error(entry.path(), None, "制品含特殊文件"));
         }
     }
     Ok(())
@@ -1077,6 +1237,113 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    fn write_archive(path: &Path, files: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (name, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, *contents).unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn write_special_archive(path: &Path, entry_type: tar::EntryType) {
+        let file = fs::File::create(path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(0);
+        header.set_mode(0o644);
+        if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
+            header.set_link_name("target").unwrap();
+        }
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "package/special", io::empty())
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn safely_extracts_regular_registry_archives() {
+        let root = temp("safe-archive");
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("package.tar.gz");
+        let destination = root.join("unpacked");
+        write_archive(
+            &archive,
+            &[
+                (
+                    "package/言序.toml",
+                    b"[package]\nname='safe'\nversion='1.0.0'\nentry='main.yx'\n",
+                ),
+                ("package/main.yx", "言「善哉」；\n".as_bytes()),
+            ],
+        );
+        extract_archive_safely(&archive, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("package/main.yx")).unwrap(),
+            "言「善哉」；\n"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_archive_links_devices_fifos_and_unsafe_paths() {
+        let root = temp("special-archive");
+        fs::create_dir_all(&root).unwrap();
+        for (index, entry_type) in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+            tar::EntryType::Fifo,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let archive = root.join(format!("special-{index}.tar.gz"));
+            write_special_archive(&archive, entry_type);
+            let error =
+                extract_archive_safely(&archive, &root.join(format!("out-{index}"))).unwrap_err();
+            assert!(error.message.contains("特殊条目"));
+        }
+        assert!(validate_archive_relative_path(Path::new("../escape"), 512).is_err());
+        assert!(validate_archive_relative_path(Path::new("/absolute"), 512).is_err());
+        assert!(validate_archive_relative_path(Path::new("safe/file"), 4).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_archive_resource_bombs_before_expansion() {
+        let root = temp("archive-limits");
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("limits.tar.gz");
+        write_archive(&archive, &[("one", b"1234"), ("two", b"5678")]);
+
+        let mut limits = ARCHIVE_LIMITS;
+        limits.compressed_bytes = 1;
+        assert!(extract_archive_with_limits(&archive, &root.join("compressed"), limits).is_err());
+
+        let mut limits = ARCHIVE_LIMITS;
+        limits.file_bytes = 3;
+        assert!(extract_archive_with_limits(&archive, &root.join("single"), limits).is_err());
+
+        let mut limits = ARCHIVE_LIMITS;
+        limits.expanded_bytes = 7;
+        assert!(extract_archive_with_limits(&archive, &root.join("expanded"), limits).is_err());
+
+        let mut limits = ARCHIVE_LIMITS;
+        limits.entries = 1;
+        assert!(extract_archive_with_limits(&archive, &root.join("entries"), limits).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn parses_full_manifest_and_validates_semver() {
         let root = temp("manifest");
@@ -1097,6 +1364,8 @@ mod tests {
             [权限]
             文件 = ["data"]
             网络 = ["api.example.com"]
+            TCP监听 = ["127.0.0.1"]
+            UDP绑定 = ["127.0.0.1"]
             环境 = ["YANXU_HOME"]
             进程 = true
         "#;
@@ -1120,6 +1389,8 @@ mod tests {
                 .check_network("http://api.example.com/v1")
                 .is_ok()
         );
+        assert!(manifest.permissions.check_tcp_listen("127.0.0.1:0").is_ok());
+        assert!(manifest.permissions.check_udp_bind("127.0.0.1:0").is_ok());
         assert!(manifest.permissions.check_environment("YANXU_HOME").is_ok());
         assert!(manifest.permissions.check_process().is_ok());
 

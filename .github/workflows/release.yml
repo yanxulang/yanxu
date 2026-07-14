@@ -32,7 +32,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
           ref: ${{ inputs.tag || github.ref_name }}
@@ -69,7 +69,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: refs/tags/${{ needs.validate.outputs.tag }}
       - name: 检查 Release 是否已存在
@@ -86,11 +86,12 @@ jobs:
           fi
       - name: 从变更记录创建 Release
         if: steps.existing.outputs.exists != 'true'
-        uses: taiki-e/create-gh-release-action@v1
+        uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1
         with:
           ref: refs/tags/${{ needs.validate.outputs.tag }}
           changelog: CHANGELOG.md
-          title: 言序 $version
+          title: 言序 ${{ needs.validate.outputs.version }}
+          draft: true
           branch: main
 
   binaries:
@@ -116,11 +117,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: refs/tags/${{ needs.validate.outputs.tag }}
       - name: 构建并上传二进制与校验和
-        uses: taiki-e/upload-rust-binary-action@v1
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: yanxu
           target: ${{ matrix.target }}
@@ -130,3 +131,19 @@ jobs:
           locked: true
           ref: refs/tags/${{ needs.validate.outputs.tag }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-release:
+    name: 发布完整 Release
+    needs: [validate, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 确认全部制品成功后公开 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: gh release edit "$TAG" --repo "$REPOSITORY" --draft=false --title "言序 $VERSION"

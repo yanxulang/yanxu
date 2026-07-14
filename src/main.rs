@@ -179,6 +179,12 @@ fn package_info(path: &str) -> ExitCode {
             for host in manifest.permissions.network_hosts() {
                 println!("权限：网络 {host}");
             }
+            for host in manifest.permissions.tcp_listen_hosts() {
+                println!("权限：TCP监听 {host}");
+            }
+            for host in manifest.permissions.udp_bind_hosts() {
+                println!("权限：UDP绑定 {host}");
+            }
             for name in manifest.permissions.environment_variables() {
                 println!("权限：环境 {name}");
             }

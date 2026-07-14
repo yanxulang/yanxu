@@ -642,6 +642,7 @@ pub struct Interpreter {
     debug_hook: Option<Box<dyn DebugHook>>,
     debug_frames: Vec<ActiveDebugFrame>,
     permissions: crate::permissions::PermissionSet,
+    socket_quota: crate::stdlib::SocketQuota,
     resources: crate::budget::ResourceMeter,
 }
 
@@ -733,6 +734,7 @@ impl Interpreter {
             debug_hook: None,
             debug_frames: Vec::new(),
             permissions: crate::permissions::PermissionSet::unrestricted(),
+            socket_quota: crate::stdlib::SocketQuota::default(),
             resources: crate::budget::ResourceMeter::new(crate::budget::ExecutionBudget::default()),
         }
     }
@@ -1589,57 +1591,23 @@ impl Interpreter {
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 native_read_directory(arguments)
             }
-            GuardedNative::HttpGet => {
-                self.permissions
-                    .check_network(string_argument(arguments, 0, "网络.获取")?)
-                    .map_err(|error| {
-                        RuntimeError::network(crate::stdlib::NetworkError::new(
-                            "NET_PERMISSION",
-                            error.to_string(),
-                        ))
-                    })?;
-                native_http_get(arguments)
-            }
-            GuardedNative::HttpPost => {
-                self.permissions
-                    .check_network(string_argument(arguments, 0, "网络.发文")?)
-                    .map_err(|error| {
-                        RuntimeError::network(crate::stdlib::NetworkError::new(
-                            "NET_PERMISSION",
-                            error.to_string(),
-                        ))
-                    })?;
-                native_http_post(arguments)
-            }
-            GuardedNative::HttpRequest => {
-                self.permissions
-                    .check_network(string_argument(arguments, 1, "网络.请求")?)
-                    .map_err(|error| {
-                        RuntimeError::network(crate::stdlib::NetworkError::new(
-                            "NET_PERMISSION",
-                            error.to_string(),
-                        ))
-                    })?;
-                native_http_request(arguments)
-            }
+            GuardedNative::HttpGet => native_http_get(arguments, &self.permissions),
+            GuardedNative::HttpPost => native_http_post(arguments, &self.permissions),
+            GuardedNative::HttpRequest => native_http_request(arguments, &self.permissions),
             GuardedNative::SocketTcpConnect => {
-                self.check_socket_permission(string_argument(arguments, 0, "套接字.TCP连接")?)?;
-                native_socket_tcp_connect(arguments)
+                native_socket_tcp_connect(arguments, &self.permissions, &self.socket_quota)
             }
             GuardedNative::SocketTcpListen => {
-                self.check_socket_permission(string_argument(arguments, 0, "套接字.TCP监听")?)?;
-                native_socket_tcp_listen(arguments)
+                native_socket_tcp_listen(arguments, &self.permissions, &self.socket_quota)
             }
             GuardedNative::SocketAccept => native_socket_accept(arguments),
             GuardedNative::SocketSend => native_socket_send(arguments),
             GuardedNative::SocketReceive => native_socket_receive(arguments),
             GuardedNative::SocketUdpBind => {
-                self.check_socket_permission(string_argument(arguments, 0, "套接字.UDP绑定")?)?;
-                native_socket_udp_bind(arguments)
+                native_socket_udp_bind(arguments, &self.permissions, &self.socket_quota)
             }
             GuardedNative::SocketUdpSendTo => {
-                self.check_socket_permission(string_argument(arguments, 2, "套接字.UDP发送至")?)?;
-                native_socket_udp_send_to(arguments)
+                native_socket_udp_send_to(arguments, &self.permissions)
             }
             GuardedNative::SocketUdpReceiveFrom => native_socket_udp_receive_from(arguments),
             GuardedNative::SocketLocalAddress => native_socket_local_address(arguments),
@@ -1658,15 +1626,6 @@ impl Interpreter {
                 native_env_exists(arguments)
             }
         }
-    }
-
-    fn check_socket_permission(&self, address: &str) -> Result<(), RuntimeError> {
-        self.permissions.check_network(address).map_err(|error| {
-            RuntimeError::socket(crate::stdlib::SocketError::new(
-                "SOCKET_PERMISSION",
-                error.to_string(),
-            ))
-        })
     }
 
     fn await_task(&mut self, task: &Rc<RefCell<YanxuTask>>) -> Result<Value, RuntimeError> {
@@ -3440,28 +3399,45 @@ fn native_json_stringify(arguments: &[Value]) -> Result<Value, RuntimeError> {
         .map_err(|error| RuntimeError::new(format!("JSON 序列化失败：{error}")))
 }
 
-fn native_http_get(arguments: &[Value]) -> Result<Value, RuntimeError> {
-    http_request("GET", string_argument(arguments, 0, "网络.获取")?, None).map(Value::String)
-}
-
-fn native_http_post(arguments: &[Value]) -> Result<Value, RuntimeError> {
+fn native_http_get(
+    arguments: &[Value],
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<Value, RuntimeError> {
     http_request(
-        "POST",
-        string_argument(arguments, 0, "网络.发文")?,
-        Some(string_argument(arguments, 1, "网络.发文")?),
+        "GET",
+        string_argument(arguments, 0, "网络.获取")?,
+        None,
+        permissions,
     )
     .map(Value::String)
 }
 
-fn native_http_request(arguments: &[Value]) -> Result<Value, RuntimeError> {
+fn native_http_post(
+    arguments: &[Value],
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<Value, RuntimeError> {
+    http_request(
+        "POST",
+        string_argument(arguments, 0, "网络.发文")?,
+        Some(string_argument(arguments, 1, "网络.发文")?),
+        permissions,
+    )
+    .map(Value::String)
+}
+
+fn native_http_request(
+    arguments: &[Value],
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<Value, RuntimeError> {
     let timeout = positive_u64_argument(arguments, 3, "网络.请求", "超时毫秒")?;
     let max_bytes = positive_u64_argument(arguments, 4, "网络.请求", "最大字节")?;
-    let response = crate::stdlib::http_request_with_options(
+    let response = crate::stdlib::http_request_with_options_guarded(
         string_argument(arguments, 0, "网络.请求")?,
         string_argument(arguments, 1, "网络.请求")?,
         Some(string_argument(arguments, 2, "网络.请求")?),
         timeout,
         max_bytes,
+        permissions,
     )
     .map_err(RuntimeError::network)?;
     let headers = Value::Map(Rc::new(RefCell::new(YanxuMap {
@@ -3484,17 +3460,25 @@ fn native_http_request(arguments: &[Value]) -> Result<Value, RuntimeError> {
     }))))
 }
 
-fn native_socket_tcp_connect(arguments: &[Value]) -> Result<Value, RuntimeError> {
+fn native_socket_tcp_connect(
+    arguments: &[Value],
+    permissions: &crate::permissions::PermissionSet,
+    quota: &crate::stdlib::SocketQuota,
+) -> Result<Value, RuntimeError> {
     let address = string_argument(arguments, 0, "套接字.TCP连接")?;
     let timeout = socket_timeout_argument(arguments, 1, "套接字.TCP连接")?;
-    crate::stdlib::socket_tcp_connect(address, timeout)
+    crate::stdlib::socket_tcp_connect_guarded(address, timeout, permissions, quota)
         .map(|socket| Value::Socket(Rc::new(RefCell::new(socket))))
         .map_err(RuntimeError::socket)
 }
 
-fn native_socket_tcp_listen(arguments: &[Value]) -> Result<Value, RuntimeError> {
+fn native_socket_tcp_listen(
+    arguments: &[Value],
+    permissions: &crate::permissions::PermissionSet,
+    quota: &crate::stdlib::SocketQuota,
+) -> Result<Value, RuntimeError> {
     let address = string_argument(arguments, 0, "套接字.TCP监听")?;
-    crate::stdlib::socket_tcp_listen(address)
+    crate::stdlib::socket_tcp_listen_guarded(address, permissions, quota)
         .map(|socket| Value::Socket(Rc::new(RefCell::new(socket))))
         .map_err(RuntimeError::socket)
 }
@@ -3528,21 +3512,34 @@ fn native_socket_receive(arguments: &[Value]) -> Result<Value, RuntimeError> {
         .map_err(RuntimeError::socket)
 }
 
-fn native_socket_udp_bind(arguments: &[Value]) -> Result<Value, RuntimeError> {
+fn native_socket_udp_bind(
+    arguments: &[Value],
+    permissions: &crate::permissions::PermissionSet,
+    quota: &crate::stdlib::SocketQuota,
+) -> Result<Value, RuntimeError> {
     let address = string_argument(arguments, 0, "套接字.UDP绑定")?;
-    crate::stdlib::socket_udp_bind(address)
+    crate::stdlib::socket_udp_bind_guarded(address, permissions, quota)
         .map(|socket| Value::Socket(Rc::new(RefCell::new(socket))))
         .map_err(RuntimeError::socket)
 }
 
-fn native_socket_udp_send_to(arguments: &[Value]) -> Result<Value, RuntimeError> {
+fn native_socket_udp_send_to(
+    arguments: &[Value],
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<Value, RuntimeError> {
     let text = string_argument(arguments, 1, "套接字.UDP发送至")?;
     let address = string_argument(arguments, 2, "套接字.UDP发送至")?;
     let timeout = socket_timeout_argument(arguments, 3, "套接字.UDP发送至")?;
     let socket = socket_argument(arguments, 0, "套接字.UDP发送至")?;
-    crate::stdlib::socket_udp_send_to(&mut socket.borrow_mut(), text, address, timeout)
-        .map(|written| Value::Number(written as f64))
-        .map_err(RuntimeError::socket)
+    crate::stdlib::socket_udp_send_to_guarded(
+        &mut socket.borrow_mut(),
+        text,
+        address,
+        timeout,
+        permissions,
+    )
+    .map(|written| Value::Number(written as f64))
+    .map_err(RuntimeError::socket)
 }
 
 fn native_socket_udp_receive_from(arguments: &[Value]) -> Result<Value, RuntimeError> {
@@ -3949,8 +3946,22 @@ fn value_to_json(value: &Value) -> Result<serde_json::Value, RuntimeError> {
     })
 }
 
-fn http_request(method: &str, url: &str, body: Option<&str>) -> Result<String, RuntimeError> {
-    crate::stdlib::http_request(method, url, body).map_err(RuntimeError::network)
+fn http_request(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<String, RuntimeError> {
+    crate::stdlib::http_request_with_options_guarded(
+        method,
+        url,
+        body,
+        crate::stdlib::HTTP_DEFAULT_TIMEOUT_MILLIS,
+        crate::stdlib::HTTP_DEFAULT_MAX_BYTES,
+        permissions,
+    )
+    .map(|response| response.body)
+    .map_err(RuntimeError::network)
 }
 
 fn ensure_type(

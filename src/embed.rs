@@ -93,6 +93,15 @@ impl std::error::Error for EngineError {}
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
+        let runtime = Self::build_runtime(&config);
+        Self {
+            config,
+            runtime,
+            type_history: Vec::new(),
+        }
+    }
+
+    fn build_runtime(config: &EngineConfig) -> Runtime {
         let mut runtime = match config.backend {
             Backend::Tree => Runtime::Tree(Interpreter::silent_with_permissions(
                 config.permissions.clone(),
@@ -105,15 +114,17 @@ impl Engine {
             Runtime::Tree(interpreter) => interpreter.set_budget(config.budget),
             Runtime::Bytecode(vm) => vm.set_budget(config.budget),
         }
-        Self {
-            config,
-            runtime,
-            type_history: Vec::new(),
-        }
+        runtime
     }
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// 清空持久运行时、类型历史、输出与所有尚未释放的宿主资源。
+    pub fn reset(&mut self) {
+        self.runtime = Self::build_runtime(&self.config);
+        self.type_history.clear();
     }
 
     pub fn run(&mut self, source: &str) -> Result<Execution, EngineError> {
@@ -174,34 +185,34 @@ impl Engine {
             })?;
         }
         let execution = match &mut self.runtime {
-            Runtime::Tree(interpreter) => {
-                let value = interpreter
-                    .execute_in_directory(&statements, directory)
-                    .map_err(|error| {
-                        EngineError::new(EngineErrorKind::Runtime, error.to_string())
-                    })?;
-                Execution {
+            Runtime::Tree(interpreter) => interpreter
+                .execute_in_directory(&statements, directory)
+                .map(|value| Execution {
                     value: value.to_string(),
                     value_type: value.type_name(),
                     output: interpreter.take_output(),
                     backend: Backend::Tree,
-                }
-            }
+                })
+                .map_err(|error| EngineError::new(EngineErrorKind::Runtime, error.to_string())),
             Runtime::Bytecode(vm) => {
                 let chunk = bytecode::compile(&statements).map_err(|error| {
                     EngineError::new(EngineErrorKind::Compile, error.to_string())
                 })?;
-                let value = vm
-                    .execute_in_directory(&chunk, directory)
-                    .map_err(|error| {
-                        EngineError::new(EngineErrorKind::Runtime, error.to_string())
-                    })?;
-                Execution {
-                    value: value.to_string(),
-                    value_type: value.type_name(),
-                    output: vm.take_output(),
-                    backend: Backend::Bytecode,
-                }
+                vm.execute_in_directory(&chunk, directory)
+                    .map(|value| Execution {
+                        value: value.to_string(),
+                        value_type: value.type_name(),
+                        output: vm.take_output(),
+                        backend: Backend::Bytecode,
+                    })
+                    .map_err(|error| EngineError::new(EngineErrorKind::Runtime, error.to_string()))
+            }
+        };
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                self.reset();
+                return Err(error);
             }
         };
         if self.config.static_check {
@@ -303,6 +314,42 @@ mod tests {
                 .run("法 深入（值：数）：数 则 归 深入（值 加 1）；终 言 深入（0）；")
                 .unwrap_err();
             assert!(recursion.message.contains("max_call_depth"));
+        }
+    }
+
+    #[test]
+    fn runtime_failure_resets_persistent_state_and_type_history() {
+        for backend in [Backend::Tree, Backend::Bytecode] {
+            let mut engine = Engine::new(EngineConfig::sandboxed(backend));
+            engine.run("令 值：数 为 2；言 值；").unwrap();
+            let error = engine
+                .run("置 值 为 9；令 零：数 为 0；言 1 除 零；")
+                .unwrap_err();
+            assert_eq!(error.kind, EngineErrorKind::Runtime);
+            assert!(error.message.contains("不可除以零"));
+
+            let missing = engine.run("言 值；").unwrap_err();
+            assert_eq!(missing.kind, EngineErrorKind::Type);
+            assert!(missing.message.contains("值"));
+
+            let recovered = engine.run("令 值：数 为 4；言 值；").unwrap();
+            assert_eq!(recovered.output, ["4"]);
+        }
+    }
+
+    #[test]
+    fn outbound_permission_does_not_implicitly_allow_socket_binding() {
+        let source = "引「标准:套接字」为 套接字；定 监听器 为 套接字.TCP监听（「127.0.0.1:0」）；套接字.关闭（监听器）；";
+        for backend in [Backend::Tree, Backend::Bytecode] {
+            let mut denied_config = EngineConfig::sandboxed(backend);
+            denied_config.permissions = PermissionSet::sandboxed().allow_network("127.0.0.1");
+            let error = Engine::new(denied_config).run(source).unwrap_err();
+            assert_eq!(error.kind, EngineErrorKind::Runtime);
+            assert!(error.message.contains("TCP监听"));
+
+            let mut allowed_config = EngineConfig::sandboxed(backend);
+            allowed_config.permissions = PermissionSet::sandboxed().allow_tcp_listen("127.0.0.1");
+            Engine::new(allowed_config).run(source).unwrap();
         }
     }
 }

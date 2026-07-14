@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +14,8 @@ pub struct PermissionSet {
     allow_all: bool,
     file_roots: Vec<PathBuf>,
     network_hosts: BTreeSet<String>,
+    tcp_listen_hosts: BTreeSet<String>,
+    udp_bind_hosts: BTreeSet<String>,
     environment_variables: BTreeSet<String>,
     process: bool,
 }
@@ -23,6 +26,8 @@ impl PermissionSet {
             allow_all: true,
             file_roots: Vec::new(),
             network_hosts: BTreeSet::new(),
+            tcp_listen_hosts: BTreeSet::new(),
+            udp_bind_hosts: BTreeSet::new(),
             environment_variables: BTreeSet::new(),
             process: true,
         }
@@ -33,6 +38,8 @@ impl PermissionSet {
             allow_all: false,
             file_roots: Vec::new(),
             network_hosts: BTreeSet::new(),
+            tcp_listen_hosts: BTreeSet::new(),
+            udp_bind_hosts: BTreeSet::new(),
             environment_variables: BTreeSet::new(),
             process: false,
         }
@@ -49,6 +56,18 @@ impl PermissionSet {
 
     pub fn allow_network(mut self, host: impl Into<String>) -> Self {
         self.network_hosts
+            .insert(normalize_host(&host.into()).to_owned());
+        self
+    }
+
+    pub fn allow_tcp_listen(mut self, host: impl Into<String>) -> Self {
+        self.tcp_listen_hosts
+            .insert(normalize_host(&host.into()).to_owned());
+        self
+    }
+
+    pub fn allow_udp_bind(mut self, host: impl Into<String>) -> Self {
+        self.udp_bind_hosts
             .insert(normalize_host(&host.into()).to_owned());
         self
     }
@@ -102,6 +121,92 @@ impl PermissionSet {
         }
     }
 
+    pub fn check_resolved_network(
+        &self,
+        resource: &str,
+        address: SocketAddr,
+    ) -> Result<(), PermissionError> {
+        self.check_network(resource)?;
+        if self.allow_all || !is_sensitive_ip(address.ip()) {
+            return Ok(());
+        }
+        let ip = address.ip().to_string();
+        if self.network_hosts.contains(&ip) {
+            Ok(())
+        } else {
+            Err(PermissionError::new(
+                "网络地址",
+                format!("{resource} → {ip}（回环、私网或特殊地址须精确授权）"),
+            ))
+        }
+    }
+
+    pub fn check_tcp_listen(&self, address: &str) -> Result<(), PermissionError> {
+        self.check_bind_permission("TCP监听", &self.tcp_listen_hosts, address)
+    }
+
+    pub fn check_udp_bind(&self, address: &str) -> Result<(), PermissionError> {
+        self.check_bind_permission("UDP绑定", &self.udp_bind_hosts, address)
+    }
+
+    pub fn check_tcp_listen_resolved(
+        &self,
+        requested: &str,
+        address: SocketAddr,
+    ) -> Result<(), PermissionError> {
+        self.check_tcp_listen(requested)?;
+        self.check_bind_ip("TCP监听", &self.tcp_listen_hosts, requested, address)
+    }
+
+    pub fn check_udp_bind_resolved(
+        &self,
+        requested: &str,
+        address: SocketAddr,
+    ) -> Result<(), PermissionError> {
+        self.check_udp_bind(requested)?;
+        self.check_bind_ip("UDP绑定", &self.udp_bind_hosts, requested, address)
+    }
+
+    fn check_bind_permission(
+        &self,
+        capability: &str,
+        grants: &BTreeSet<String>,
+        address: &str,
+    ) -> Result<(), PermissionError> {
+        if self.allow_all {
+            return Ok(());
+        }
+        let authority = network_authority(address);
+        let host = normalize_host(authority);
+        if grants.contains("*") || grants.contains(authority) || grants.contains(host) {
+            Ok(())
+        } else {
+            Err(PermissionError::new(capability, authority))
+        }
+    }
+
+    fn check_bind_ip(
+        &self,
+        capability: &str,
+        grants: &BTreeSet<String>,
+        requested: &str,
+        address: SocketAddr,
+    ) -> Result<(), PermissionError> {
+        if self.allow_all {
+            return Ok(());
+        }
+        let requested_host = normalize_host(network_authority(requested));
+        let ip = address.ip().to_string();
+        if grants.contains("*") || grants.contains(requested_host) || grants.contains(&ip) {
+            Ok(())
+        } else {
+            Err(PermissionError::new(
+                capability,
+                format!("{requested} → {ip}"),
+            ))
+        }
+    }
+
     pub fn check_environment(&self, name: &str) -> Result<(), PermissionError> {
         if self.allow_all
             || self.environment_variables.contains("*")
@@ -131,6 +236,14 @@ impl PermissionSet {
 
     pub fn network_hosts(&self) -> impl Iterator<Item = &str> {
         self.network_hosts.iter().map(String::as_str)
+    }
+
+    pub fn tcp_listen_hosts(&self) -> impl Iterator<Item = &str> {
+        self.tcp_listen_hosts.iter().map(String::as_str)
+    }
+
+    pub fn udp_bind_hosts(&self) -> impl Iterator<Item = &str> {
+        self.udp_bind_hosts.iter().map(String::as_str)
     }
 
     pub fn environment_variables(&self) -> impl Iterator<Item = &str> {
@@ -224,6 +337,45 @@ fn normalize_host(authority: &str) -> &str {
     host.strip_suffix(']').unwrap_or(host)
 }
 
+fn network_authority(resource: &str) -> &str {
+    resource
+        .strip_prefix("http://")
+        .or_else(|| resource.strip_prefix("https://"))
+        .and_then(|target| target.split('/').next())
+        .unwrap_or(resource)
+}
+
+pub fn is_sensitive_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [first, second, third, _] = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || ip.is_documentation()
+                || (first == 100 && (64..=127).contains(&second))
+                || (first == 192 && second == 0 && third == 0)
+                || (first == 198 && matches!(second, 18 | 19))
+                || first >= 240
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|ipv4| is_sensitive_ip(IpAddr::V4(ipv4)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,10 +386,20 @@ mod tests {
         let permissions = PermissionSet::sandboxed()
             .allow_file(&root)
             .allow_network("localhost")
+            .allow_network("127.0.0.1")
+            .allow_tcp_listen("127.0.0.1")
+            .allow_udp_bind("127.0.0.1")
             .allow_environment("YANXU_TEST");
         assert!(permissions.check_file(root.join("a.txt")).is_ok());
         assert!(permissions.check_file("/unrelated/file").is_err());
         assert!(permissions.check_network("http://localhost:8080/a").is_ok());
+        assert!(
+            permissions
+                .check_resolved_network("localhost:8080", "127.0.0.1:8080".parse().unwrap())
+                .is_ok()
+        );
+        assert!(permissions.check_tcp_listen("127.0.0.1:0").is_ok());
+        assert!(permissions.check_udp_bind("127.0.0.1:0").is_ok());
         assert!(permissions.check_network("http://example.com").is_err());
         assert!(permissions.check_environment("YANXU_TEST").is_ok());
         assert!(permissions.check_environment("HOME").is_err());
@@ -245,5 +407,25 @@ mod tests {
 
         let ipv6 = PermissionSet::sandboxed().allow_network("::1");
         assert!(ipv6.check_network("[::1]:8080").is_ok());
+
+        let wildcard = PermissionSet::sandboxed().allow_network("*");
+        assert!(wildcard.check_network("https://example.com").is_ok());
+        assert!(
+            wildcard
+                .check_resolved_network("example.com:443", "127.0.0.1:443".parse().unwrap())
+                .is_err()
+        );
+        assert!(
+            PermissionSet::sandboxed()
+                .allow_network("127.0.0.1")
+                .check_resolved_network("127.0.0.1:80", "127.0.0.1:80".parse().unwrap())
+                .is_ok()
+        );
+        assert!(
+            PermissionSet::sandboxed()
+                .allow_network("127.0.0.1")
+                .check_tcp_listen("127.0.0.1:0")
+                .is_err()
+        );
     }
 }

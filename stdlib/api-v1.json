@@ -60,14 +60,14 @@
       ]
     },
     {
-      "name": "套接字", "permissions": ["network"], "platforms": ["native"], "deterministic": false,
+      "name": "套接字", "permissions": ["network", "tcp_listen", "udp_bind"], "platforms": ["native"], "deterministic": false,
       "members": [
-        {"name":"TCP连接","signature":"法（地址：文，超时毫秒：数）：套接字","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_CONNECT","SOCKET_TIMEOUT","SOCKET_UNSUPPORTED"]},
-        {"name":"TCP监听","signature":"法（地址：文）：套接字","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_BIND","SOCKET_UNSUPPORTED"]},
-        {"name":"接受","signature":"法（监听器：套接字，超时毫秒：数）：典<文，任意>","errors":["SOCKET_ACCEPT","SOCKET_TIMEOUT","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
+        {"name":"TCP连接","signature":"法（地址：文，超时毫秒：数）：套接字","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_CONNECT","SOCKET_TIMEOUT","SOCKET_LIMIT","SOCKET_UNSUPPORTED"]},
+        {"name":"TCP监听","signature":"法（地址：文）：套接字","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_BIND","SOCKET_LIMIT","SOCKET_UNSUPPORTED"]},
+        {"name":"接受","signature":"法（监听器：套接字，超时毫秒：数）：典<文，任意>","errors":["SOCKET_ACCEPT","SOCKET_TIMEOUT","SOCKET_LIMIT","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
         {"name":"发送","signature":"法（套接字，正文：文，超时毫秒：数）：数","errors":["SOCKET_TIMEOUT","SOCKET_WRITE","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
         {"name":"接收","signature":"法（套接字，最大字节：数，超时毫秒：数）：文","errors":["SOCKET_TIMEOUT","SOCKET_READ","SOCKET_LIMIT","SOCKET_STATE","SOCKET_UTF8","SOCKET_UNSUPPORTED"]},
-        {"name":"UDP绑定","signature":"法（地址：文）：套接字","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_BIND","SOCKET_UNSUPPORTED"]},
+        {"name":"UDP绑定","signature":"法（地址：文）：套接字","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_BIND","SOCKET_LIMIT","SOCKET_UNSUPPORTED"]},
         {"name":"UDP发送至","signature":"法（套接字，正文：文，地址：文，超时毫秒：数）：数","errors":["SOCKET_PERMISSION","SOCKET_ADDRESS","SOCKET_DNS","SOCKET_TIMEOUT","SOCKET_WRITE","SOCKET_STATE","SOCKET_UNSUPPORTED"]},
         {"name":"UDP接收自","signature":"法（套接字，最大字节：数，超时毫秒：数）：典<文，文>","errors":["SOCKET_TIMEOUT","SOCKET_READ","SOCKET_LIMIT","SOCKET_STATE","SOCKET_UTF8","SOCKET_UNSUPPORTED"]},
         {"name":"本地地址","signature":"法（套接字）：文","errors":["SOCKET_STATE","SOCKET_UNSUPPORTED"]},

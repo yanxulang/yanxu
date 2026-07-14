@@ -548,6 +548,7 @@ pub struct Vm {
     bytecode_cache: HashMap<PathBuf, CachedChunk>,
     loading_modules: Vec<PathBuf>,
     permissions: crate::permissions::PermissionSet,
+    socket_quota: crate::stdlib::SocketQuota,
     resources: crate::budget::ResourceMeter,
 }
 
@@ -601,6 +602,7 @@ impl Vm {
             bytecode_cache: HashMap::new(),
             loading_modules: Vec::new(),
             permissions: crate::permissions::PermissionSet::unrestricted(),
+            socket_quota: crate::stdlib::SocketQuota::default(),
             resources: crate::budget::ResourceMeter::new(crate::budget::ExecutionBudget::default()),
         };
         for (name, arity, kind) in [
@@ -2173,62 +2175,39 @@ impl Vm {
             Std::JsonStringify => serde_json::to_string(&vm_value_to_json(&arguments[0], span)?)
                 .map(VmValue::String)
                 .map_err(|runtime_error| error(span, format!("JSON 序列化失败：{runtime_error}"))),
-            Std::HttpGet => crate::stdlib::http_request(
+            Std::HttpGet => crate::stdlib::http_request_with_options_guarded(
                 "GET",
-                {
-                    let url = vm_string(&arguments[0], "网络.获取", span)?;
-                    self.permissions.check_network(url).map_err(|permission| {
-                        network_error(
-                            span,
-                            crate::stdlib::NetworkError::new(
-                                "NET_PERMISSION",
-                                permission.to_string(),
-                            ),
-                        )
-                    })?;
-                    url
-                },
+                vm_string(&arguments[0], "网络.获取", span)?,
                 None,
+                crate::stdlib::HTTP_DEFAULT_TIMEOUT_MILLIS,
+                crate::stdlib::HTTP_DEFAULT_MAX_BYTES,
+                &self.permissions,
             )
-            .map(VmValue::String)
+            .map(|response| VmValue::String(response.body))
             .map_err(|source| network_error(span, source)),
-            Std::HttpPost => crate::stdlib::http_request(
+            Std::HttpPost => crate::stdlib::http_request_with_options_guarded(
                 "POST",
-                {
-                    let url = vm_string(&arguments[0], "网络.发文", span)?;
-                    self.permissions.check_network(url).map_err(|permission| {
-                        network_error(
-                            span,
-                            crate::stdlib::NetworkError::new(
-                                "NET_PERMISSION",
-                                permission.to_string(),
-                            ),
-                        )
-                    })?;
-                    url
-                },
+                vm_string(&arguments[0], "网络.发文", span)?,
                 Some(vm_string(&arguments[1], "网络.发文", span)?),
+                crate::stdlib::HTTP_DEFAULT_TIMEOUT_MILLIS,
+                crate::stdlib::HTTP_DEFAULT_MAX_BYTES,
+                &self.permissions,
             )
-            .map(VmValue::String)
+            .map(|response| VmValue::String(response.body))
             .map_err(|source| network_error(span, source)),
             Std::HttpRequest => {
                 let method = vm_string(&arguments[0], "网络.请求", span)?;
                 let url = vm_string(&arguments[1], "网络.请求", span)?;
-                self.permissions.check_network(url).map_err(|permission| {
-                    network_error(
-                        span,
-                        crate::stdlib::NetworkError::new("NET_PERMISSION", permission.to_string()),
-                    )
-                })?;
                 let body = vm_string(&arguments[2], "网络.请求", span)?;
                 let timeout = vm_positive_u64(&arguments[3], "网络.请求", "超时毫秒", span)?;
                 let max_bytes = vm_positive_u64(&arguments[4], "网络.请求", "最大字节", span)?;
-                let response = crate::stdlib::http_request_with_options(
+                let response = crate::stdlib::http_request_with_options_guarded(
                     method,
                     url,
                     Some(body),
                     timeout,
                     max_bytes,
+                    &self.permissions,
                 )
                 .map_err(|source| network_error(span, source))?;
                 let headers = VmValue::Map(Rc::new(RefCell::new(VmMap {
@@ -2258,18 +2237,25 @@ impl Vm {
             }
             Std::SocketTcpConnect => {
                 let address = vm_string(&arguments[0], "套接字.TCP连接", span)?;
-                check_socket_permission(&self.permissions, address, span)?;
                 let timeout = vm_socket_timeout(&arguments[1], "套接字.TCP连接", span)?;
-                crate::stdlib::socket_tcp_connect(address, timeout)
-                    .map(|socket| VmValue::Socket(Rc::new(RefCell::new(socket))))
-                    .map_err(|source| socket_error(span, source))
+                crate::stdlib::socket_tcp_connect_guarded(
+                    address,
+                    timeout,
+                    &self.permissions,
+                    &self.socket_quota,
+                )
+                .map(|socket| VmValue::Socket(Rc::new(RefCell::new(socket))))
+                .map_err(|source| socket_error(span, source))
             }
             Std::SocketTcpListen => {
                 let address = vm_string(&arguments[0], "套接字.TCP监听", span)?;
-                check_socket_permission(&self.permissions, address, span)?;
-                crate::stdlib::socket_tcp_listen(address)
-                    .map(|socket| VmValue::Socket(Rc::new(RefCell::new(socket))))
-                    .map_err(|source| socket_error(span, source))
+                crate::stdlib::socket_tcp_listen_guarded(
+                    address,
+                    &self.permissions,
+                    &self.socket_quota,
+                )
+                .map(|socket| VmValue::Socket(Rc::new(RefCell::new(socket))))
+                .map_err(|source| socket_error(span, source))
             }
             Std::SocketAccept => {
                 let socket = vm_socket(&arguments[0], "套接字.接受", span)?;
@@ -2300,20 +2286,28 @@ impl Vm {
             }
             Std::SocketUdpBind => {
                 let address = vm_string(&arguments[0], "套接字.UDP绑定", span)?;
-                check_socket_permission(&self.permissions, address, span)?;
-                crate::stdlib::socket_udp_bind(address)
-                    .map(|socket| VmValue::Socket(Rc::new(RefCell::new(socket))))
-                    .map_err(|source| socket_error(span, source))
+                crate::stdlib::socket_udp_bind_guarded(
+                    address,
+                    &self.permissions,
+                    &self.socket_quota,
+                )
+                .map(|socket| VmValue::Socket(Rc::new(RefCell::new(socket))))
+                .map_err(|source| socket_error(span, source))
             }
             Std::SocketUdpSendTo => {
                 let socket = vm_socket(&arguments[0], "套接字.UDP发送至", span)?;
                 let text = vm_string(&arguments[1], "套接字.UDP发送至", span)?;
                 let address = vm_string(&arguments[2], "套接字.UDP发送至", span)?;
-                check_socket_permission(&self.permissions, address, span)?;
                 let timeout = vm_socket_timeout(&arguments[3], "套接字.UDP发送至", span)?;
-                crate::stdlib::socket_udp_send_to(&mut socket.borrow_mut(), text, address, timeout)
-                    .map(|written| VmValue::Number(written as f64))
-                    .map_err(|source| socket_error(span, source))
+                crate::stdlib::socket_udp_send_to_guarded(
+                    &mut socket.borrow_mut(),
+                    text,
+                    address,
+                    timeout,
+                    &self.permissions,
+                )
+                .map(|written| VmValue::Number(written as f64))
+                .map_err(|source| socket_error(span, source))
             }
             Std::SocketUdpReceiveFrom => {
                 let socket = vm_socket(&arguments[0], "套接字.UDP接收自", span)?;
@@ -3666,19 +3660,6 @@ fn vm_socket(
             format!("“{function}”参数须为套接字，不可为{}", value.type_name()),
         )),
     }
-}
-
-fn check_socket_permission(
-    permissions: &crate::permissions::PermissionSet,
-    address: &str,
-    span: &Span,
-) -> Result<(), VmError> {
-    permissions.check_network(address).map_err(|permission| {
-        socket_error(
-            span,
-            crate::stdlib::SocketError::new("SOCKET_PERMISSION", permission.to_string()),
-        )
-    })
 }
 
 fn vm_string_key_map(entries: Vec<(&'static str, VmValue)>) -> VmValue {

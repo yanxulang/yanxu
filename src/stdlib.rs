@@ -21,6 +21,12 @@ use std::io::{Read, Write};
 #[cfg(not(target_family = "wasm"))]
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(not(target_family = "wasm"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(not(target_family = "wasm"))]
+use std::sync::{Arc, Mutex, mpsc};
+#[cfg(not(target_family = "wasm"))]
+use std::thread;
+#[cfg(not(target_family = "wasm"))]
 use std::time::{Duration, Instant};
 
 pub fn path_join(left: &str, right: &str) -> String {
@@ -729,6 +735,7 @@ pub fn csv_stringify(rows: &[Vec<String>]) -> String {
 
 pub const HTTP_DEFAULT_TIMEOUT_MILLIS: u64 = 10_000;
 pub const HTTP_DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub const HTTP_MAX_REDIRECTS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkError {
@@ -759,6 +766,10 @@ impl std::error::Error for NetworkError {}
 
 pub const SOCKET_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 pub const SOCKET_MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+pub const SOCKET_MAX_OPEN_RESOURCES: usize = 128;
+pub const SOCKET_MAX_OPEN_LISTENERS: usize = 16;
+#[cfg(not(target_family = "wasm"))]
+const SOCKET_BIND_RESOLVE_TIMEOUT_MILLIS: u64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketError {
@@ -789,10 +800,151 @@ impl std::error::Error for SocketError {}
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Debug)]
+pub struct SocketQuota {
+    inner: Arc<SocketQuotaInner>,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Debug, Clone, Default)]
+pub struct SocketQuota {
+    _private: (),
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+struct SocketQuotaInner {
+    max_resources: usize,
+    max_listeners: usize,
+    resources: AtomicUsize,
+    listeners: AtomicUsize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Clone for SocketQuota {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Default for SocketQuota {
+    fn default() -> Self {
+        Self::new(SOCKET_MAX_OPEN_RESOURCES, SOCKET_MAX_OPEN_LISTENERS)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl SocketQuota {
+    pub fn new(max_resources: usize, max_listeners: usize) -> Self {
+        Self {
+            inner: Arc::new(SocketQuotaInner {
+                max_resources,
+                max_listeners,
+                resources: AtomicUsize::new(0),
+                listeners: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    fn acquire(&self, listener: bool) -> Result<SocketLease, SocketError> {
+        if listener
+            && self
+                .inner
+                .listeners
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    (count < self.inner.max_listeners).then_some(count + 1)
+                })
+                .is_err()
+        {
+            return Err(SocketError::new(
+                "SOCKET_LIMIT",
+                format!(
+                    "同时打开的 TCP 监听器不得超过 {} 个",
+                    self.inner.max_listeners
+                ),
+            ));
+        }
+        if self
+            .inner
+            .resources
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < self.inner.max_resources).then_some(count + 1)
+            })
+            .is_err()
+        {
+            if listener {
+                self.inner.listeners.fetch_sub(1, Ordering::SeqCst);
+            }
+            return Err(SocketError::new(
+                "SOCKET_LIMIT",
+                format!(
+                    "同时打开的套接字资源不得超过 {} 个",
+                    self.inner.max_resources
+                ),
+            ));
+        }
+        Ok(SocketLease {
+            quota: self.clone(),
+            listener,
+        })
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.inner.resources.load(Ordering::SeqCst),
+            self.inner.listeners.load(Ordering::SeqCst),
+        )
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+struct SocketLease {
+    quota: SocketQuota,
+    listener: bool,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for SocketLease {
+    fn drop(&mut self) {
+        self.quota.inner.resources.fetch_sub(1, Ordering::SeqCst);
+        if self.listener {
+            self.quota.inner.listeners.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+pub struct TcpStreamHandle {
+    stream: TcpStream,
+    read_buffer: Vec<u8>,
+    _lease: SocketLease,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+pub struct TcpListenerHandle {
+    listener: TcpListener,
+    lease: SocketLease,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+pub struct UdpSocketHandle {
+    socket: UdpSocket,
+    _lease: SocketLease,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
 pub enum SocketHandle {
-    TcpStream(TcpStream),
-    TcpListener(TcpListener),
-    Udp(UdpSocket),
+    TcpStream(TcpStreamHandle),
+    TcpListener(TcpListenerHandle),
+    Udp(UdpSocketHandle),
     Closed,
 }
 
@@ -820,9 +972,40 @@ impl SocketHandle {
 
 #[cfg(not(target_family = "wasm"))]
 pub fn socket_tcp_connect(address: &str, timeout_millis: u64) -> Result<SocketHandle, SocketError> {
+    socket_tcp_connect_guarded(
+        address,
+        timeout_millis,
+        &crate::permissions::PermissionSet::unrestricted(),
+        &SocketQuota::default(),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_tcp_connect_guarded(
+    address: &str,
+    timeout_millis: u64,
+    permissions: &crate::permissions::PermissionSet,
+    quota: &SocketQuota,
+) -> Result<SocketHandle, SocketError> {
     let timeout = socket_timeout(timeout_millis)?;
-    let addresses = resolve_socket_addresses(address)?;
     let deadline = Instant::now() + timeout;
+    permissions
+        .check_network(address)
+        .map_err(socket_permission_error)?;
+    let addresses = resolve_socket_addresses(address, deadline)?
+        .into_iter()
+        .filter(|resolved| {
+            permissions
+                .check_resolved_network(address, *resolved)
+                .is_ok()
+        })
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(SocketError::new(
+            "SOCKET_PERMISSION",
+            format!("套接字地址“{address}”的 DNS 结果均被网络地址策略拒绝"),
+        ));
+    }
     let mut last_error = None;
     for address in addresses {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -834,7 +1017,12 @@ pub fn socket_tcp_connect(address: &str, timeout_millis: u64) -> Result<SocketHa
                 stream
                     .set_nodelay(true)
                     .map_err(|error| socket_io_error("SOCKET_CONNECT", "配置 TCP 流", error))?;
-                return Ok(SocketHandle::TcpStream(stream));
+                let lease = quota.acquire(false)?;
+                return Ok(SocketHandle::TcpStream(TcpStreamHandle {
+                    stream,
+                    read_buffer: Vec::new(),
+                    _lease: lease,
+                }));
             }
             Err(error) => last_error = Some(error),
         }
@@ -851,25 +1039,79 @@ pub fn socket_tcp_connect(
     Err(socket_unsupported())
 }
 
+#[cfg(target_family = "wasm")]
+pub fn socket_tcp_connect_guarded(
+    _address: &str,
+    _timeout_millis: u64,
+    _permissions: &crate::permissions::PermissionSet,
+    _quota: &SocketQuota,
+) -> Result<SocketHandle, SocketError> {
+    Err(socket_unsupported())
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub fn socket_tcp_listen(address: &str) -> Result<SocketHandle, SocketError> {
-    let addresses = resolve_socket_addresses(address)?;
+    socket_tcp_listen_guarded(
+        address,
+        &crate::permissions::PermissionSet::unrestricted(),
+        &SocketQuota::default(),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_tcp_listen_guarded(
+    address: &str,
+    permissions: &crate::permissions::PermissionSet,
+    quota: &SocketQuota,
+) -> Result<SocketHandle, SocketError> {
+    permissions
+        .check_tcp_listen(address)
+        .map_err(socket_permission_error)?;
+    let deadline = Instant::now() + Duration::from_millis(SOCKET_BIND_RESOLVE_TIMEOUT_MILLIS);
+    let addresses = resolve_socket_addresses(address, deadline)?;
     let mut last_error = None;
-    for address in addresses {
-        match TcpListener::bind(address) {
-            Ok(listener) => return Ok(SocketHandle::TcpListener(listener)),
+    for resolved in addresses {
+        if permissions
+            .check_tcp_listen_resolved(address, resolved)
+            .is_err()
+        {
+            continue;
+        }
+        match TcpListener::bind(resolved) {
+            Ok(listener) => {
+                let lease = quota.acquire(true)?;
+                return Ok(SocketHandle::TcpListener(TcpListenerHandle {
+                    listener,
+                    lease,
+                }));
+            }
             Err(error) => last_error = Some(error),
         }
     }
+    let Some(last_error) = last_error else {
+        return Err(SocketError::new(
+            "SOCKET_PERMISSION",
+            "TCP 监听地址的 DNS 结果均被绑定策略拒绝",
+        ));
+    };
     Err(socket_io_error(
         "SOCKET_BIND",
         "绑定 TCP 监听地址",
-        last_error.expect("地址列表非空"),
+        last_error,
     ))
 }
 
 #[cfg(target_family = "wasm")]
 pub fn socket_tcp_listen(_address: &str) -> Result<SocketHandle, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_tcp_listen_guarded(
+    _address: &str,
+    _permissions: &crate::permissions::PermissionSet,
+    _quota: &SocketQuota,
+) -> Result<SocketHandle, SocketError> {
     Err(socket_unsupported())
 }
 
@@ -879,15 +1121,16 @@ pub fn socket_accept(
     timeout_millis: u64,
 ) -> Result<(SocketHandle, String), SocketError> {
     let timeout = socket_timeout(timeout_millis)?;
-    let SocketHandle::TcpListener(listener) = handle else {
+    let SocketHandle::TcpListener(listener_handle) = handle else {
         return Err(socket_state(handle, "接受", "TCP监听器"));
     };
-    listener
+    listener_handle
+        .listener
         .set_nonblocking(true)
         .map_err(|error| socket_io_error("SOCKET_ACCEPT", "配置 TCP 监听器", error))?;
     let deadline = Instant::now() + timeout;
     loop {
-        match listener.accept() {
+        match listener_handle.listener.accept() {
             Ok((stream, peer)) => {
                 stream.set_nonblocking(false).map_err(|error| {
                     socket_io_error("SOCKET_ACCEPT", "配置已接受 TCP 流", error)
@@ -895,7 +1138,15 @@ pub fn socket_accept(
                 stream.set_nodelay(true).map_err(|error| {
                     socket_io_error("SOCKET_ACCEPT", "配置已接受 TCP 流", error)
                 })?;
-                return Ok((SocketHandle::TcpStream(stream), peer.to_string()));
+                let lease = listener_handle.lease.quota.acquire(false)?;
+                return Ok((
+                    SocketHandle::TcpStream(TcpStreamHandle {
+                        stream,
+                        read_buffer: Vec::new(),
+                        _lease: lease,
+                    }),
+                    peer.to_string(),
+                ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
@@ -928,7 +1179,7 @@ pub fn socket_send(
     timeout_millis: u64,
 ) -> Result<u64, SocketError> {
     let timeout = socket_timeout(timeout_millis)?;
-    let SocketHandle::TcpStream(stream) = handle else {
+    let SocketHandle::TcpStream(stream_handle) = handle else {
         return Err(socket_state(handle, "发送", "TCP流"));
     };
     let deadline = Instant::now() + timeout;
@@ -942,10 +1193,12 @@ pub fn socket_send(
                 "写入 TCP 流已超过超时上限",
             ));
         }
-        stream
+        stream_handle
+            .stream
             .set_write_timeout(Some(remaining))
             .map_err(|error| socket_io_error("SOCKET_WRITE", "配置 TCP 写超时", error))?;
-        let count = stream
+        let count = stream_handle
+            .stream
             .write(&bytes[written..])
             .map_err(|error| socket_io_error("SOCKET_WRITE", "写入 TCP 流", error))?;
         if count == 0 {
@@ -973,25 +1226,66 @@ pub fn socket_receive(
 ) -> Result<String, SocketError> {
     let timeout = socket_timeout(timeout_millis)?;
     let capacity = socket_read_capacity(max_bytes)?;
-    let SocketHandle::TcpStream(stream) = handle else {
+    let SocketHandle::TcpStream(stream_handle) = handle else {
         return Err(socket_state(handle, "接收", "TCP流"));
     };
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| socket_io_error("SOCKET_READ", "配置 TCP 读超时", error))?;
-    let mut bytes = vec![0; capacity + 1];
-    let length = stream
-        .read(&mut bytes)
-        .map_err(|error| socket_io_error("SOCKET_READ", "读取 TCP 流", error))?;
-    if length > capacity {
-        return Err(SocketError::new(
-            "SOCKET_LIMIT",
-            format!("TCP 单次接收超过 {max_bytes} 字节上限"),
-        ));
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stream_handle.read_buffer.len() > capacity {
+            return Err(SocketError::new(
+                "SOCKET_LIMIT",
+                format!("TCP 单次接收超过 {max_bytes} 字节上限"),
+            ));
+        }
+        if !stream_handle.read_buffer.is_empty() {
+            match std::str::from_utf8(&stream_handle.read_buffer) {
+                Ok(text) => {
+                    let text = text.to_owned();
+                    stream_handle.read_buffer.clear();
+                    return Ok(text);
+                }
+                Err(error) if error.error_len().is_some() => {
+                    return Err(SocketError::new(
+                        "SOCKET_UTF8",
+                        "TCP 接收内容含非法 UTF-8 字节序列",
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SocketError::new(
+                "SOCKET_TIMEOUT",
+                "读取 TCP 流已超过超时上限",
+            ));
+        }
+        stream_handle
+            .stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| socket_io_error("SOCKET_READ", "配置 TCP 读超时", error))?;
+        let read_capacity = capacity
+            .saturating_add(1)
+            .saturating_sub(stream_handle.read_buffer.len())
+            .max(1);
+        let mut bytes = vec![0; read_capacity];
+        let length = stream_handle
+            .stream
+            .read(&mut bytes)
+            .map_err(|error| socket_io_error("SOCKET_READ", "读取 TCP 流", error))?;
+        if length == 0 {
+            if stream_handle.read_buffer.is_empty() {
+                return Ok(String::new());
+            }
+            return Err(SocketError::new(
+                "SOCKET_UTF8",
+                "TCP 流在未完成的 UTF-8 字符后结束",
+            ));
+        }
+        stream_handle
+            .read_buffer
+            .extend_from_slice(&bytes[..length]);
     }
-    bytes.truncate(length);
-    String::from_utf8(bytes)
-        .map_err(|_| SocketError::new("SOCKET_UTF8", "TCP 接收内容不是完整 UTF-8 文字"))
 }
 
 #[cfg(target_family = "wasm")]
@@ -1005,23 +1299,63 @@ pub fn socket_receive(
 
 #[cfg(not(target_family = "wasm"))]
 pub fn socket_udp_bind(address: &str) -> Result<SocketHandle, SocketError> {
-    let addresses = resolve_socket_addresses(address)?;
+    socket_udp_bind_guarded(
+        address,
+        &crate::permissions::PermissionSet::unrestricted(),
+        &SocketQuota::default(),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_udp_bind_guarded(
+    address: &str,
+    permissions: &crate::permissions::PermissionSet,
+    quota: &SocketQuota,
+) -> Result<SocketHandle, SocketError> {
+    permissions
+        .check_udp_bind(address)
+        .map_err(socket_permission_error)?;
+    let deadline = Instant::now() + Duration::from_millis(SOCKET_BIND_RESOLVE_TIMEOUT_MILLIS);
+    let addresses = resolve_socket_addresses(address, deadline)?;
     let mut last_error = None;
-    for address in addresses {
-        match UdpSocket::bind(address) {
-            Ok(socket) => return Ok(SocketHandle::Udp(socket)),
+    for resolved in addresses {
+        if permissions
+            .check_udp_bind_resolved(address, resolved)
+            .is_err()
+        {
+            continue;
+        }
+        match UdpSocket::bind(resolved) {
+            Ok(socket) => {
+                let lease = quota.acquire(false)?;
+                return Ok(SocketHandle::Udp(UdpSocketHandle {
+                    socket,
+                    _lease: lease,
+                }));
+            }
             Err(error) => last_error = Some(error),
         }
     }
-    Err(socket_io_error(
-        "SOCKET_BIND",
-        "绑定 UDP 地址",
-        last_error.expect("地址列表非空"),
-    ))
+    let Some(last_error) = last_error else {
+        return Err(SocketError::new(
+            "SOCKET_PERMISSION",
+            "UDP 绑定地址的 DNS 结果均被绑定策略拒绝",
+        ));
+    };
+    Err(socket_io_error("SOCKET_BIND", "绑定 UDP 地址", last_error))
 }
 
 #[cfg(target_family = "wasm")]
 pub fn socket_udp_bind(_address: &str) -> Result<SocketHandle, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_udp_bind_guarded(
+    _address: &str,
+    _permissions: &crate::permissions::PermissionSet,
+    _quota: &SocketQuota,
+) -> Result<SocketHandle, SocketError> {
     Err(socket_unsupported())
 }
 
@@ -1032,17 +1366,59 @@ pub fn socket_udp_send_to(
     address: &str,
     timeout_millis: u64,
 ) -> Result<u64, SocketError> {
+    socket_udp_send_to_guarded(
+        handle,
+        text,
+        address,
+        timeout_millis,
+        &crate::permissions::PermissionSet::unrestricted(),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_udp_send_to_guarded(
+    handle: &mut SocketHandle,
+    text: &str,
+    address: &str,
+    timeout_millis: u64,
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<u64, SocketError> {
     let timeout = socket_timeout(timeout_millis)?;
-    let addresses = resolve_socket_addresses(address)?;
-    let SocketHandle::Udp(socket) = handle else {
+    let deadline = Instant::now() + timeout;
+    permissions
+        .check_network(address)
+        .map_err(socket_permission_error)?;
+    let addresses = resolve_socket_addresses(address, deadline)?
+        .into_iter()
+        .filter(|resolved| {
+            permissions
+                .check_resolved_network(address, *resolved)
+                .is_ok()
+        })
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(SocketError::new(
+            "SOCKET_PERMISSION",
+            format!("UDP 目标“{address}”的 DNS 结果均被网络地址策略拒绝"),
+        ));
+    }
+    let SocketHandle::Udp(socket_handle) = handle else {
         return Err(socket_state(handle, "UDP发送至", "UDP套接字"));
     };
-    socket
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| socket_io_error("SOCKET_WRITE", "配置 UDP 写超时", error))?;
     let mut last_error = None;
     for address in addresses {
-        match socket.send_to(text.as_bytes(), address) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SocketError::new(
+                "SOCKET_TIMEOUT",
+                "发送 UDP 数据报已超过超时上限",
+            ));
+        }
+        socket_handle
+            .socket
+            .set_write_timeout(Some(remaining))
+            .map_err(|error| socket_io_error("SOCKET_WRITE", "配置 UDP 写超时", error))?;
+        match socket_handle.socket.send_to(text.as_bytes(), address) {
             Ok(written) => return Ok(written as u64),
             Err(error) => last_error = Some(error),
         }
@@ -1064,6 +1440,17 @@ pub fn socket_udp_send_to(
     Err(socket_unsupported())
 }
 
+#[cfg(target_family = "wasm")]
+pub fn socket_udp_send_to_guarded(
+    _handle: &mut SocketHandle,
+    _text: &str,
+    _address: &str,
+    _timeout_millis: u64,
+    _permissions: &crate::permissions::PermissionSet,
+) -> Result<u64, SocketError> {
+    Err(socket_unsupported())
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub fn socket_udp_receive_from(
     handle: &mut SocketHandle,
@@ -1072,14 +1459,16 @@ pub fn socket_udp_receive_from(
 ) -> Result<(String, String), SocketError> {
     let timeout = socket_timeout(timeout_millis)?;
     let capacity = socket_read_capacity(max_bytes)?;
-    let SocketHandle::Udp(socket) = handle else {
+    let SocketHandle::Udp(socket_handle) = handle else {
         return Err(socket_state(handle, "UDP接收自", "UDP套接字"));
     };
-    socket
+    socket_handle
+        .socket
         .set_read_timeout(Some(timeout))
         .map_err(|error| socket_io_error("SOCKET_READ", "配置 UDP 读超时", error))?;
     let mut bytes = vec![0; capacity + 1];
-    let (length, peer) = socket
+    let (length, peer) = socket_handle
+        .socket
         .recv_from(&mut bytes)
         .map_err(|error| socket_io_error("SOCKET_READ", "接收 UDP 数据报", error))?;
     if length > capacity {
@@ -1106,9 +1495,9 @@ pub fn socket_udp_receive_from(
 #[cfg(not(target_family = "wasm"))]
 pub fn socket_local_address(handle: &SocketHandle) -> Result<String, SocketError> {
     let result = match handle {
-        SocketHandle::TcpStream(stream) => stream.local_addr(),
-        SocketHandle::TcpListener(listener) => listener.local_addr(),
-        SocketHandle::Udp(socket) => socket.local_addr(),
+        SocketHandle::TcpStream(stream) => stream.stream.local_addr(),
+        SocketHandle::TcpListener(listener) => listener.listener.local_addr(),
+        SocketHandle::Udp(socket) => socket.socket.local_addr(),
         SocketHandle::Closed => return Err(socket_state(handle, "本地地址", "开放套接字")),
     };
     result
@@ -1125,6 +1514,7 @@ pub fn socket_local_address(_handle: &SocketHandle) -> Result<String, SocketErro
 pub fn socket_peer_address(handle: &SocketHandle) -> Result<Option<String>, SocketError> {
     match handle {
         SocketHandle::TcpStream(stream) => stream
+            .stream
             .peer_addr()
             .map(|address| Some(address.to_string()))
             .map_err(|error| socket_io_error("SOCKET_STATE", "读取对端地址", error)),
@@ -1142,7 +1532,7 @@ pub fn socket_peer_address(_handle: &SocketHandle) -> Result<Option<String>, Soc
 pub fn socket_close(handle: &mut SocketHandle) -> Result<(), SocketError> {
     let previous = std::mem::replace(handle, SocketHandle::Closed);
     if let SocketHandle::TcpStream(stream) = previous {
-        match stream.shutdown(Shutdown::Both) {
+        match stream.stream.shutdown(Shutdown::Both) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
             Err(error) => {
@@ -1159,7 +1549,10 @@ pub fn socket_close(_handle: &mut SocketHandle) -> Result<(), SocketError> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn resolve_socket_addresses(address: &str) -> Result<Vec<SocketAddr>, SocketError> {
+fn resolve_socket_addresses(
+    address: &str,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, SocketError> {
     let address = address.trim();
     let (_, port) = address.rsplit_once(':').ok_or_else(|| {
         SocketError::new("SOCKET_ADDRESS", "套接字地址须为主机:端口或 [IPv6]:端口")
@@ -1170,13 +1563,42 @@ fn resolve_socket_addresses(address: &str) -> Result<Vec<SocketAddr>, SocketErro
             "套接字端口须为 0..65535 的整数",
         ));
     }
-    let addresses = address.to_socket_addrs().map_err(|error| {
-        SocketError::new(
-            "SOCKET_DNS",
-            format!("不能解析套接字地址“{address}”：{error}"),
-        )
-    })?;
-    let addresses = addresses.collect::<Vec<_>>();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(SocketError::new(
+            "SOCKET_TIMEOUT",
+            format!("解析套接字地址“{address}”已超过超时上限"),
+        ));
+    }
+    let owned = address.to_owned();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = owned
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect::<Vec<_>>());
+        let _ = sender.send(result);
+    });
+    let addresses = match receiver.recv_timeout(remaining) {
+        Ok(Ok(addresses)) => addresses,
+        Ok(Err(error)) => {
+            return Err(SocketError::new(
+                "SOCKET_DNS",
+                format!("不能解析套接字地址“{address}”：{error}"),
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(SocketError::new(
+                "SOCKET_TIMEOUT",
+                format!("解析套接字地址“{address}”已超过超时上限"),
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(SocketError::new(
+                "SOCKET_DNS",
+                format!("解析套接字地址“{address}”的工作线程异常结束"),
+            ));
+        }
+    };
     if addresses.is_empty() {
         Err(SocketError::new(
             "SOCKET_DNS",
@@ -1185,6 +1607,11 @@ fn resolve_socket_addresses(address: &str) -> Result<Vec<SocketAddr>, SocketErro
     } else {
         Ok(addresses)
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn socket_permission_error(error: crate::permissions::PermissionError) -> SocketError {
+    SocketError::new("SOCKET_PERMISSION", error.to_string())
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1262,72 +1689,218 @@ pub fn http_request_with_options(
     timeout_millis: u64,
     max_bytes: u64,
 ) -> Result<HttpResponse, NetworkError> {
+    http_request_with_options_guarded(
+        method,
+        url,
+        body,
+        timeout_millis,
+        max_bytes,
+        &crate::permissions::PermissionSet::unrestricted(),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn http_request_with_options_guarded(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    timeout_millis: u64,
+    max_bytes: u64,
+    permissions: &crate::permissions::PermissionSet,
+) -> Result<HttpResponse, NetworkError> {
     use ureq::ResponseExt as _;
 
-    let parsed = Url::parse(url)
+    let mut parsed = Url::parse(url)
         .map_err(|error| NetworkError::new("NET_URL", format!("网络地址无效：{error}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err(NetworkError::new(
-            "NET_URL",
-            "网络地址须使用 http:// 或 https:// 且含主机",
-        ));
-    }
+    validate_http_url(&parsed)?;
     if timeout_millis == 0 {
         return Err(NetworkError::new("NET_URL", "网络超时须大于零毫秒"));
     }
     if max_bytes == 0 {
         return Err(NetworkError::new("NET_LIMIT", "响应大小上限须大于零字节"));
     }
-    let method = ureq::http::Method::from_bytes(method.as_bytes())
+    let mut method = ureq::http::Method::from_bytes(method.as_bytes())
         .map_err(|error| NetworkError::new("NET_PROTOCOL", format!("HTTP 方法无效：{error}")))?;
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_millis(timeout_millis)))
-        .build()
-        .new_agent();
-    let request = ureq::http::Request::builder()
-        .method(method)
-        .uri(parsed.as_str())
-        .header("content-type", "text/plain; charset=utf-8")
-        .header("accept", "text/plain, application/json;q=0.9, */*;q=0.1")
-        .body(body.unwrap_or("").as_bytes())
-        .map_err(|error| NetworkError::new("NET_URL", format!("不能建立 HTTP 请求：{error}")))?;
-    let mut response = agent.run(request).map_err(network_error_from_ureq)?;
-    let status = response.status().as_u16();
-    let final_url = response.get_uri().to_string();
-    let headers = response
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_owned(),
-                value.to_str().unwrap_or("<非文字首部>").to_owned(),
-            )
-        })
-        .collect::<Vec<_>>();
-    if response
-        .body()
-        .content_length()
-        .is_some_and(|length| length > max_bytes)
-    {
-        return Err(NetworkError::new(
-            "NET_LIMIT",
-            format!("HTTP 响应超过 {max_bytes} 字节上限"),
-        ));
+    let mut request_body = body.map(str::as_bytes);
+    let deadline = Instant::now() + Duration::from_millis(timeout_millis);
+    for redirect_count in 0..=HTTP_MAX_REDIRECTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(NetworkError::new(
+                "NET_TIMEOUT",
+                "HTTP 请求已超过调用级超时上限",
+            ));
+        }
+        permissions
+            .check_network(parsed.as_str())
+            .map_err(network_permission_error)?;
+        let denial = Arc::new(Mutex::new(None));
+        let resolver = PermissionResolver {
+            permissions: permissions.clone(),
+            denial: denial.clone(),
+        };
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(remaining))
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .proxy(None)
+            .build();
+        let agent = ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::default(),
+            resolver,
+        );
+        let request = ureq::http::Request::builder()
+            .method(method.clone())
+            .uri(parsed.as_str())
+            .header("content-type", "text/plain; charset=utf-8")
+            .header("accept", "text/plain, application/json;q=0.9, */*;q=0.1")
+            .body(request_body.unwrap_or_default())
+            .map_err(|error| {
+                NetworkError::new("NET_URL", format!("不能建立 HTTP 请求：{error}"))
+            })?;
+        let mut response = match agent.run(request) {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(message) = denial.lock().expect("permission denial lock").take() {
+                    return Err(NetworkError::new("NET_PERMISSION", message));
+                }
+                return Err(network_error_from_ureq(error));
+            }
+        };
+        let status = response.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308)
+            && let Some(location) = response.headers().get("location")
+        {
+            if redirect_count == HTTP_MAX_REDIRECTS {
+                return Err(NetworkError::new(
+                    "NET_PROTOCOL",
+                    format!("HTTP 重定向超过 {HTTP_MAX_REDIRECTS} 跳上限"),
+                ));
+            }
+            let location = location
+                .to_str()
+                .map_err(|_| NetworkError::new("NET_PROTOCOL", "HTTP Location 首部不是有效文字"))?;
+            let next = parsed.join(location).map_err(|error| {
+                NetworkError::new("NET_URL", format!("HTTP 重定向地址无效：{error}"))
+            })?;
+            validate_http_url(&next)?;
+            permissions
+                .check_network(next.as_str())
+                .map_err(network_permission_error)?;
+            if matches!(status, 301..=303)
+                && method != ureq::http::Method::GET
+                && method != ureq::http::Method::HEAD
+            {
+                method = ureq::http::Method::GET;
+                request_body = None;
+            }
+            parsed = next;
+            continue;
+        }
+        let final_url = response.get_uri().to_string();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or("<非文字首部>").to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if response
+            .body()
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
+            return Err(NetworkError::new(
+                "NET_LIMIT",
+                format!("HTTP 响应超过 {max_bytes} 字节上限"),
+            ));
+        }
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(max_bytes)
+            .read_to_vec()
+            .map_err(network_error_from_ureq)?;
+        let body = String::from_utf8(bytes)
+            .map_err(|_| NetworkError::new("NET_UTF8", "HTTP 响应正文不是 UTF-8 文字"))?;
+        return Ok(HttpResponse {
+            status,
+            url: final_url,
+            headers,
+            body,
+        });
     }
-    let bytes = response
-        .body_mut()
-        .with_config()
-        .limit(max_bytes)
-        .read_to_vec()
-        .map_err(network_error_from_ureq)?;
-    let body = String::from_utf8(bytes)
-        .map_err(|_| NetworkError::new("NET_UTF8", "HTTP 响应正文不是 UTF-8 文字"))?;
-    Ok(HttpResponse {
-        status,
-        url: final_url,
-        headers,
-        body,
-    })
+    unreachable!("redirect loop returns at its configured bound")
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone)]
+struct PermissionResolver {
+    permissions: crate::permissions::PermissionSet,
+    denial: Arc<Mutex<Option<String>>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl std::fmt::Debug for PermissionResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PermissionResolver")
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl ureq::unversioned::resolver::Resolver for PermissionResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        use ureq::unversioned::resolver::DefaultResolver;
+
+        let resource = uri.to_string();
+        if let Err(error) = self.permissions.check_network(&resource) {
+            *self.denial.lock().expect("permission denial lock") = Some(error.to_string());
+            return Err(ureq::Error::HostNotFound);
+        }
+        let resolved = DefaultResolver::default().resolve(uri, config, timeout)?;
+        let mut allowed = self.empty();
+        let mut last_denial = None;
+        for address in resolved.iter().copied() {
+            match self.permissions.check_resolved_network(&resource, address) {
+                Ok(()) => allowed.push(address),
+                Err(error) => last_denial = Some(error.to_string()),
+            }
+        }
+        if allowed.is_empty() {
+            *self.denial.lock().expect("permission denial lock") = Some(
+                last_denial.unwrap_or_else(|| format!("网络地址“{resource}”没有获准的 DNS 结果")),
+            );
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(allowed)
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn validate_http_url(url: &Url) -> Result<(), NetworkError> {
+    if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() {
+        Ok(())
+    } else {
+        Err(NetworkError::new(
+            "NET_URL",
+            "网络地址须使用 http:// 或 https:// 且含主机",
+        ))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn network_permission_error(error: crate::permissions::PermissionError) -> NetworkError {
+    NetworkError::new("NET_PERMISSION", error.to_string())
 }
 
 #[cfg(target_family = "wasm")]
@@ -1337,6 +1910,21 @@ pub fn http_request_with_options(
     _body: Option<&str>,
     _timeout_millis: u64,
     _max_bytes: u64,
+) -> Result<HttpResponse, NetworkError> {
+    Err(NetworkError::new(
+        "NET_PROTOCOL",
+        "WASI 运行时未授予原生网络传输能力",
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn http_request_with_options_guarded(
+    _method: &str,
+    _url: &str,
+    _body: Option<&str>,
+    _timeout_millis: u64,
+    _max_bytes: u64,
+    _permissions: &crate::permissions::PermissionSet,
 ) -> Result<HttpResponse, NetworkError> {
     Err(NetworkError::new(
         "NET_PROTOCOL",
@@ -1594,6 +2182,64 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
+    fn checks_http_permissions_again_on_every_redirect_hop() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let denied_target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let denied_address = denied_target.local_addr().unwrap();
+        let redirector = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirector_address = redirector.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = redirector.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost:{}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                denied_address.port()
+            )
+            .unwrap();
+        });
+        let permissions = crate::permissions::PermissionSet::sandboxed().allow_network("127.0.0.1");
+        let error = http_request_with_options_guarded(
+            "GET",
+            &format!("http://{redirector_address}/redirect"),
+            None,
+            1_000,
+            64,
+            &permissions,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        drop(denied_target);
+        assert_eq!(error.code, "NET_PERMISSION");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn rejects_sensitive_http_dns_results_without_an_exact_ip_grant() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let permissions = crate::permissions::PermissionSet::sandboxed().allow_network("localhost");
+        let error = http_request_with_options_guarded(
+            "GET",
+            &format!(
+                "http://localhost:{}/",
+                listener.local_addr().unwrap().port()
+            ),
+            None,
+            1_000,
+            64,
+            &permissions,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "NET_PERMISSION");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
     fn classifies_http_status_and_non_utf8_responses() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -1678,6 +2324,54 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
+    fn tcp_receive_buffers_utf8_code_points_split_across_reads() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&[0xe5]).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            stream.write_all(&[0x96, 0x84]).unwrap();
+        });
+        let mut client = socket_tcp_connect(&address.to_string(), 1_000).unwrap();
+        assert_eq!(socket_receive(&mut client, 3, 1_000).unwrap(), "善");
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn socket_quota_limits_resources_and_releases_capacity_on_close() {
+        let permissions = crate::permissions::PermissionSet::sandboxed()
+            .allow_tcp_listen("127.0.0.1")
+            .allow_udp_bind("127.0.0.1");
+        let quota = SocketQuota::new(2, 1);
+        let mut listener = socket_tcp_listen_guarded("127.0.0.1:0", &permissions, &quota).unwrap();
+        assert_eq!(quota.counts(), (1, 1));
+        assert_eq!(
+            socket_tcp_listen_guarded("127.0.0.1:0", &permissions, &quota)
+                .unwrap_err()
+                .code,
+            "SOCKET_LIMIT"
+        );
+        let mut udp = socket_udp_bind_guarded("127.0.0.1:0", &permissions, &quota).unwrap();
+        assert_eq!(quota.counts(), (2, 1));
+        assert_eq!(
+            socket_udp_bind_guarded("127.0.0.1:0", &permissions, &quota)
+                .unwrap_err()
+                .code,
+            "SOCKET_LIMIT"
+        );
+        socket_close(&mut udp).unwrap();
+        assert_eq!(quota.counts(), (1, 1));
+        socket_close(&mut listener).unwrap();
+        assert_eq!(quota.counts(), (0, 0));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
     fn udp_sockets_preserve_datagrams_and_enforce_limits_and_utf8() {
         let mut receiver = socket_udp_bind("127.0.0.1:0").unwrap();
         let receiver_address = socket_local_address(&receiver).unwrap();
@@ -1740,6 +2434,14 @@ mod tests {
         assert_eq!(manifest["schema_version"], API_MANIFEST_SCHEMA_VERSION);
         let modules = manifest["modules"].as_array().unwrap();
         assert_eq!(modules.len(), 22);
+        let socket_module = modules
+            .iter()
+            .find(|module| module["name"] == "套接字")
+            .unwrap();
+        assert_eq!(
+            socket_module["permissions"],
+            serde_json::json!(["network", "tcp_listen", "udp_bind"])
+        );
         let mut module_names = std::collections::HashSet::new();
         for module in modules {
             let name = module["name"].as_str().unwrap();
