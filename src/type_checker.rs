@@ -754,7 +754,12 @@ impl Checker {
             }
             ExprKind::Call { callee, arguments } => {
                 let callee_type = self.expression(callee, scope);
-                let function = if let ExprKind::Variable(name) = &callee.kind {
+                let builtin_name = if let ExprKind::Variable(name) = &callee.kind {
+                    Some(name.as_str())
+                } else {
+                    None
+                };
+                let function = if let Some(name) = builtin_name {
                     scope
                         .get(name)
                         .cloned()
@@ -774,11 +779,23 @@ impl Checker {
                             expression.span.clone(),
                         );
                     }
+                    let mut actuals = Vec::with_capacity(arguments.len());
                     for (expected, argument) in function.params.iter().zip(arguments) {
                         let actual = self.expression(argument, scope);
                         self.require(expected, &actual, &argument.span, "参数".into());
+                        actuals.push(actual);
                     }
-                    function.result
+                    for argument in arguments.iter().skip(function.params.len()) {
+                        actuals.push(self.expression(argument, scope));
+                    }
+                    if builtin_name == Some("折叠") {
+                        actuals
+                            .get(1)
+                            .cloned()
+                            .unwrap_or_else(|| function.result.clone())
+                    } else {
+                        function.result
+                    }
                 } else {
                     for argument in arguments {
                         self.expression(argument, scope);
@@ -1863,5 +1880,16 @@ mod tests {
                 .iter()
                 .any(|error| error.message.contains("须收任务"))
         );
+    }
+
+    #[test]
+    fn infers_fold_result_from_the_initial_accumulator() {
+        let source = r#"
+            法 相加（合计：数，分数：数）：数 则
+                归 合计 加 分数；
+            终
+            定 总分：数 为 折叠（【1，2，3】，0，相加）；
+        "#;
+        check(&crate::parse(source).unwrap()).unwrap();
     }
 }

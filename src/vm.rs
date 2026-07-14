@@ -1322,7 +1322,7 @@ impl Vm {
                 let mut items = items.borrow_mut();
                 let slot = items
                     .get_mut(index)
-                    .ok_or_else(|| error(span, "列下标超出范围"))?;
+                    .ok_or_else(|| error(span, format!("列下标 {index} 超出范围")))?;
                 *slot = value;
                 Ok(())
             }
@@ -1643,7 +1643,7 @@ impl Vm {
                 VmValue::List(value) => {
                     let index = list_index(&arguments[1], span)?;
                     if index > value.borrow().len() {
-                        return Err(error(span, "插入下标超出范围"));
+                        return Err(error(span, format!("列下标 {index} 超出可插入范围")));
                     }
                     self.resources
                         .check_collection(value.borrow().len().saturating_add(1))
@@ -1657,7 +1657,7 @@ impl Vm {
                 VmValue::List(value) => {
                     let index = list_index(&arguments[1], span)?;
                     if index >= value.borrow().len() {
-                        return Err(error(span, "删除下标超出范围"));
+                        return Err(error(span, format!("列下标 {index} 超出范围")));
                     }
                     Ok(value.borrow_mut().remove(index))
                 }
@@ -2843,27 +2843,35 @@ fn list_index(value: &VmValue, span: &Span) -> Result<usize, VmError> {
 
 fn index_value(object: VmValue, index: VmValue, span: &Span) -> Result<VmValue, VmError> {
     match object {
-        VmValue::List(items) => items
-            .borrow()
-            .get(list_index(&index, span)?)
-            .cloned()
-            .ok_or_else(|| error(span, "列下标超出范围")),
-        VmValue::Tuple(items) => items
-            .get(list_index(&index, span)?)
-            .cloned()
-            .ok_or_else(|| error(span, "元下标超出范围")),
-        VmValue::String(text) => text
-            .chars()
-            .nth(list_index(&index, span)?)
-            .map(|character| VmValue::String(character.to_string()))
-            .ok_or_else(|| error(span, "文字下标超出范围")),
+        VmValue::List(items) => {
+            let index = list_index(&index, span)?;
+            items
+                .borrow()
+                .get(index)
+                .cloned()
+                .ok_or_else(|| error(span, format!("列下标 {index} 超出范围")))
+        }
+        VmValue::Tuple(items) => {
+            let index = list_index(&index, span)?;
+            items
+                .get(index)
+                .cloned()
+                .ok_or_else(|| error(span, format!("元组下标 {index} 超出范围")))
+        }
+        VmValue::String(text) => {
+            let index = list_index(&index, span)?;
+            text.chars()
+                .nth(index)
+                .map(|character| VmValue::String(character.to_string()))
+                .ok_or_else(|| error(span, format!("文字下标 {index} 超出范围")))
+        }
         VmValue::Map(map) => map
             .borrow()
             .entries
             .iter()
             .find(|(key, _)| values_equal(key, &index))
             .map(|(_, value)| value.clone())
-            .ok_or_else(|| error(span, "典中未有此键")),
+            .ok_or_else(|| error(span, format!("典中未有键“{index}”"))),
         value => Err(error(span, format!("{}不可用下标读取", value.type_name()))),
     }
 }

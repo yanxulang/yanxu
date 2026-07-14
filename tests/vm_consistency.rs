@@ -24,6 +24,27 @@ fn assert_consistent(name: &str, source: &str) {
     assert_eq!(tree, vm, "{name} 的树解释器与 VM 输出不一致");
 }
 
+#[test]
+fn official_examples_type_check_and_match_both_runtimes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let mut paths = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "yx"))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    for path in paths {
+        let source = fs::read_to_string(&path).unwrap();
+        let statements = yanxu::parse_named(&source, path.display().to_string()).unwrap();
+        yanxu::type_checker::check_in_directory(&statements, &root)
+            .unwrap_or_else(|errors| panic!("{} 静态检查失败：{errors:#?}", path.display()));
+        let (tree, vm) = execute_both(&source, &root);
+        assert_eq!(tree, vm, "{} 的树解释器与 VM 输出不一致", path.display());
+    }
+}
+
 fn source_path(path: &Path) -> String {
     path.display()
         .to_string()

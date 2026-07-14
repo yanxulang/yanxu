@@ -82,7 +82,7 @@ module.exports = grammar({
     index_expression: $ => prec(9, seq($.expression, '【', optional($.expression),
       optional(seq('：', optional($.expression))), '】')),
 
-    identifier: _ => /[^\s\(\)（）\[\]【】{},，:：.;；+\-*\/!=><|?#？「」“”]+/,
+    identifier: _ => /[^0-9\s\(\)（）\[\]【】{},，:：.;；+\-*\/!=><|?#？「」“”][^\s\(\)（）\[\]【】{},，:：.;；+\-*\/!=><|?#？「」“”]*/,
     number: _ => /\d+(\.\d+)?/,
     string: _ => token(choice(seq('「', repeat(choice(/[^」\\]/, /\\./)), '」'),
       seq('"', repeat(choice(/[^"\\]/, /\\./)), '"')))

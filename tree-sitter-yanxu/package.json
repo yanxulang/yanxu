@@ -1,8 +1,15 @@
 {
   "name": "tree-sitter-yanxu",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Tree-sitter grammar for the Yanxu programming language",
   "main": "bindings/node",
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test"
+  },
   "keywords": ["tree-sitter", "yanxu", "language"],
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "0.26.11"
+  }
 }

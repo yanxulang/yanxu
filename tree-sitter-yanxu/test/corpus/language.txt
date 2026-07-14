@@ -1,0 +1,167 @@
+==================
+异步函数、泛型与等待
+==================
+
+异 法 求和（值：数）：数 则
+    归 值 加 1；
+终
+定 工作：任务<数> 为 求和（41）；
+言 候 工作；
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter
+      (identifier)
+      (type_annotation
+        (type
+          (named_type
+            (identifier)))))
+    (type_annotation
+      (type
+        (named_type
+          (identifier))))
+    (return_statement
+      (expression
+        (binary_expression
+          (expression
+            (identifier))
+          (expression
+            (number))))))
+  (declaration
+    (identifier)
+    (type_annotation
+      (type
+        (generic_type
+          (identifier)
+          (type
+            (named_type
+              (identifier))))))
+    (expression
+      (call_expression
+        (expression
+          (identifier))
+        (expression
+          (number)))))
+  (print_statement
+    (expression
+      (await_expression
+        (expression
+          (identifier))))))
+
+==================
+协议、继承与成员
+==================
+
+协 可名 则
+    域 名：文；
+    法 显示（）：文；
+终
+类 人 纳 可名 则
+    公 只 域 名：文；
+    法 初始化（名：文）则 置 此.名 为 名；终
+    法 显示（）：文 则 归 此.名；终
+终
+
+---
+
+(source_file
+  (protocol_declaration
+    (identifier)
+    (protocol_field
+      (identifier)
+      (type_annotation
+        (type
+          (named_type
+            (identifier)))))
+    (protocol_method
+      (identifier)
+      (type_annotation
+        (type
+          (named_type
+            (identifier))))))
+  (class_declaration
+    (identifier)
+    (identifier)
+    (class_member
+      (field_declaration
+        (member_modifiers)
+        (identifier)
+        (type_annotation
+          (type
+            (named_type
+              (identifier))))))
+    (class_member
+      (method_declaration
+        (identifier)
+        (parameter
+          (identifier)
+          (type_annotation
+            (type
+              (named_type
+                (identifier)))))
+        (assignment
+          (expression
+            (member_expression
+              (expression)
+              (identifier)))
+          (expression
+            (identifier)))))
+    (class_member
+      (method_declaration
+        (identifier)
+        (type_annotation
+          (type
+            (named_type
+              (identifier))))
+        (return_statement
+          (expression
+            (member_expression
+              (expression)
+              (identifier))))))))
+
+==================
+容器、切片与错误
+==================
+
+定 名录：列<文> 为【「子衿」，「蒹葭」】；
+试 则
+    言 名录【0：1】；
+救 所误 则
+    抛 所误；
+终
+
+---
+
+(source_file
+  (declaration
+    (identifier)
+    (type_annotation
+      (type
+        (generic_type
+          (identifier)
+          (type
+            (named_type
+              (identifier))))))
+    (expression
+      (list
+        (expression
+          (string))
+        (expression
+          (string)))))
+  (try_statement
+    (print_statement
+      (expression
+        (index_expression
+          (expression
+            (identifier))
+          (expression
+            (number))
+          (expression
+            (number)))))
+    (identifier)
+    (throw_statement
+      (expression
+        (identifier)))))

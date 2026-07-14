@@ -37,6 +37,63 @@ jobs:
       - name: 检查 WASI 库
         run: cargo check --target wasm32-wasip1 --lib --locked
 
+  embedding:
+    name: 宿主嵌入验收
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: 准备 WASI 目标
+        run: rustup target add wasm32-wasip1
+      - name: 运行 Rust 宿主示例
+        run: cargo run --manifest-path examples/embedding/rust-host/Cargo.toml --locked
+      - name: 检查 WASI 宿主示例
+        run: cargo check --manifest-path examples/embedding/wasi-host/Cargo.toml --target wasm32-wasip1 --locked
+      - name: 构建动态库
+        run: cargo build --release --locked
+      - name: 编译并运行 C ABI 宿主示例
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc examples/embedding/c-host/main.c -Iinclude -Ltarget/release -lyanxu -o "$RUNNER_TEMP/yanxu-c-host"
+          LD_LIBRARY_PATH="$GITHUB_WORKSPACE/target/release" "$RUNNER_TEMP/yanxu-c-host"
+
+  acceptance:
+    name: 1.0 验收与工具链
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tree-sitter-yanxu/package-lock.json
+      - name: 构建命令行
+        run: cargo build --locked
+      - name: 从仓库外运行兼容语料
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/target/debug/yanxu" 兼容 "$GITHUB_WORKSPACE/compat" --json > compatibility.json
+          jq -e '.schema_version == 1 and (.cases | length) >= 9 and ([.cases[].passed] | all)' compatibility.json >/dev/null
+      - name: 校验标准库机器清单
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/debug/yanxu 标准库 --json > stdlib.json
+          jq -e '.schema_version == 1 and (.modules | length) == 17' stdlib.json >/dev/null
+      - name: 编译模糊测试目标
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+      - name: 隔离验证 Cargo 发布包
+        run: cargo package --locked
+      - name: 安装 Tree-sitter 工具
+        run: npm --prefix tree-sitter-yanxu ci
+      - name: 生成并测试 Tree-sitter
+        run: |
+          npm --prefix tree-sitter-yanxu run generate
+          npm --prefix tree-sitter-yanxu test
+          git diff --exit-code -- tree-sitter-yanxu/src tree-sitter-yanxu/grammar.js
+
   installer:
     name: 安装器 · ${{ matrix.os }}
     strategy:

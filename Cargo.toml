@@ -1,6 +1,6 @@
 [package]
 name = "yanxu"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "言序：以 Rust 编写的文言风格解释型编程语言"
 license = "MIT"
@@ -30,6 +30,9 @@ include = [
     "/proposals/**",
     "/reference/**",
     "/tree-sitter-yanxu/**",
+    "!/examples/**/target/**",
+    "!/fuzz/target/**",
+    "!/tree-sitter-yanxu/node_modules/**",
     "/言序.toml",
 ]
 
