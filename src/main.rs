@@ -677,4 +677,5 @@ fn help() {
     println!(
         "言序——文言风格的解释型编程语言\n\n用法：\n  yanxu [文卷.yx]       以树解释器执行（兼容模式，不限制宿主能力）\n  yanxu 查 <文卷>        静态类型检查并报告弃用\n  yanxu 字节 <文卷>      以字节码 VM 执行\n  yanxu 格 [--写] <文卷>  格式化\n  yanxu 试 [目录] [--筛 词] [--并发 N] [--超时 ms] [--json]\n                         运行 .yx 规格测试\n  yanxu 兼容 [目录] [--json]  对照树解释器与 VM 的版本语料\n  yanxu 迁 [--检查|--差异|--写] <文卷>  检查或应用弃用迁移\n  yanxu 标准库 [--json]   显示版本化标准库 API 清单\n  yanxu 包 [路径]          显示包清单\n  yanxu 包 运行 [路径]     按清单权限运行包入口\n  yanxu 包 锁 [--离线] [路径]  生成或验证锁文件\n  yanxu 文 <文卷> [输出]  生成公开 API 文档\n  yanxu 调 <文卷>          执行并输出踪迹\n  yanxu 调试服务          启动 DAP 调试适配器\n  yanxu 基准 [轮数]       比较树解释器与 VM\n  yanxu 语言服务          启动 LSP stdio 服务\n\n不带参数时进入带历史与补全的多行 REPL。"
     );
+    println!("\n包项目的创建、依赖增删与安装请使用独立官方工具 yanbao。");
 }
