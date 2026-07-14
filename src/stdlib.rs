@@ -4,11 +4,14 @@
 //! 各自复制路径、编码、统计、CSV 与纯函数工具算法。运行时适配层只负责
 //! 类型转换和报错。
 
+use base64::Engine as _;
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Component, Path, PathBuf};
+use url::Url;
 
 pub const API_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
@@ -152,6 +155,219 @@ pub fn percent_decode(text: &str) -> Result<String, String> {
         }
     }
     String::from_utf8(decoded).map_err(|_| "解码结果不是有效 UTF-8 文字".into())
+}
+
+pub fn base64_encode(text: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+}
+
+pub fn base64_decode(text: &str) -> Result<String, String> {
+    decode_base64(&base64::engine::general_purpose::STANDARD, text, "Base64")
+}
+
+pub fn base64_url_encode(text: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text.as_bytes())
+}
+
+pub fn base64_url_decode(text: &str) -> Result<String, String> {
+    decode_base64(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        text,
+        "网址 Base64",
+    )
+}
+
+fn decode_base64(engine: &impl base64::Engine, text: &str, name: &str) -> Result<String, String> {
+    let bytes = engine
+        .decode(text)
+        .map_err(|_| format!("{name}文字含非法字母、长度或填充"))?;
+    String::from_utf8(bytes).map_err(|_| format!("{name}解码结果不是有效 UTF-8 文字"))
+}
+
+fn compile_regex(pattern: &str) -> Result<Regex, String> {
+    Regex::new(pattern).map_err(|error| format!("正则模式不合法：{error}"))
+}
+
+pub fn regex_is_match(pattern: &str, text: &str) -> Result<bool, String> {
+    Ok(compile_regex(pattern)?.is_match(text))
+}
+
+pub fn regex_first(pattern: &str, text: &str) -> Result<Option<String>, String> {
+    Ok(compile_regex(pattern)?
+        .find(text)
+        .map(|matched| matched.as_str().to_string()))
+}
+
+pub fn regex_replace_all(pattern: &str, text: &str, replacement: &str) -> Result<String, String> {
+    Ok(compile_regex(pattern)?
+        .replace_all(text, replacement)
+        .into_owned())
+}
+
+pub fn regex_split(pattern: &str, text: &str) -> Result<Vec<String>, String> {
+    Ok(compile_regex(pattern)?
+        .split(text)
+        .map(str::to_string)
+        .collect())
+}
+
+fn parse_url(text: &str) -> Result<Url, String> {
+    Url::parse(text).map_err(|error| format!("URL 不合法：{error}"))
+}
+
+pub fn url_is_valid(text: &str) -> bool {
+    Url::parse(text).is_ok()
+}
+
+pub fn url_scheme(text: &str) -> Result<String, String> {
+    Ok(parse_url(text)?.scheme().to_string())
+}
+
+pub fn url_host(text: &str) -> Result<Option<String>, String> {
+    Ok(parse_url(text)?.host_str().map(str::to_string))
+}
+
+pub fn url_port(text: &str) -> Result<Option<f64>, String> {
+    Ok(parse_url(text)?.port().map(f64::from))
+}
+
+pub fn url_path(text: &str) -> Result<String, String> {
+    Ok(parse_url(text)?.path().to_string())
+}
+
+pub fn url_query_value(text: &str, name: &str) -> Result<Option<String>, String> {
+    Ok(parse_url(text)?
+        .query_pairs()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned()))
+}
+
+pub fn url_join(base: &str, relative: &str) -> Result<String, String> {
+    parse_url(base)?
+        .join(relative)
+        .map(|url| url.into())
+        .map_err(|error| format!("相对 URL 不合法：{error}"))
+}
+
+#[derive(Clone, Copy)]
+struct IsoDate {
+    year: i32,
+    month: u32,
+    day: u32,
+}
+
+fn parse_iso_date(text: &str) -> Result<IsoDate, String> {
+    let bytes = text.as_bytes();
+    let digits = [0, 1, 2, 3, 5, 6, 8, 9];
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !digits
+            .into_iter()
+            .all(|index| bytes[index].is_ascii_digit())
+    {
+        return Err("日期须为 YYYY-MM-DD 形式".into());
+    }
+    let year = text[0..4].parse::<i32>().unwrap();
+    let month = text[5..7].parse::<u32>().unwrap();
+    let day = text[8..10].parse::<u32>().unwrap();
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+    {
+        return Err("日期不在 0001-01-01 至 9999-12-31 的有效公历范围".into());
+    }
+    Ok(IsoDate { year, month, day })
+}
+
+fn leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        2 if leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+pub fn date_is_valid(text: &str) -> bool {
+    parse_iso_date(text).is_ok()
+}
+
+pub fn date_is_leap_year(year: f64) -> Result<bool, String> {
+    let year = safe_integer(year, "年份")?;
+    let year = i32::try_from(year)
+        .ok()
+        .filter(|year| (1..=9999).contains(year))
+        .ok_or_else(|| "年份须在 1 至 9999 之间".to_string())?;
+    Ok(leap_year(year))
+}
+
+pub fn date_add_days(text: &str, days: f64) -> Result<String, String> {
+    let date = parse_iso_date(text)?;
+    let days = safe_integer(days, "日期天数")?;
+    let ordinal = days_from_civil(date)
+        .checked_add(days)
+        .ok_or_else(|| "日期运算超出支持范围".to_string())?;
+    let minimum = days_from_civil(IsoDate {
+        year: 1,
+        month: 1,
+        day: 1,
+    });
+    let maximum = days_from_civil(IsoDate {
+        year: 9999,
+        month: 12,
+        day: 31,
+    });
+    if !(minimum..=maximum).contains(&ordinal) {
+        return Err("日期运算超出 0001-01-01 至 9999-12-31".into());
+    }
+    let result = civil_from_days(ordinal);
+    Ok(format!(
+        "{:04}-{:02}-{:02}",
+        result.year, result.month, result.day
+    ))
+}
+
+/// 返回从开始日期到结束日期的天数；结束早于开始时为负数。
+pub fn date_days_between(start: &str, end: &str) -> Result<f64, String> {
+    let start = days_from_civil(parse_iso_date(start)?);
+    let end = days_from_civil(parse_iso_date(end)?);
+    Ok((end - start) as f64)
+}
+
+fn days_from_civil(date: IsoDate) -> i64 {
+    let mut year = i64::from(date.year);
+    let month = i64::from(date.month);
+    let day = i64::from(date.day);
+    year -= i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_days(days: i64) -> IsoDate {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    IsoDate {
+        year: year as i32,
+        month: month as u32,
+        day: day as u32,
+    }
 }
 
 fn hex_digit(byte: u8) -> Option<u8> {
@@ -632,6 +848,55 @@ mod tests {
     }
 
     #[test]
+    fn one_one_text_and_date_modules_are_deterministic() {
+        assert_eq!(base64_decode(&base64_encode("言序")).unwrap(), "言序");
+        assert_eq!(
+            base64_url_decode(&base64_url_encode("言序/语言")).unwrap(),
+            "言序/语言"
+        );
+        assert!(base64_decode("***").is_err());
+
+        assert!(regex_is_match(r"^言.+$", "言序").unwrap());
+        assert_eq!(
+            regex_first(r"\d+", "甲12乙").unwrap().as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            regex_replace_all(r"\d+", "甲12乙34", "数").unwrap(),
+            "甲数乙数"
+        );
+        assert_eq!(
+            regex_split(r"[,，]", "甲,乙，丙").unwrap(),
+            ["甲", "乙", "丙"]
+        );
+        assert!(regex_is_match("[", "言序").is_err());
+
+        let address = "https://yanxu.dev:8443/docs/start?lang=zh&mode=read";
+        assert!(url_is_valid(address));
+        assert_eq!(url_scheme(address).unwrap(), "https");
+        assert_eq!(url_host(address).unwrap().as_deref(), Some("yanxu.dev"));
+        assert_eq!(url_port(address).unwrap(), Some(8443.0));
+        assert_eq!(url_path(address).unwrap(), "/docs/start");
+        assert_eq!(
+            url_query_value(address, "lang").unwrap().as_deref(),
+            Some("zh")
+        );
+        assert_eq!(
+            url_join("https://yanxu.dev/docs/", "../download").unwrap(),
+            "https://yanxu.dev/download"
+        );
+
+        assert!(date_is_valid("2024-02-29"));
+        assert!(!date_is_valid("2023-02-29"));
+        assert!(date_is_leap_year(2000.0).unwrap());
+        assert!(!date_is_leap_year(1900.0).unwrap());
+        assert_eq!(date_add_days("2024-02-28", 2.0).unwrap(), "2024-03-01");
+        assert_eq!(date_add_days("2024-01-01", -1.0).unwrap(), "2023-12-31");
+        assert_eq!(date_days_between("2024-02-28", "2024-03-01").unwrap(), 2.0);
+        assert!(date_add_days("9999-12-31", 1.0).is_err());
+    }
+
+    #[test]
     fn computes_population_statistics() {
         let values = [1.0, 2.0, 3.0, 4.0];
         assert_eq!(stats_sum(&values).unwrap(), 10.0);
@@ -665,15 +930,30 @@ mod tests {
         let manifest = api_manifest().unwrap();
         assert_eq!(manifest["schema_version"], API_MANIFEST_SCHEMA_VERSION);
         let modules = manifest["modules"].as_array().unwrap();
-        assert_eq!(modules.len(), 17);
+        assert_eq!(modules.len(), 21);
         let mut module_names = std::collections::HashSet::new();
         for module in modules {
-            assert!(module_names.insert(module["name"].as_str().unwrap()));
+            let name = module["name"].as_str().unwrap();
+            assert!(!name.is_empty());
+            assert!(module_names.insert(name));
+            assert!(module["permissions"].is_array());
+            assert!(
+                module["platforms"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+            );
+            assert!(module["deterministic"].is_boolean());
             assert!(!module["members"].as_array().unwrap().is_empty());
             let mut members = std::collections::HashSet::new();
             for member in module["members"].as_array().unwrap() {
                 assert!(members.insert(member["name"].as_str().unwrap()));
                 assert!(member["signature"].is_string());
+                assert!(member.get("errors").is_none_or(serde_json::Value::is_array));
+                assert!(
+                    member
+                        .get("deterministic")
+                        .is_none_or(serde_json::Value::is_boolean)
+                );
             }
         }
     }

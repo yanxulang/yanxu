@@ -853,7 +853,10 @@ fn collect_files(
             .map_err(|error| manifest_error(directory, None, format!("不能读取目录项：{error}")))?;
         let path = entry.path();
         let name = entry.file_name();
-        if matches!(name.to_str(), Some(".git" | "target" | LOCK_NAME)) {
+        if matches!(
+            name.to_str(),
+            Some(".git" | ".yanxu" | ".DS_Store" | "target" | LOCK_NAME)
+        ) {
             continue;
         }
         if path.is_dir() {
@@ -1221,6 +1224,14 @@ mod tests {
         assert!(root.join(LOCK_NAME).is_file());
         let second = ensure_lock(&manifest, true).unwrap();
         assert_eq!(first["工具"].locked, second["工具"].locked);
+
+        write(&dependency.join(".DS_Store"), "本机元数据");
+        write(&dependency.join(".yanxu/bin/yanxu"), "本机工具");
+        let with_workspace_artifacts = ensure_lock(&manifest, true).unwrap();
+        assert_eq!(
+            first["工具"].locked,
+            with_workspace_artifacts["工具"].locked
+        );
 
         write(&dependency.join("主.yx"), "公 定 答：数 为 43；\n");
         let changed = ensure_lock(&manifest, true).unwrap_err();

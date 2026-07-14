@@ -1,6 +1,6 @@
 [package]
 name = "yanxu"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 description = "言序：以 Rust 编写的文言风格解释型编程语言"
 license = "MIT"
@@ -46,11 +46,14 @@ name = "yanxu"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
+regex = "1"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10"
 toml = "0.8"
+url = "2"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 rustyline = "18.0.1"

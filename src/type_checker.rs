@@ -1589,6 +1589,112 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 );
             }
         }
+        "Base64" => {
+            for function in ["编码", "解码", "网址编码", "解网址编码"] {
+                insert_std_function(
+                    &mut shape,
+                    function,
+                    vec![TypeSet::named("文")],
+                    TypeSet::named("文"),
+                );
+            }
+        }
+        "正则" => {
+            insert_std_function(
+                &mut shape,
+                "匹配",
+                vec![TypeSet::named("文"), TypeSet::named("文")],
+                TypeSet::named("理"),
+            );
+            insert_std_function(
+                &mut shape,
+                "首项",
+                vec![TypeSet::named("文"), TypeSet::named("文")],
+                TypeSet::union(vec![TypeSet::named("文"), TypeSet::named("空")]),
+            );
+            insert_std_function(
+                &mut shape,
+                "替换全部",
+                vec![
+                    TypeSet::named("文"),
+                    TypeSet::named("文"),
+                    TypeSet::named("文"),
+                ],
+                TypeSet::named("文"),
+            );
+            insert_std_function(
+                &mut shape,
+                "分割",
+                vec![TypeSet::named("文"), TypeSet::named("文")],
+                TypeSet::single(StaticType::List(Box::new(TypeSet::named("文")))),
+            );
+        }
+        "URL" => {
+            insert_std_function(
+                &mut shape,
+                "是否合法",
+                vec![TypeSet::named("文")],
+                TypeSet::named("理"),
+            );
+            for function in ["协议", "路径"] {
+                insert_std_function(
+                    &mut shape,
+                    function,
+                    vec![TypeSet::named("文")],
+                    TypeSet::named("文"),
+                );
+            }
+            insert_std_function(
+                &mut shape,
+                "主机",
+                vec![TypeSet::named("文")],
+                TypeSet::union(vec![TypeSet::named("文"), TypeSet::named("空")]),
+            );
+            insert_std_function(
+                &mut shape,
+                "端口",
+                vec![TypeSet::named("文")],
+                TypeSet::union(vec![TypeSet::named("数"), TypeSet::named("空")]),
+            );
+            insert_std_function(
+                &mut shape,
+                "查询值",
+                vec![TypeSet::named("文"), TypeSet::named("文")],
+                TypeSet::union(vec![TypeSet::named("文"), TypeSet::named("空")]),
+            );
+            insert_std_function(
+                &mut shape,
+                "合并",
+                vec![TypeSet::named("文"), TypeSet::named("文")],
+                TypeSet::named("文"),
+            );
+        }
+        "日期" => {
+            insert_std_function(
+                &mut shape,
+                "是否合法",
+                vec![TypeSet::named("文")],
+                TypeSet::named("理"),
+            );
+            insert_std_function(
+                &mut shape,
+                "是否闰年",
+                vec![TypeSet::named("数")],
+                TypeSet::named("理"),
+            );
+            insert_std_function(
+                &mut shape,
+                "加天",
+                vec![TypeSet::named("文"), TypeSet::named("数")],
+                TypeSet::named("文"),
+            );
+            insert_std_function(
+                &mut shape,
+                "相差天数",
+                vec![TypeSet::named("文"), TypeSet::named("文")],
+                TypeSet::named("数"),
+            );
+        }
         _ => return None,
     }
     Some(shape)
@@ -1846,6 +1952,10 @@ mod tests {
             引「标准:标识」为 标识；
             引「标准:模板」为 模板；
             引「标准:校验」为 校验；
+            引「标准:Base64」为 Base64；
+            引「标准:正则」为 正则；
+            引「标准:URL」为 URL；
+            引「标准:日期」为 日期；
             定 文件：文? 为 路径.文件名（「甲/乙.yx」）；
             定 摘要：文 为 哈希.SHA256（「言序」）；
             定 平均：数 为 统计.平均（【1，2，3】）；
@@ -1855,6 +1965,11 @@ mod tests {
             定 标号：文 为 标识.稳定UUID（「言序」）；
             定 页面：文 为 模板.插值（「{{name}}」，「name」，「言序」）；
             定 地址可用：理 为 校验.电子邮件（「hello@yanxu.dev」）；
+            定 编码值：文 为 Base64.编码（「言序」）；
+            定 匹配项：文? 为 正则.首项（「[0-9]+」，「甲12乙」）；
+            定 地址主机：文? 为 URL.主机（「https://yanxu.dev/」）；
+            定 地址端口：数? 为 URL.端口（「https://yanxu.dev:8443/」）；
+            定 明日：文 为 日期.加天（「2024-01-01」，1）；
         "#;
         check(&crate::parse(source).unwrap()).unwrap();
 

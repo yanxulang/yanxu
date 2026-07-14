@@ -8,9 +8,46 @@
     "schema_version": { "const": 1 },
     "modules": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["name", "permissions", "platforms", "deterministic", "members"]
+        "required": ["name", "permissions", "platforms", "deterministic", "members"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "permissions": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "platforms": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "deterministic": { "type": "boolean" },
+          "members": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["name", "signature"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "signature": { "type": "string", "minLength": 1 },
+                "kind": { "type": "string", "enum": ["constant"] },
+                "deterministic": { "type": "boolean" },
+                "errors": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "items": { "type": "string", "minLength": 1 }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
       }
     }
   },

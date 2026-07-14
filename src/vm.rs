@@ -428,6 +428,25 @@ enum StandardNative {
     IsIpv4,
     IsHexColor,
     IsIdentifier,
+    Base64Encode,
+    Base64Decode,
+    Base64UrlEncode,
+    Base64UrlDecode,
+    RegexIsMatch,
+    RegexFirst,
+    RegexReplaceAll,
+    RegexSplit,
+    UrlIsValid,
+    UrlScheme,
+    UrlHost,
+    UrlPort,
+    UrlPath,
+    UrlQueryValue,
+    UrlJoin,
+    DateIsValid,
+    DateIsLeapYear,
+    DateAddDays,
+    DateDaysBetween,
 }
 
 pub struct VmNative {
@@ -2282,6 +2301,106 @@ impl Vm {
                 "校验.标识符",
                 span,
             )?))),
+            Std::Base64Encode => Ok(VmValue::String(crate::stdlib::base64_encode(vm_string(
+                &arguments[0],
+                "Base64.编码",
+                span,
+            )?))),
+            Std::Base64Decode => {
+                crate::stdlib::base64_decode(vm_string(&arguments[0], "Base64.解码", span)?)
+                    .map(VmValue::String)
+                    .map_err(|message| error(span, message))
+            }
+            Std::Base64UrlEncode => Ok(VmValue::String(crate::stdlib::base64_url_encode(
+                vm_string(&arguments[0], "Base64.网址编码", span)?,
+            ))),
+            Std::Base64UrlDecode => crate::stdlib::base64_url_decode(vm_string(
+                &arguments[0],
+                "Base64.解网址编码",
+                span,
+            )?)
+            .map(VmValue::String)
+            .map_err(|message| error(span, message)),
+            Std::RegexIsMatch => crate::stdlib::regex_is_match(
+                vm_string(&arguments[0], "正则.匹配", span)?,
+                vm_string(&arguments[1], "正则.匹配", span)?,
+            )
+            .map(VmValue::Bool)
+            .map_err(|message| error(span, message)),
+            Std::RegexFirst => crate::stdlib::regex_first(
+                vm_string(&arguments[0], "正则.首项", span)?,
+                vm_string(&arguments[1], "正则.首项", span)?,
+            )
+            .map(vm_optional_string)
+            .map_err(|message| error(span, message)),
+            Std::RegexReplaceAll => crate::stdlib::regex_replace_all(
+                vm_string(&arguments[0], "正则.替换全部", span)?,
+                vm_string(&arguments[1], "正则.替换全部", span)?,
+                vm_string(&arguments[2], "正则.替换全部", span)?,
+            )
+            .map(VmValue::String)
+            .map_err(|message| error(span, message)),
+            Std::RegexSplit => crate::stdlib::regex_split(
+                vm_string(&arguments[0], "正则.分割", span)?,
+                vm_string(&arguments[1], "正则.分割", span)?,
+            )
+            .map(|parts| {
+                VmValue::List(Rc::new(RefCell::new(
+                    parts.into_iter().map(VmValue::String).collect(),
+                )))
+            })
+            .map_err(|message| error(span, message)),
+            Std::UrlIsValid => Ok(VmValue::Bool(crate::stdlib::url_is_valid(vm_string(
+                &arguments[0],
+                "URL.是否合法",
+                span,
+            )?))),
+            Std::UrlScheme => {
+                crate::stdlib::url_scheme(vm_string(&arguments[0], "URL.协议", span)?)
+                    .map(VmValue::String)
+                    .map_err(|message| error(span, message))
+            }
+            Std::UrlHost => crate::stdlib::url_host(vm_string(&arguments[0], "URL.主机", span)?)
+                .map(vm_optional_string)
+                .map_err(|message| error(span, message)),
+            Std::UrlPort => crate::stdlib::url_port(vm_string(&arguments[0], "URL.端口", span)?)
+                .map(|port| port.map_or(VmValue::Nil, VmValue::Number))
+                .map_err(|message| error(span, message)),
+            Std::UrlPath => crate::stdlib::url_path(vm_string(&arguments[0], "URL.路径", span)?)
+                .map(VmValue::String)
+                .map_err(|message| error(span, message)),
+            Std::UrlQueryValue => crate::stdlib::url_query_value(
+                vm_string(&arguments[0], "URL.查询值", span)?,
+                vm_string(&arguments[1], "URL.查询值", span)?,
+            )
+            .map(vm_optional_string)
+            .map_err(|message| error(span, message)),
+            Std::UrlJoin => crate::stdlib::url_join(
+                vm_string(&arguments[0], "URL.合并", span)?,
+                vm_string(&arguments[1], "URL.合并", span)?,
+            )
+            .map(VmValue::String)
+            .map_err(|message| error(span, message)),
+            Std::DateIsValid => Ok(VmValue::Bool(crate::stdlib::date_is_valid(vm_string(
+                &arguments[0],
+                "日期.是否合法",
+                span,
+            )?))),
+            Std::DateIsLeapYear => crate::stdlib::date_is_leap_year(number(&arguments[0], span)?)
+                .map(VmValue::Bool)
+                .map_err(|message| error(span, message)),
+            Std::DateAddDays => crate::stdlib::date_add_days(
+                vm_string(&arguments[0], "日期.加天", span)?,
+                number(&arguments[1], span)?,
+            )
+            .map(VmValue::String)
+            .map_err(|message| error(span, message)),
+            Std::DateDaysBetween => crate::stdlib::date_days_between(
+                vm_string(&arguments[0], "日期.相差天数", span)?,
+                vm_string(&arguments[1], "日期.相差天数", span)?,
+            )
+            .map(VmValue::Number)
+            .map_err(|message| error(span, message)),
         }
     }
 
@@ -2592,6 +2711,77 @@ impl Vm {
                     "标识符",
                     1,
                     NativeKind::Standard(StandardNative::IsIdentifier),
+                ),
+            ],
+            "Base64" => &[
+                (
+                    "编码",
+                    1,
+                    NativeKind::Standard(StandardNative::Base64Encode),
+                ),
+                (
+                    "解码",
+                    1,
+                    NativeKind::Standard(StandardNative::Base64Decode),
+                ),
+                (
+                    "网址编码",
+                    1,
+                    NativeKind::Standard(StandardNative::Base64UrlEncode),
+                ),
+                (
+                    "解网址编码",
+                    1,
+                    NativeKind::Standard(StandardNative::Base64UrlDecode),
+                ),
+            ],
+            "正则" => &[
+                (
+                    "匹配",
+                    2,
+                    NativeKind::Standard(StandardNative::RegexIsMatch),
+                ),
+                ("首项", 2, NativeKind::Standard(StandardNative::RegexFirst)),
+                (
+                    "替换全部",
+                    3,
+                    NativeKind::Standard(StandardNative::RegexReplaceAll),
+                ),
+                ("分割", 2, NativeKind::Standard(StandardNative::RegexSplit)),
+            ],
+            "URL" => &[
+                (
+                    "是否合法",
+                    1,
+                    NativeKind::Standard(StandardNative::UrlIsValid),
+                ),
+                ("协议", 1, NativeKind::Standard(StandardNative::UrlScheme)),
+                ("主机", 1, NativeKind::Standard(StandardNative::UrlHost)),
+                ("端口", 1, NativeKind::Standard(StandardNative::UrlPort)),
+                ("路径", 1, NativeKind::Standard(StandardNative::UrlPath)),
+                (
+                    "查询值",
+                    2,
+                    NativeKind::Standard(StandardNative::UrlQueryValue),
+                ),
+                ("合并", 2, NativeKind::Standard(StandardNative::UrlJoin)),
+            ],
+            "日期" => &[
+                (
+                    "是否合法",
+                    1,
+                    NativeKind::Standard(StandardNative::DateIsValid),
+                ),
+                (
+                    "是否闰年",
+                    1,
+                    NativeKind::Standard(StandardNative::DateIsLeapYear),
+                ),
+                ("加天", 2, NativeKind::Standard(StandardNative::DateAddDays)),
+                (
+                    "相差天数",
+                    2,
+                    NativeKind::Standard(StandardNative::DateDaysBetween),
                 ),
             ],
             _ => return Err(error(span, format!("VM 未有标准模块“{name}”"))),

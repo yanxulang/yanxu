@@ -140,6 +140,45 @@
         {"name":"十六进制色","signature":"法（文）：理"},
         {"name":"标识符","signature":"法（文）：理"}
       ]
+    },
+    {
+      "name": "Base64", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"编码","signature":"法（文）：文"},
+        {"name":"解码","signature":"法（文）：文","errors":["非法 Base64","非 UTF-8"]},
+        {"name":"网址编码","signature":"法（文）：文"},
+        {"name":"解网址编码","signature":"法（文）：文","errors":["非法 URL 安全 Base64","非 UTF-8"]}
+      ]
+    },
+    {
+      "name": "正则", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"匹配","signature":"法（模式：文，文字：文）：理","errors":["非法模式"]},
+        {"name":"首项","signature":"法（模式：文，文字：文）：文?","errors":["非法模式"]},
+        {"name":"替换全部","signature":"法（模式：文，文字：文，替换：文）：文","errors":["非法模式"]},
+        {"name":"分割","signature":"法（模式：文，文字：文）：列<文>","errors":["非法模式"]}
+      ]
+    },
+    {
+      "name": "URL", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"是否合法","signature":"法（文）：理"},
+        {"name":"协议","signature":"法（文）：文","errors":["非法 URL"]},
+        {"name":"主机","signature":"法（文）：文?","errors":["非法 URL"]},
+        {"name":"端口","signature":"法（文）：数?","errors":["非法 URL"]},
+        {"name":"路径","signature":"法（文）：文","errors":["非法 URL"]},
+        {"name":"查询值","signature":"法（文，名：文）：文?","errors":["非法 URL"]},
+        {"name":"合并","signature":"法（基址：文，相对址：文）：文","errors":["非法 URL"]}
+      ]
+    },
+    {
+      "name": "日期", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"是否合法","signature":"法（文）：理"},
+        {"name":"是否闰年","signature":"法（年：数）：理","errors":["年份非安全整数或超出 1..9999"]},
+        {"name":"加天","signature":"法（日期：文，天数：数）：文","errors":["非法日期","天数非安全整数","结果越界"]},
+        {"name":"相差天数","signature":"法（开始：文，结束：文）：数","errors":["非法日期"]}
+      ]
     }
   ]
 }

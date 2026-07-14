@@ -45,6 +45,24 @@ fn official_examples_type_check_and_match_both_runtimes() {
     }
 }
 
+#[test]
+fn standard_library_manifest_matches_types_and_both_runtimes() {
+    let manifest = yanxu::stdlib::api_manifest().unwrap();
+    for module in manifest["modules"].as_array().unwrap() {
+        let name = module["name"].as_str().unwrap();
+        let mut source = format!("引「标准:{name}」为 模块；\n");
+        for member in module["members"].as_array().unwrap() {
+            source.push_str(&format!("模块.{}；\n", member["name"].as_str().unwrap()));
+        }
+        let source_name = format!("<标准库清单:{name}>");
+        let statements = yanxu::parse_named(&source, source_name.clone()).unwrap();
+        yanxu::type_checker::check(&statements)
+            .unwrap_or_else(|errors| panic!("{source_name} 静态摘要不完整：{errors:#?}"));
+        let (tree, vm) = execute_both(&source, Path::new("."));
+        assert_eq!(tree, vm, "{source_name} 的公开成员不一致");
+    }
+}
+
 fn source_path(path: &Path) -> String {
     path.display()
         .to_string()
@@ -226,6 +244,94 @@ fn expanded_pure_standard_modules_match_both_runtimes() {
             "真"
         ]
     );
+}
+
+#[test]
+fn one_one_standard_modules_match_both_runtimes() {
+    let source = r#"
+        引「标准:Base64」为 Base64；
+        引「标准:正则」为 正则；
+        引「标准:URL」为 URL；
+        引「标准:日期」为 日期；
+        定 编码值：文 为 Base64.编码（「言序」）；
+        言 Base64.解码（编码值）；
+        言 Base64.解网址编码（Base64.网址编码（「言序/语言」））；
+        言 正则.匹配（「^言.+$」，「言序」）；
+        言 正则.首项（「[0-9]+」，「甲12乙」）；
+        言 正则.替换全部（「[0-9]+」，「甲12乙34」，「数」）；
+        言 正则.分割（「[,，]」，「甲,乙，丙」）；
+        定 地址：文 为「https://yanxu.dev:8443/docs/start?lang=zh」；
+        言 URL.协议（地址）；言 URL.主机（地址）；言 URL.端口（地址）；
+        言 URL.路径（地址）；言 URL.查询值（地址，「lang」）；
+        言 URL.合并（「https://yanxu.dev/docs/」，「../download」）；
+        言 日期.是否合法（「2024-02-29」）；
+        言 日期.是否闰年（2000）；
+        言 日期.加天（「2024-02-28」，2）；
+        言 日期.相差天数（「2024-02-28」，「2024-03-01」）；
+    "#;
+    let (tree, vm) = execute_both(source, Path::new("."));
+    assert_eq!(tree, vm);
+    assert_eq!(
+        tree,
+        [
+            "言序",
+            "言序/语言",
+            "真",
+            "12",
+            "甲数乙数",
+            "【甲，乙，丙】",
+            "https",
+            "yanxu.dev",
+            "8443",
+            "/docs/start",
+            "zh",
+            "https://yanxu.dev/download",
+            "真",
+            "真",
+            "2024-03-01",
+            "2",
+        ]
+    );
+}
+
+#[test]
+fn one_one_standard_module_errors_match_both_runtimes() {
+    let cases = [
+        (
+            "Base64",
+            "引「标准:Base64」为 Base64；言 Base64.解码（「***」）；",
+            "Base64文字含非法",
+        ),
+        (
+            "正则",
+            "引「标准:正则」为 正则；言 正则.匹配（「[」，「言序」）；",
+            "正则模式不合法",
+        ),
+        (
+            "URL",
+            "引「标准:URL」为 URL；言 URL.协议（「不是URL」）；",
+            "URL 不合法",
+        ),
+        (
+            "日期",
+            "引「标准:日期」为 日期；言 日期.加天（「2023-02-29」，1）；",
+            "有效公历范围",
+        ),
+    ];
+
+    for (name, source, expected) in cases {
+        let source_name = format!("<1.1-{name}-错误>");
+        let statements = yanxu::parse_named(source, source_name.clone()).unwrap();
+        let mut interpreter = Interpreter::silent();
+        let tree_error = interpreter.execute(&statements).unwrap_err().to_string();
+        let chunk = bytecode::compile(&statements).unwrap();
+        let mut vm = Vm::silent();
+        let vm_error = vm.execute(&chunk).unwrap_err().to_string();
+        for runtime_error in [&tree_error, &vm_error] {
+            assert!(runtime_error.contains(expected), "{runtime_error}");
+            assert!(runtime_error.contains(&source_name), "{runtime_error}");
+        }
+    }
 }
 
 #[test]

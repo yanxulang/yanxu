@@ -2479,6 +2479,81 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
                 native_is_identifier,
             );
         }
+        "Base64" => {
+            define_export_native(&environment, &mut exports, "编码", 1, native_base64_encode);
+            define_export_native(&environment, &mut exports, "解码", 1, native_base64_decode);
+            define_export_native(
+                &environment,
+                &mut exports,
+                "网址编码",
+                1,
+                native_base64_url_encode,
+            );
+            define_export_native(
+                &environment,
+                &mut exports,
+                "解网址编码",
+                1,
+                native_base64_url_decode,
+            );
+        }
+        "正则" => {
+            define_export_native(&environment, &mut exports, "匹配", 2, native_regex_is_match);
+            define_export_native(&environment, &mut exports, "首项", 2, native_regex_first);
+            define_export_native(
+                &environment,
+                &mut exports,
+                "替换全部",
+                3,
+                native_regex_replace_all,
+            );
+            define_export_native(&environment, &mut exports, "分割", 2, native_regex_split);
+        }
+        "URL" => {
+            define_export_native(
+                &environment,
+                &mut exports,
+                "是否合法",
+                1,
+                native_url_is_valid,
+            );
+            define_export_native(&environment, &mut exports, "协议", 1, native_url_scheme);
+            define_export_native(&environment, &mut exports, "主机", 1, native_url_host);
+            define_export_native(&environment, &mut exports, "端口", 1, native_url_port);
+            define_export_native(&environment, &mut exports, "路径", 1, native_url_path);
+            define_export_native(
+                &environment,
+                &mut exports,
+                "查询值",
+                2,
+                native_url_query_value,
+            );
+            define_export_native(&environment, &mut exports, "合并", 2, native_url_join);
+        }
+        "日期" => {
+            define_export_native(
+                &environment,
+                &mut exports,
+                "是否合法",
+                1,
+                native_date_is_valid,
+            );
+            define_export_native(
+                &environment,
+                &mut exports,
+                "是否闰年",
+                1,
+                native_date_is_leap_year,
+            );
+            define_export_native(&environment, &mut exports, "加天", 2, native_date_add_days);
+            define_export_native(
+                &environment,
+                &mut exports,
+                "相差天数",
+                2,
+                native_date_days_between,
+            );
+        }
         _ => return Err(RuntimeError::new(format!("未有标准模块“{name}”"))),
     }
     Ok(Rc::new(YanxuModule {
@@ -2861,6 +2936,153 @@ fn native_is_identifier(arguments: &[Value]) -> Result<Value, RuntimeError> {
         0,
         "校验.标识符",
     )?)))
+}
+
+fn native_base64_encode(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::String(crate::stdlib::base64_encode(
+        string_argument(arguments, 0, "Base64.编码")?,
+    )))
+}
+
+fn native_base64_decode(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::base64_decode(string_argument(arguments, 0, "Base64.解码")?)
+        .map(Value::String)
+        .map_err(RuntimeError::new)
+}
+
+fn native_base64_url_encode(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::String(crate::stdlib::base64_url_encode(
+        string_argument(arguments, 0, "Base64.网址编码")?,
+    )))
+}
+
+fn native_base64_url_decode(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::base64_url_decode(string_argument(arguments, 0, "Base64.解网址编码")?)
+        .map(Value::String)
+        .map_err(RuntimeError::new)
+}
+
+fn native_regex_is_match(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::regex_is_match(
+        string_argument(arguments, 0, "正则.匹配")?,
+        string_argument(arguments, 1, "正则.匹配")?,
+    )
+    .map(Value::Bool)
+    .map_err(RuntimeError::new)
+}
+
+fn native_regex_first(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::regex_first(
+        string_argument(arguments, 0, "正则.首项")?,
+        string_argument(arguments, 1, "正则.首项")?,
+    )
+    .map(optional_string)
+    .map_err(RuntimeError::new)
+}
+
+fn native_regex_replace_all(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::regex_replace_all(
+        string_argument(arguments, 0, "正则.替换全部")?,
+        string_argument(arguments, 1, "正则.替换全部")?,
+        string_argument(arguments, 2, "正则.替换全部")?,
+    )
+    .map(Value::String)
+    .map_err(RuntimeError::new)
+}
+
+fn native_regex_split(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::regex_split(
+        string_argument(arguments, 0, "正则.分割")?,
+        string_argument(arguments, 1, "正则.分割")?,
+    )
+    .map(|parts| {
+        Value::List(Rc::new(RefCell::new(
+            parts.into_iter().map(Value::String).collect(),
+        )))
+    })
+    .map_err(RuntimeError::new)
+}
+
+fn native_url_is_valid(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::Bool(crate::stdlib::url_is_valid(string_argument(
+        arguments,
+        0,
+        "URL.是否合法",
+    )?)))
+}
+
+fn native_url_scheme(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::url_scheme(string_argument(arguments, 0, "URL.协议")?)
+        .map(Value::String)
+        .map_err(RuntimeError::new)
+}
+
+fn native_url_host(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::url_host(string_argument(arguments, 0, "URL.主机")?)
+        .map(optional_string)
+        .map_err(RuntimeError::new)
+}
+
+fn native_url_port(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::url_port(string_argument(arguments, 0, "URL.端口")?)
+        .map(|port| port.map_or(Value::Nil, Value::Number))
+        .map_err(RuntimeError::new)
+}
+
+fn native_url_path(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::url_path(string_argument(arguments, 0, "URL.路径")?)
+        .map(Value::String)
+        .map_err(RuntimeError::new)
+}
+
+fn native_url_query_value(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::url_query_value(
+        string_argument(arguments, 0, "URL.查询值")?,
+        string_argument(arguments, 1, "URL.查询值")?,
+    )
+    .map(optional_string)
+    .map_err(RuntimeError::new)
+}
+
+fn native_url_join(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::url_join(
+        string_argument(arguments, 0, "URL.合并")?,
+        string_argument(arguments, 1, "URL.合并")?,
+    )
+    .map(Value::String)
+    .map_err(RuntimeError::new)
+}
+
+fn native_date_is_valid(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::Bool(crate::stdlib::date_is_valid(string_argument(
+        arguments,
+        0,
+        "日期.是否合法",
+    )?)))
+}
+
+fn native_date_is_leap_year(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::date_is_leap_year(number_argument(arguments, 0, "日期.是否闰年")?)
+        .map(Value::Bool)
+        .map_err(RuntimeError::new)
+}
+
+fn native_date_add_days(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::date_add_days(
+        string_argument(arguments, 0, "日期.加天")?,
+        number_argument(arguments, 1, "日期.加天")?,
+    )
+    .map(Value::String)
+    .map_err(RuntimeError::new)
+}
+
+fn native_date_days_between(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    crate::stdlib::date_days_between(
+        string_argument(arguments, 0, "日期.相差天数")?,
+        string_argument(arguments, 1, "日期.相差天数")?,
+    )
+    .map(Value::Number)
+    .map_err(RuntimeError::new)
 }
 
 fn optional_string(value: Option<String>) -> Value {
@@ -3816,6 +4038,55 @@ mod tests {
 
         let error = run_with(&mut interpreter, "言 随机.整数（1，2，2）；").unwrap_err();
         assert!(error.to_string().contains("下界小于上界"));
+    }
+
+    #[test]
+    fn one_one_standard_modules_work_together() {
+        let source = r#"
+            引「标准:Base64」为 Base64；
+            引「标准:正则」为 正则；
+            引「标准:URL」为 URL；
+            引「标准:日期」为 日期；
+            定 编码值：文 为 Base64.编码（「言序」）；
+            言 编码值；言 Base64.解码（编码值）；
+            言 Base64.解网址编码（Base64.网址编码（「言序/语言」））；
+            言 正则.匹配（「^言.+$」，「言序」）；
+            言 正则.首项（「[0-9]+」，「甲12乙」）；
+            言 正则.替换全部（「[0-9]+」，「甲12乙34」，「数」）；
+            言 正则.分割（「[,，]」，「甲,乙，丙」）；
+            定 地址：文 为「https://yanxu.dev:8443/docs/start?lang=zh」；
+            言 URL.协议（地址）；言 URL.主机（地址）；言 URL.端口（地址）；
+            言 URL.路径（地址）；言 URL.查询值（地址，「lang」）；
+            言 URL.合并（「https://yanxu.dev/docs/」，「../download」）；
+            言 日期.是否合法（「2024-02-29」）；
+            言 日期.是否闰年（2000）；
+            言 日期.加天（「2024-02-28」，2）；
+            言 日期.相差天数（「2024-02-28」，「2024-03-01」）；
+        "#;
+        let mut interpreter = Interpreter::silent();
+        run_with(&mut interpreter, source).unwrap();
+        assert_eq!(
+            interpreter.output(),
+            &[
+                "6KiA5bqP",
+                "言序",
+                "言序/语言",
+                "真",
+                "12",
+                "甲数乙数",
+                "【甲，乙，丙】",
+                "https",
+                "yanxu.dev",
+                "8443",
+                "/docs/start",
+                "zh",
+                "https://yanxu.dev/download",
+                "真",
+                "真",
+                "2024-03-01",
+                "2",
+            ]
+        );
     }
 
     #[test]
