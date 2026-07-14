@@ -44,8 +44,12 @@ struct TypeSet {
 
 impl TypeSet {
     fn named(name: impl Into<String>) -> Self {
+        let name = name.into();
+        if name == "任意" {
+            return Self::any();
+        }
         Self {
-            variants: vec![StaticType::Named(name.into())],
+            variants: vec![StaticType::Named(name)],
         }
     }
 
@@ -2363,6 +2367,18 @@ mod tests {
         let bad = crate::parse("定 值：数 为「非数」；").unwrap();
         let errors = check(&bad).unwrap_err();
         assert!(errors[0].to_string().contains("应为 数"));
+    }
+
+    #[test]
+    fn any_annotation_accepts_and_propagates_dynamic_values() {
+        let source = r#"
+            定 初值：任意 为 空；
+            令 值：任意 为 1；
+            置 值 为「文」；
+            法 原样（参数：任意）：任意 则 归 参数；终
+            定 结果：任意 为 原样（【1，2】）；
+        "#;
+        check(&crate::parse(source).unwrap()).unwrap();
     }
 
     #[test]

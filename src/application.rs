@@ -3,21 +3,27 @@
 use crate::bytecode::{self, Chunk, Instruction};
 use crate::package::{self, Manifest, ResolutionGraph};
 use crate::permissions::PermissionSet;
+use crate::source::{SourceFile, Span};
 use base64::Engine as _;
+use flate2::Compression;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 pub const YXB_FORMAT_VERSION: u32 = 1;
 const YXB_MAGIC: &[u8] = b"YANXU-YXB-1\n";
+const YXB_COMPRESSED_MAGIC: &[u8] = b"YANXU-YXB-1Z\n";
 const STANDALONE_MAGIC: &[u8; 16] = b"YANXU-APP-v1\0\0\0\0";
 const RESOURCE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const RESOURCE_MAX_ENTRIES: usize = 4_096;
+const YXB_MAX_DECODED_BYTES: u64 = RESOURCE_MAX_BYTES * 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationArchive {
@@ -271,6 +277,7 @@ impl ApplicationCompiler {
         let mut chunk =
             bytecode::compile(&statements).map_err(|error| application_error(error.to_string()))?;
         self.rewrite_chunk_imports(&mut chunk, path)?;
+        compact_debug_sources(&mut chunk);
         self.visiting.remove(id);
         self.modules.insert(
             id.to_owned(),
@@ -379,6 +386,48 @@ impl ApplicationCompiler {
     }
 }
 
+fn compact_debug_sources(chunk: &mut Chunk) {
+    let mut sources = BTreeMap::new();
+    compact_chunk_debug_sources(chunk, &mut sources);
+}
+
+fn compact_chunk_debug_sources(
+    chunk: &mut Chunk,
+    sources: &mut BTreeMap<(String, usize, String), Rc<SourceFile>>,
+) {
+    for span in &mut chunk.spans {
+        compact_span_source(span, sources);
+    }
+    for function in &mut chunk.functions {
+        compact_span_source(&mut function.span, sources);
+        compact_chunk_debug_sources(&mut function.chunk, sources);
+    }
+    for class in &mut chunk.classes {
+        for method in &mut class.methods {
+            compact_span_source(&mut method.span, sources);
+            compact_chunk_debug_sources(&mut method.chunk, sources);
+        }
+    }
+}
+
+fn compact_span_source(
+    span: &mut Span,
+    sources: &mut BTreeMap<(String, usize, String), Rc<SourceFile>>,
+) {
+    let name = span.source.name.clone();
+    let line = span.line;
+    let source_line = span.source.line(line).unwrap_or("").to_owned();
+    let key = (name.clone(), line, source_line.clone());
+    span.source = sources
+        .entry(key)
+        .or_insert_with(|| {
+            let mut text = "\n".repeat(line.saturating_sub(1));
+            text.push_str(&source_line);
+            SourceFile::new(name, text)
+        })
+        .clone();
+}
+
 fn collect_resources(
     manifest: &Manifest,
 ) -> Result<BTreeMap<String, ApplicationResource>, ApplicationError> {
@@ -463,19 +512,40 @@ fn collect_resource_files(
 
 pub fn serialize(archive: &ApplicationArchive) -> Result<Vec<u8>, ApplicationError> {
     validate_archive(archive)?;
-    let mut bytes = YXB_MAGIC.to_vec();
+    let mut bytes = YXB_COMPRESSED_MAGIC.to_vec();
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    serde_json::to_writer(&mut encoder, archive)
+        .map_err(|error| application_error(format!("不能序列化：{error}")))?;
     bytes.extend(
-        serde_json::to_vec(archive)
-            .map_err(|error| application_error(format!("不能序列化：{error}")))?,
+        encoder
+            .finish()
+            .map_err(|error| application_error(format!("不能压缩归档：{error}")))?,
     );
     Ok(bytes)
 }
 
 pub fn deserialize(bytes: &[u8]) -> Result<ApplicationArchive, ApplicationError> {
-    let payload = bytes
-        .strip_prefix(YXB_MAGIC)
-        .ok_or_else(|| application_error("缺少 YXB 文件头"))?;
-    let archive: ApplicationArchive = serde_json::from_slice(payload)
+    let payload = if let Some(compressed) = bytes.strip_prefix(YXB_COMPRESSED_MAGIC) {
+        let mut decoder = ZlibDecoder::new(compressed);
+        let mut payload = Vec::new();
+        decoder
+            .by_ref()
+            .take(YXB_MAX_DECODED_BYTES + 1)
+            .read_to_end(&mut payload)
+            .map_err(|error| application_error(format!("归档压缩载荷无效：{error}")))?;
+        if payload.len() as u64 > YXB_MAX_DECODED_BYTES {
+            return Err(application_error("YXB 解压后超过大小限制"));
+        }
+        payload
+    } else if let Some(payload) = bytes.strip_prefix(YXB_MAGIC) {
+        if payload.len() as u64 > YXB_MAX_DECODED_BYTES {
+            return Err(application_error("YXB JSON 超过大小限制"));
+        }
+        payload.to_vec()
+    } else {
+        return Err(application_error("缺少 YXB 文件头"));
+    };
+    let archive: ApplicationArchive = serde_json::from_slice(&payload)
         .map_err(|error| application_error(format!("归档 JSON 无效：{error}")))?;
     validate_archive(&archive)?;
     Ok(archive)
@@ -511,9 +581,23 @@ fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationError
 fn archive_checksum(archive: &ApplicationArchive) -> Result<String, ApplicationError> {
     let mut unsigned = archive.clone();
     unsigned.content_checksum.clear();
-    let bytes = serde_json::to_vec(&unsigned)
+    let mut writer = DigestWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, &unsigned)
         .map_err(|error| application_error(format!("不能计算归档校验：{error}")))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(format!("{:x}", writer.0.finalize()))
+}
+
+struct DigestWriter(Sha256);
+
+impl Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn write_archive(
@@ -725,10 +809,18 @@ mod tests {
         let second = compile_application(&root, "release").unwrap();
         let bytes = serialize(&first).unwrap();
         assert_eq!(bytes, serialize(&second).unwrap());
+        assert!(bytes.starts_with(YXB_COMPRESSED_MAGIC));
+        assert!(bytes.len() < serde_json::to_vec(&first).unwrap().len());
         assert_eq!(first.modules.len(), 2);
         assert_eq!(first.resources.len(), 1);
         let decoded = deserialize(&bytes).unwrap();
         assert_eq!(decoded.content_checksum, first.content_checksum);
+        let mut legacy = YXB_MAGIC.to_vec();
+        legacy.extend(serde_json::to_vec(&first).unwrap());
+        assert_eq!(
+            deserialize(&legacy).unwrap().content_checksum,
+            first.content_checksum
+        );
         fs::remove_dir_all(&root).unwrap();
         let mut vm = crate::vm::Vm::silent();
         vm.execute_application(&decoded).unwrap();
