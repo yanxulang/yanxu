@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yanxu.dev/schemas/test-report-v1.json",
+  "type": "object",
+  "required": ["schema", "schema_version", "summary", "tests"],
+  "properties": {
+    "schema": { "const": "https://yanxu.dev/schemas/test-report-v1.json" },
+    "schema_version": { "const": 1 },
+    "summary": { "type": "object" },
+    "tests": { "type": "array" }
+  },
+  "additionalProperties": false
+}

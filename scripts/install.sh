@@ -8,6 +8,10 @@ INSTALL_DIR="${YANXU_INSTALL_DIR:-$HOME/.local/bin}"
 say() { printf '%s\n' "$*"; }
 fail() { say "言序安装失败：$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || fail "需要命令 $1"; }
+download() {
+  curl --disable --fail --location --silent --show-error \
+    --proto '=https' --tlsv1.2 "$@"
+}
 
 need curl
 need tar
@@ -28,8 +32,9 @@ target="${arch}-${system}"
 asset="yanxu-${target}.tar.gz"
 checksum_asset="yanxu-${target}.sha256"
 if [ "$VERSION" = "latest" ]; then
-  release_json="$(curl --fail --location --silent --show-error \
+  release_json="$(download \
     --header "Accept: application/vnd.github+json" \
+    --header "X-GitHub-Api-Version: 2022-11-28" \
     "https://api.github.com/repos/${REPOSITORY}/releases?per_page=1")" || fail "无法查询最新发行版"
   tag="$(printf '%s' "$release_json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   [ -n "$tag" ] || fail "仓库尚未发布可安装版本"
@@ -42,13 +47,23 @@ else
 fi
 
 tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t yanxu)"
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+staged=""
+cleanup() {
+  rm -rf "$tmp_dir"
+  [ -z "$staged" ] || rm -f "$staged"
+}
+trap cleanup EXIT HUP INT TERM
 
 say "正在安装言序 ${version_label}（${target}）…"
-curl --fail --location --silent --show-error "$base_url/$asset" --output "$tmp_dir/$asset" || fail "未找到适用于 ${target} 的发行包"
+download "$base_url/$asset" --output "$tmp_dir/$asset" || fail "未找到适用于 ${target} 的发行包"
 
-if curl --fail --location --silent --show-error "$base_url/$checksum_asset" --output "$tmp_dir/$checksum_asset"; then
+if download "$base_url/$checksum_asset" --output "$tmp_dir/$checksum_asset"; then
   expected="$(awk '{print $1; exit}' "$tmp_dir/$checksum_asset")"
+  case "$expected" in
+    ''|*[!0-9A-Fa-f]*) fail "SHA-256 校验文件格式无效" ;;
+  esac
+  [ "${#expected}" -eq 64 ] || fail "SHA-256 校验文件格式无效"
+  expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
   if command -v sha256sum >/dev/null 2>&1; then
     actual="$(sha256sum "$tmp_dir/$asset" | awk '{print $1}')"
   elif command -v shasum >/dev/null 2>&1; then
@@ -65,11 +80,19 @@ mkdir -p "$INSTALL_DIR"
 tar -xzf "$tmp_dir/$asset" -C "$tmp_dir"
 binary="$(find "$tmp_dir" -type f -name yanxu -perm -u+x | head -n 1)"
 [ -n "$binary" ] || fail "发行包内没有 yanxu 可执行文件"
-install -m 755 "$binary" "$INSTALL_DIR/yanxu"
+staged="$(mktemp "$INSTALL_DIR/.yanxu.XXXXXX")" || fail "无法在安装目录创建临时文件"
+install -m 755 "$binary" "$staged"
+if ! installed_version="$("$staged" --version 2>&1)"; then
+  fail "下载的 yanxu 无法在当前系统运行：$installed_version"
+fi
+[ -n "$installed_version" ] || fail "下载的 yanxu 没有返回版本信息"
+mv -f "$staged" "$INSTALL_DIR/yanxu"
+staged=""
 
 say "言序已安装到 $INSTALL_DIR/yanxu"
+say "已验证：$installed_version"
 case ":$PATH:" in
-  *":$INSTALL_DIR:"*) say "运行 yanxu --version 验证安装。" ;;
+  *":$INSTALL_DIR:"*) say "现在可以运行 yanxu。" ;;
   *)
     say "请把以下一行加入你的 shell 配置，然后重开终端："
     say "  export PATH=\"$INSTALL_DIR:\$PATH\""

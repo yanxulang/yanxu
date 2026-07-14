@@ -1,0 +1,9 @@
+lock_version = 1
+manifest_checksum = "ec6b3068aba49e3b2e314015e7c89488ca786006d9bcb03505b3244166fd7e35"
+
+[[package]]
+name = "共享工具"
+version = "1.0.0"
+source = "path:../共享工具"
+checksum = "fee763443055364b1029c8446a11e46de72151eecae655adc3dc130dbba0f98e"
+entry = "主.yx"

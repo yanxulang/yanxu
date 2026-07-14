@@ -1,0 +1,145 @@
+{
+  "schema": "https://yanxu.dev/schemas/stdlib-api-v1.json",
+  "schema_version": 1,
+  "modules": [
+    {
+      "name": "文字",
+      "permissions": [],
+      "platforms": ["all"],
+      "deterministic": true,
+      "members": [
+        {"name":"修剪","signature":"法（文）：文"},{"name":"分割","signature":"法（文，文）：列<文>"},
+        {"name":"替换","signature":"法（文，文，文）：文"},{"name":"始于","signature":"法（文，文）：理"},
+        {"name":"终于","signature":"法（文，文）：理"},{"name":"大写","signature":"法（文）：文"},
+        {"name":"小写","signature":"法（文）：文"},{"name":"字符列","signature":"法（文）：列<文>"},
+        {"name":"联结","signature":"法（列<文>|元<文>，文）：文","errors":["非文字元素"]}
+      ]
+    },
+    {
+      "name": "数学",
+      "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"圆周率","signature":"数","kind":"constant"},{"name":"绝对值","signature":"法（数）：数"},
+        {"name":"平方根","signature":"法（数）：数","errors":["负数"]},{"name":"幂","signature":"法（数，数）：数"},
+        {"name":"下取整","signature":"法（数）：数"},{"name":"上取整","signature":"法（数）：数"},
+        {"name":"四舍五入","signature":"法（数）：数"},{"name":"正弦","signature":"法（数）：数"},
+        {"name":"余弦","signature":"法（数）：数"},{"name":"最小","signature":"法（数，数）：数"},
+        {"name":"最大","signature":"法（数，数）：数"}
+      ]
+    },
+    {
+      "name": "时间", "permissions": [], "platforms": ["all"], "deterministic": false,
+      "members": [
+        {"name":"今","signature":"法（）：数","deterministic":false},{"name":"毫秒","signature":"法（）：数","deterministic":false},
+        {"name":"等待","signature":"法（数）：空","deterministic":false,"errors":["秒数不在 0..60"]}
+      ]
+    },
+    {
+      "name": "文件", "permissions": ["file"], "platforms": ["all"], "deterministic": false,
+      "members": [
+        {"name":"读取","signature":"法（文）：文","errors":["权限","I/O","非 UTF-8"]},
+        {"name":"写入","signature":"法（文，文）：数","errors":["权限","I/O"]},
+        {"name":"追加","signature":"法（文，文）：数","errors":["权限","I/O"]},
+        {"name":"存在","signature":"法（文）：理","errors":["权限"]},
+        {"name":"目录","signature":"法（文）：列<文>","errors":["权限","I/O"]}
+      ]
+    },
+    {
+      "name": "JSON", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"解析","signature":"法（文）：任意","errors":["JSON 语法"]},
+        {"name":"序列化","signature":"法（任意）：文","errors":["不支持的值或典键"]}
+      ]
+    },
+    {
+      "name": "网络", "permissions": ["network"], "platforms": ["native"], "deterministic": false,
+      "members": [
+        {"name":"获取","signature":"法（文）：文","errors":["权限","仅 http","HTTP 状态","传输","非 UTF-8"]},
+        {"name":"发文","signature":"法（文，文）：文","errors":["权限","仅 http","HTTP 状态","传输","非 UTF-8"]}
+      ]
+    },
+    {
+      "name": "测试", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"断言","signature":"法（理，文）：空","errors":["断言失败"]},
+        {"name":"相等","signature":"法（任意，任意）：空","errors":["不相等"]},
+        {"name":"非空","signature":"法（任意，文）：空","errors":["值为空"]}
+      ]
+    },
+    {
+      "name": "路径", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"合并","signature":"法（文，文）：文"},{"name":"父级","signature":"法（文）：文?"},
+        {"name":"文件名","signature":"法（文）：文?"},{"name":"扩展名","signature":"法（文）：文?"},
+        {"name":"是否绝对","signature":"法（文）：理"},{"name":"规范化","signature":"法（文）：文"}
+      ]
+    },
+    {
+      "name": "环境", "permissions": ["environment:读取/存在"], "platforms": ["all"], "deterministic": false,
+      "members": [
+        {"name":"读取","signature":"法（文）：文?","errors":["权限","非 UTF-8"]},
+        {"name":"存在","signature":"法（文）：理","errors":["权限"]},
+        {"name":"当前目录","signature":"法（）：文"},{"name":"系统","signature":"法（）：文"},{"name":"架构","signature":"法（）：文"}
+      ]
+    },
+    {
+      "name": "哈希", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [{"name":"SHA256","signature":"法（文）：文"}]
+    },
+    {
+      "name": "编码", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"十六进制","signature":"法（文）：文"},{"name":"解十六进制","signature":"法（文）：文","errors":["非法十六进制","非 UTF-8"]},
+        {"name":"百分号","signature":"法（文）：文"},{"name":"解百分号","signature":"法（文）：文","errors":["非法百分号编码","非 UTF-8"]}
+      ]
+    },
+    {
+      "name": "统计", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"总和","signature":"法（列<数>）：数"},{"name":"平均","signature":"法（列<数>）：数","errors":["空数据"]},
+        {"name":"中位数","signature":"法（列<数>）：数","errors":["空数据"]},{"name":"方差","signature":"法（列<数>）：数","errors":["空数据"]},
+        {"name":"标准差","signature":"法（列<数>）：数","errors":["空数据"]}
+      ]
+    },
+    {
+      "name": "CSV", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"解析","signature":"法（文）：列<列<文>>","errors":["CSV 引号格式"]},
+        {"name":"序列化","signature":"法（列<列<文>>）：文","errors":["非文字单元格"]}
+      ]
+    },
+    {
+      "name": "随机", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"小数","signature":"法（种子：数）：数","errors":["种子非安全整数"]},
+        {"name":"整数","signature":"法（种子：数，下界：数，上界：数）：数","errors":["参数非安全整数","区间为空或过大"]},
+        {"name":"布尔","signature":"法（种子：数）：理","errors":["种子非安全整数"]}
+      ]
+    },
+    {
+      "name": "标识", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"稳定UUID","signature":"法（文）：文"},
+        {"name":"是否UUID","signature":"法（文）：理"},
+        {"name":"稳定短码","signature":"法（文，长度：数）：文","errors":["长度不在 4..64"]}
+      ]
+    },
+    {
+      "name": "模板", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"插值","signature":"法（模板：文，占位名：文，值：文）：文","errors":["占位名为空或含花括号"]},
+        {"name":"转义HTML","signature":"法（文）：文"},
+        {"name":"反转义HTML","signature":"法（文）：文"}
+      ]
+    },
+    {
+      "name": "校验", "permissions": [], "platforms": ["all"], "deterministic": true,
+      "members": [
+        {"name":"电子邮件","signature":"法（文）：理"},
+        {"name":"IPv4","signature":"法（文）：理"},
+        {"name":"十六进制色","signature":"法（文）：理"},
+        {"name":"标识符","signature":"法（文）：理"}
+      ]
+    }
+  ]
+}

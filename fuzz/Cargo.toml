@@ -1,0 +1,33 @@
+[package]
+name = "yanxu-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+yanxu = { path = ".." }
+
+[[bin]]
+name = "frontend"
+path = "fuzz_targets/frontend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "formatting"
+path = "fuzz_targets/formatting.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bytecode_archive"
+path = "fuzz_targets/bytecode_archive.rs"
+test = false
+doc = false
+bench = false

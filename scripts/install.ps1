@@ -3,6 +3,11 @@ $ErrorActionPreference = "Stop"
 $Repository = if ($env:YANXU_REPOSITORY) { $env:YANXU_REPOSITORY } else { "YanXuLang/yanxu" }
 $Version = if ($env:YANXU_VERSION) { $env:YANXU_VERSION } else { "latest" }
 $InstallDir = if ($env:YANXU_INSTALL_DIR) { $env:YANXU_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\Yanxu\bin" }
+try {
+    $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
+} catch {
+    throw "言序安装失败：安装目录无效：$($_.Exception.Message)"
+}
 
 $Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 switch ($Architecture) {
@@ -31,6 +36,7 @@ if ($Version -eq "latest") {
 
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("yanxu-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $TempDir | Out-Null
+$StagedPath = $null
 
 try {
     Write-Host "正在安装言序 $VersionLabel（$Target）…"
@@ -39,7 +45,9 @@ try {
     Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/$Asset" -OutFile $ArchivePath
     Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/$ChecksumAsset" -OutFile $ChecksumPath
 
-    $Expected = ((Get-Content $ChecksumPath -Raw).Trim() -split "\s+")[0].ToLowerInvariant()
+    $Expected = ((Get-Content $ChecksumPath -Raw).Trim() -split "\s+")[0]
+    if ($Expected -notmatch "^[0-9A-Fa-f]{64}$") { throw "SHA-256 校验文件格式无效" }
+    $Expected = $Expected.ToLowerInvariant()
     $Actual = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
     if ($Expected -ne $Actual) { throw "SHA-256 校验不一致" }
 
@@ -49,21 +57,31 @@ try {
     if (-not $Binary) { throw "发行包内没有 yanxu.exe" }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item -Force $Binary.FullName (Join-Path $InstallDir "yanxu.exe")
+    $InstalledPath = Join-Path $InstallDir "yanxu.exe"
+    $StagedPath = Join-Path $InstallDir (".yanxu-" + [guid]::NewGuid() + ".exe")
+    Copy-Item $Binary.FullName $StagedPath
+    $VersionOutput = @(& $StagedPath --version 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "下载的 yanxu.exe 无法在当前系统运行：$($VersionOutput -join [Environment]::NewLine)" }
+    $VersionText = ($VersionOutput -join " ").Trim()
+    if (-not $VersionText) { throw "下载的 yanxu.exe 没有返回版本信息" }
+    Move-Item -Force $StagedPath $InstalledPath
+    $StagedPath = $null
 
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $PathParts = @($UserPath -split ";" | Where-Object { $_ })
     if ($PathParts -notcontains $InstallDir) {
         $NewPath = (($PathParts + $InstallDir) -join ";")
         [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
-        $env:Path = "$env:Path;$InstallDir"
         Write-Host "已把 $InstallDir 加入用户 PATH；新终端会自动生效。"
     }
-    Write-Host "言序已安装到 $(Join-Path $InstallDir 'yanxu.exe')"
-    Write-Host "运行 yanxu --version 验证安装。"
+    $ProcessPathParts = @($env:Path -split ";" | Where-Object { $_ })
+    if ($ProcessPathParts -notcontains $InstallDir) { $env:Path = "$env:Path;$InstallDir" }
+    Write-Host "言序已安装到 $InstalledPath"
+    Write-Host "已验证：$VersionText"
 } catch {
     Write-Error "言序安装失败：$($_.Exception.Message)"
     exit 1
 } finally {
+    if ($StagedPath) { Remove-Item -Force -ErrorAction SilentlyContinue $StagedPath }
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $TempDir
 }

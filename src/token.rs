@@ -1,3 +1,5 @@
+use crate::source::Span;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     LeftParen,
@@ -10,6 +12,8 @@ pub enum TokenKind {
     Colon,
     Dot,
     Semicolon,
+    Pipe,
+    Question,
     Plus,
     Minus,
     Star,
@@ -37,7 +41,17 @@ pub enum TokenKind {
     For,
     In,
     Function,
+    Async,
+    Await,
     Class,
+    Inherit,
+    Protocol,
+    Implements,
+    Field,
+    Private,
+    Readonly,
+    Static,
+    Public,
     This,
     Import,
     As,
@@ -59,10 +73,16 @@ pub struct Token {
     pub kind: TokenKind,
     pub line: usize,
     pub column: usize,
+    pub span: Span,
 }
 
 impl Token {
-    pub fn new(kind: TokenKind, line: usize, column: usize) -> Self {
-        Self { kind, line, column }
+    pub fn new(kind: TokenKind, span: Span) -> Self {
+        Self {
+            kind,
+            line: span.line,
+            column: span.column,
+            span,
+        }
     }
 }

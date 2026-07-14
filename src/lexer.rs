@@ -1,27 +1,30 @@
+use crate::source::{SourceFile, Span};
 use crate::token::{Token, TokenKind};
 use std::fmt;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LexError {
     pub message: String,
     pub line: usize,
     pub column: usize,
+    pub span: Span,
 }
 
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "第 {} 行，第 {} 列：{}",
-            self.line, self.column, self.message
-        )
+        write!(f, "{}", self.span.render("词法有误", &self.message))
     }
 }
 
 impl std::error::Error for LexError {}
 
 pub fn scan(source: &str) -> Result<Vec<Token>, LexError> {
-    Scanner::new(source).scan_tokens()
+    scan_named(source, "<文句>")
+}
+
+pub fn scan_named(source: &str, name: impl Into<String>) -> Result<Vec<Token>, LexError> {
+    Scanner::new(SourceFile::new(name, source)).scan_tokens()
 }
 
 struct Scanner {
@@ -29,15 +32,17 @@ struct Scanner {
     current: usize,
     line: usize,
     column: usize,
+    source: Rc<SourceFile>,
 }
 
 impl Scanner {
-    fn new(source: &str) -> Self {
+    fn new(source: Rc<SourceFile>) -> Self {
         Self {
-            chars: source.chars().collect(),
+            chars: source.text.chars().collect(),
             current: 0,
             line: 1,
             column: 1,
+            source,
         }
     }
 
@@ -60,6 +65,8 @@ impl Scanner {
                 ':' | '：' => TokenKind::Colon,
                 '.' => TokenKind::Dot,
                 ';' | '；' => TokenKind::Semicolon,
+                '|' => TokenKind::Pipe,
+                '?' | '？' => TokenKind::Question,
                 '+' => TokenKind::Plus,
                 '-' => TokenKind::Minus,
                 '*' | '×' => TokenKind::Star,
@@ -95,9 +102,21 @@ impl Scanner {
                     return Err(self.error(line, column, format!("不识字符“{other}”")));
                 }
             };
-            tokens.push(Token::new(kind, line, column));
+            tokens.push(Token::new(
+                kind,
+                Span::new(self.source.clone(), line, column, self.line, self.column),
+            ));
         }
-        tokens.push(Token::new(TokenKind::Eof, self.line, self.column));
+        tokens.push(Token::new(
+            TokenKind::Eof,
+            Span::new(
+                self.source.clone(),
+                self.line,
+                self.column,
+                self.line,
+                self.column,
+            ),
+        ));
         Ok(tokens)
     }
 
@@ -195,6 +214,7 @@ impl Scanner {
             message: message.into(),
             line,
             column,
+            span: Span::new(self.source.clone(), line, column, self.line, self.column),
         }
     }
 }
@@ -235,6 +255,9 @@ fn is_identifier_char(c: char) -> bool {
                 | '「'
                 | '」'
                 | '#'
+                | '|'
+                | '?'
+                | '？'
         )
 }
 
@@ -253,7 +276,17 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "逐" => TokenKind::For,
         "于" => TokenKind::In,
         "法" => TokenKind::Function,
+        "异" => TokenKind::Async,
+        "候" => TokenKind::Await,
         "类" => TokenKind::Class,
+        "承" => TokenKind::Inherit,
+        "协" => TokenKind::Protocol,
+        "纳" => TokenKind::Implements,
+        "域" => TokenKind::Field,
+        "私" => TokenKind::Private,
+        "只" => TokenKind::Readonly,
+        "静" => TokenKind::Static,
+        "公" => TokenKind::Public,
         "此" => TokenKind::This,
         "引" => TokenKind::Import,
         "作" => TokenKind::As,
@@ -298,5 +331,14 @@ mod tests {
                 .iter()
                 .any(|token| token.kind == TokenKind::String("已长成".into()))
         );
+    }
+
+    #[test]
+    fn lexical_errors_render_source_excerpt() {
+        let error = scan_named("言 ”；", "词法例.yx").unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("词法例.yx:1:3"));
+        assert!(rendered.contains("言 ”；"));
+        assert!(rendered.contains('^'));
     }
 }

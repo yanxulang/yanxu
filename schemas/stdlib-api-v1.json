@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yanxu.dev/schemas/stdlib-api-v1.json",
+  "type": "object",
+  "required": ["schema", "schema_version", "modules"],
+  "properties": {
+    "schema": { "const": "https://yanxu.dev/schemas/stdlib-api-v1.json" },
+    "schema_version": { "const": 1 },
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "permissions", "platforms", "deterministic", "members"]
+      }
+    }
+  },
+  "additionalProperties": false
+}

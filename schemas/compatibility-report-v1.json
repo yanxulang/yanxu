@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yanxu.dev/schemas/compatibility-report-v1.json",
+  "type": "object",
+  "required": ["schema", "schema_version", "language_version", "cases"],
+  "properties": {
+    "schema": { "const": "https://yanxu.dev/schemas/compatibility-report-v1.json" },
+    "schema_version": { "const": 1 },
+    "language_version": { "type": "string" },
+    "cases": { "type": "array", "items": { "type": "object", "required": ["path", "passed", "tree", "bytecode"] } }
+  },
+  "additionalProperties": false
+}

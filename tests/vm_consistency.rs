@@ -1,0 +1,379 @@
+use std::fs;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+use yanxu::bytecode;
+use yanxu::interpreter::Interpreter;
+use yanxu::vm::Vm;
+
+fn execute_both(source: &str, directory: &Path) -> (Vec<String>, Vec<String>) {
+    let statements = yanxu::parse_named(source, "<一致性规格>").unwrap();
+
+    let mut interpreter = Interpreter::silent();
+    interpreter
+        .execute_in_directory(&statements, directory)
+        .unwrap();
+
+    let chunk = bytecode::compile(&statements).unwrap();
+    let mut vm = Vm::silent();
+    vm.execute_in_directory(&chunk, directory).unwrap();
+    (interpreter.take_output(), vm.take_output())
+}
+
+fn assert_consistent(name: &str, source: &str) {
+    let (tree, vm) = execute_both(source, Path::new("."));
+    assert_eq!(tree, vm, "{name} 的树解释器与 VM 输出不一致");
+}
+
+#[test]
+fn shared_language_semantics_match_the_tree_interpreter() {
+    let cases = [
+        (
+            "值、分支与循环",
+            r#"
+                令 和：数 为 0；令 次：数 为 1；
+                当 次 不大于 5 则
+                    置 和 为 和 加 次；置 次 为 次 加 1；
+                终
+                若 和 等于 15 且 非 假 则 言「善」；否则 言「误」；终
+            "#,
+        ),
+        (
+            "递归、闭包与归值",
+            r#"
+                法 阶乘（值：数）：数 则
+                    若 值 不大于 1 则 归 1；终
+                    归 值 乘 阶乘（值 减 1）；
+                终
+                法 相加器（甲：数）：法（数）：数 则
+                    法 加乙（乙：数）：数 则 归 甲 加 乙；终
+                    归 加乙；
+                终
+                定 加七：法（数）：数 为 相加器（7）；
+                言 阶乘（6）；言 加七（8）；
+            "#,
+        ),
+        (
+            "容器、结构相等、切片与改写",
+            r#"
+                令 列表：列<数> 为【3，1，2】；
+                置 列表【0】为 4；追加（列表，5）；
+                令 对照：典<文,数> 为{「甲」：1}；置 对照【「乙」】为 2；
+                言 列表【1：4】；言 对照【「乙」】；
+                言（1，「二」）等于（1，「二」）；
+                言 排序（列表）；
+            "#,
+        ),
+        (
+            "统一惰性迭代协议",
+            r#"
+                法 倍（值：数）：数 则 归 值 乘 2；终
+                法 偶（值：数）：理 则 归 值 除 2 等于 值 除 2；终
+                法 求和（合：数，值：数）：数 则 归 合 加 值；终
+                定 流 为 映射（范围（1，5），倍）；
+                言 续（遍（流））；
+                言 折叠（范围（1，5），0，求和）；
+                言 反转（「天地玄」）；言 包含（【1，2，3】，2）；
+            "#,
+        ),
+        (
+            "协议、继承、字段与方法绑定",
+            r#"
+                协 可名 则 域 名：文；法 显示（）：文；终
+                类 生灵 则 法 显示（）：文 则 归 此.名；终 终
+                类 人 承 生灵 纳 可名 则
+                    公 只 域 名：文；静 域 数目：数 为 0；
+                    法 初始化（名：文）则 置 此.名 为 名；终
+                    静 法 类名（）：文 则 归「人」；终
+                终
+                定 子：可名 为 人（「子路」）；
+                定 展示：法（）：文 为 子.显示；
+                言 展示（）；言 人.类名（）；言 人.数目；
+            "#,
+        ),
+        (
+            "结构化错误",
+            r#"
+                法 失败（）：数 则 归 1 除 0；终
+                试 则 失败（）；救 错 则
+                    言 错.消息；言 长度（错.踪迹）不小于 1；
+                终
+            "#,
+        ),
+    ];
+
+    for (name, source) in cases {
+        assert_consistent(name, source);
+    }
+}
+
+#[test]
+fn relative_modules_have_matching_exports_and_single_initialization() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("yanxu-vm-consistency-{unique}"));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("算书.yx"),
+        "言「模块已载」；公 定 基数：数 为 40；公 法 加二（值：数）：数 则 归 值 加 2；终",
+    )
+    .unwrap();
+    let source = r#"
+        引「算书.yx」为 甲；引「算书.yx」为 乙；
+        言 甲.加二（甲.基数）；言 乙.基数；
+    "#;
+
+    let (tree, vm) = execute_both(source, &root);
+    assert_eq!(tree, ["模块已载", "42", "40"]);
+    assert_eq!(tree, vm);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn shared_runtime_failures_retain_the_same_error_category() {
+    let source = "法 加一（值：数）：数 则 归 值 加 1；终 加一（「错」）；";
+    let statements = yanxu::parse(source).unwrap();
+
+    let mut interpreter = Interpreter::silent();
+    let tree_error = interpreter.execute(&statements).unwrap_err().to_string();
+
+    let chunk = bytecode::compile(&statements).unwrap();
+    let mut vm = Vm::silent();
+    let vm_error = vm.execute(&chunk).unwrap_err().to_string();
+
+    for error in [&tree_error, &vm_error] {
+        assert!(error.contains("变量“值”注为数，不可纳入文"), "{error}");
+        assert!(error.contains("<文句>:1"), "{error}");
+    }
+}
+
+#[test]
+fn expanded_pure_standard_modules_match_both_runtimes() {
+    let source = r#"
+        引「标准:路径」为 路径；
+        引「标准:环境」为 环境；
+        引「标准:哈希」为 哈希；
+        引「标准:编码」为 编码；
+        引「标准:统计」为 统计；
+        引「标准:CSV」为 CSV；
+        引「标准:随机」为 随机；
+        引「标准:标识」为 标识；
+        引「标准:模板」为 模板；
+        引「标准:校验」为 校验；
+        言 路径.规范化（「甲/乙/../丙」）；
+        言 路径.扩展名（「档案.yx」）；
+        言 环境.系统（）；言 环境.架构（）；
+        言 哈希.SHA256（「言序」）；
+        言 编码.解十六进制（编码.十六进制（「言序」））；
+        言 编码.解百分号（编码.百分号（「言序 /?」））；
+        言 统计.总和（【1，2，3，4】）；
+        言 统计.平均（【1，2，3，4】）；
+        言 统计.方差（【1，2，3，4】）；
+        定 表：列<列<文>> 为 CSV.解析（「甲,乙\n一,\"二,三\"」）；
+        言 表【1】【1】；言 CSV.序列化（表）；
+        言 随机.整数（42，10，20）；
+        定 标号：文 为 标识.稳定UUID（「言序」）；
+        言 标号；言 标识.是否UUID（标号）；
+        言 模板.插值（「问{{name}}安」，「name」，「子衿」）；
+        言 模板.反转义HTML（模板.转义HTML（「<言序>」））；
+        言 校验.电子邮件（「hello@yanxu.dev」）；
+        言 校验.IPv4（「127.0.0.1」）；
+        言 校验.十六进制色（「#7fef6d」）；
+    "#;
+    let (tree, vm) = execute_both(source, Path::new("."));
+    assert_eq!(tree, vm);
+    assert_eq!(tree[4], yanxu::stdlib::sha256("言序"));
+    assert_eq!(tree[7..10], ["10", "2.5", "1.25"]);
+    assert_eq!(
+        tree[12..],
+        [
+            "13",
+            "7fef6d82-32f7-8809-a49c-11a4e2944571",
+            "真",
+            "问子衿安",
+            "<言序>",
+            "真",
+            "真",
+            "真"
+        ]
+    );
+}
+
+#[test]
+fn post_one_zero_standard_module_errors_match_both_runtimes() {
+    let source = "引「标准:随机」为 随机；言 随机.整数（1，2，2）；";
+    let statements = yanxu::parse_named(source, "<标准库错误规格>").unwrap();
+
+    let mut interpreter = Interpreter::silent();
+    let tree_error = interpreter.execute(&statements).unwrap_err().to_string();
+
+    let chunk = bytecode::compile(&statements).unwrap();
+    let mut vm = Vm::silent();
+    let vm_error = vm.execute(&chunk).unwrap_err().to_string();
+
+    for runtime_error in [&tree_error, &vm_error] {
+        assert!(runtime_error.contains("下界小于上界"), "{runtime_error}");
+        assert!(
+            runtime_error.contains("<标准库错误规格>:1"),
+            "{runtime_error}"
+        );
+    }
+}
+
+#[test]
+fn baseline_standard_modules_are_fully_available_in_both_runtimes() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("yanxu-vm-stdlib-{unique}"));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("资料.txt"), "天地玄黄").unwrap();
+    let source = format!(
+        r#"
+        引「标准:文字」为 文字；引「标准:数学」为 数学；
+        引「标准:时间」为 时间；引「标准:文件」为 文件；
+        引「标准:JSON」为 JSON；引「标准:测试」为 测试；
+        言 文字.联结（文字.分割（「甲,乙,丙」，「,」），「-」）；
+        言 文字.替换（「青青子衿」，「青青」，「悠悠」）；
+        言 数学.最大（数学.下取整（3.9），数学.幂（2，1））；
+        定 数据：典 为 JSON.解析（「{{\"名\":\"言序\",\"版\":7}}」）；
+        言 数据【「名」】；言 JSON.序列化（【真，空，3】）；
+        测试.相等（文字.修剪（「  善  」），「善」）；
+        时间.等待（0）；
+        言 文件.读取（「{}」）；言 文件.存在（「{}」）；
+        "#,
+        root.join("资料.txt").display(),
+        root.join("资料.txt").display()
+    );
+    let (tree, vm) = execute_both(&source, &root);
+    assert_eq!(tree, vm);
+    assert_eq!(
+        tree,
+        [
+            "甲-乙-丙",
+            "悠悠子衿",
+            "3",
+            "言序",
+            "[true,null,3.0]",
+            "天地玄黄",
+            "真"
+        ]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn network_standard_module_matches_both_runtimes() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n\xe5\x96\x84\xe5\x93\x89")
+                .unwrap();
+        }
+    });
+    let source = format!("引「标准:网络」为 网络；言 网络.获取（「http://{address}/问」）；");
+    let (tree, vm) = execute_both(&source, Path::new("."));
+    assert_eq!(tree, ["善哉"]);
+    assert_eq!(tree, vm);
+    server.join().unwrap();
+}
+
+#[test]
+fn file_standard_module_mutations_match_in_isolated_directories() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("yanxu-file-parity-{unique}"));
+    let tree_root = root.join("tree");
+    let vm_root = root.join("vm");
+    fs::create_dir_all(&tree_root).unwrap();
+    fs::create_dir_all(&vm_root).unwrap();
+    let program = |directory: &Path| {
+        let path = directory.join("资料.txt");
+        format!(
+            r#"
+            引「标准:文件」为 文件；
+            文件.写入（「{}」，「甲」）；
+            文件.追加（「{}」，「乙」）；
+            言 文件.读取（「{}」）；
+            言 文件.存在（「{}」）；
+            言 文件.目录（「{}」）；
+        "#,
+            path.display(),
+            path.display(),
+            path.display(),
+            path.display(),
+            directory.display()
+        )
+    };
+    let statements = yanxu::parse(&program(&tree_root)).unwrap();
+    let mut interpreter = Interpreter::silent();
+    interpreter
+        .execute_in_directory(&statements, &tree_root)
+        .unwrap();
+    let vm_statements = yanxu::parse(&program(&vm_root)).unwrap();
+    let chunk = bytecode::compile(&vm_statements).unwrap();
+    let mut vm = Vm::silent();
+    vm.execute_in_directory(&chunk, &vm_root).unwrap();
+
+    assert_eq!(interpreter.output(), vm.output());
+    assert_eq!(
+        fs::read_to_string(tree_root.join("资料.txt")).unwrap(),
+        "甲乙"
+    );
+    assert_eq!(
+        fs::read_to_string(vm_root.join("资料.txt")).unwrap(),
+        "甲乙"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn async_tasks_cancellation_and_structured_join_match_both_runtimes() {
+    let source = r#"
+        异 法 倍增（值：数）：数 则 归 值 乘 2；终
+        异 法 失败（）：数 则 抛「任务失败」；终
+        定 甲：任务<数> 为 倍增（3）；
+        言 任务状态（甲）；言 候 甲；言 候 甲；
+        定 乙：任务<数> 为 倍增（4）；
+        定 丙：任务<数> 为 倍增（5）；
+        言 并候（【乙，丙】）；
+        定 丁：任务<数> 为 倍增（6）；言 取消（丁）；言 任务状态（丁）；
+        定 坏：任务<数> 为 失败（）；定 后：任务<数> 为 倍增（7）；
+        试 则 并候（【坏，后】）；救 错 则 言 错.消息；终
+        言 任务状态（后）；
+        令 自工：任务<数>? 为 空；
+        异 法 自候（）：数 则 归 候 自工；终
+        置 自工 为 自候（）；
+        试 则 言 候 自工；救 错 则 言 错.消息；终
+    "#;
+    let tokens = yanxu::lexer::scan_named(source, "<异步一致性>").unwrap();
+    assert!(matches!(tokens[0].kind, yanxu::token::TokenKind::Async));
+    let (tree, vm) = execute_both(source, Path::new("."));
+    assert_eq!(tree, vm);
+    assert_eq!(
+        tree,
+        [
+            "待行",
+            "6",
+            "6",
+            "【8，10】",
+            "真",
+            "取消",
+            "任务失败",
+            "取消",
+            "任务正在运行，不可自相等候"
+        ]
+    );
+}

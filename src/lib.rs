@@ -1,10 +1,32 @@
 pub mod ast;
+pub mod benchmark;
+pub mod budget;
+pub mod bytecode;
+pub mod compatibility;
+pub mod debugger;
+pub mod docgen;
+pub mod embed;
+pub mod ffi;
+pub mod formatter;
+pub mod fuzzing;
 pub mod interpreter;
 pub mod lexer;
+pub mod lsp;
+pub mod migration;
+pub mod package;
 pub mod parser;
+pub mod permissions;
+#[cfg(not(target_family = "wasm"))]
 pub mod repl;
 pub mod resolver;
+pub mod semantic;
+pub mod source;
+pub mod stdlib;
+pub mod testing;
 pub mod token;
+pub mod type_checker;
+pub mod vm;
+pub mod wasm;
 
 use interpreter::{Interpreter, RuntimeError, Value};
 use lexer::LexError;
@@ -26,10 +48,10 @@ pub enum YanxuError {
 impl fmt::Display for YanxuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Lex(error) => write!(f, "词法有误：{error}"),
-            Self::Parse(error) => write!(f, "语法有误：{error}"),
-            Self::Runtime(error) => write!(f, "运行有误：{error}"),
-            Self::Semantic(error) => write!(f, "语义有误：{error}"),
+            Self::Lex(error) => write!(f, "{error}"),
+            Self::Parse(error) => write!(f, "{error}"),
+            Self::Runtime(error) => write!(f, "{error}"),
+            Self::Semantic(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "文卷有误：{error}"),
         }
     }
@@ -38,7 +60,11 @@ impl fmt::Display for YanxuError {
 impl std::error::Error for YanxuError {}
 
 pub fn parse(source: &str) -> Result<Vec<ast::Stmt>, YanxuError> {
-    let tokens = lexer::scan(source).map_err(YanxuError::Lex)?;
+    parse_named(source, "<文句>")
+}
+
+pub fn parse_named(source: &str, name: impl Into<String>) -> Result<Vec<ast::Stmt>, YanxuError> {
+    let tokens = lexer::scan_named(source, name).map_err(YanxuError::Lex)?;
     let statements = parser::parse(tokens).map_err(YanxuError::Parse)?;
     resolver::resolve(&statements).map_err(YanxuError::Semantic)?;
     Ok(statements)
@@ -73,7 +99,7 @@ pub fn run_file_with(
         .map_err(|error| YanxuError::Io(format!("不能定位“{}”：{error}", path.display())))?;
     let source = fs::read_to_string(&canonical)
         .map_err(|error| YanxuError::Io(format!("不能读取“{}”：{error}", canonical.display())))?;
-    let statements = parse(&source)?;
+    let statements = parse_named(&source, canonical.display().to_string())?;
     let directory = canonical.parent().unwrap_or_else(|| Path::new("."));
     interpreter
         .execute_in_directory(&statements, directory)

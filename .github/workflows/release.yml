@@ -4,25 +4,98 @@ on:
   push:
     tags:
       - "v[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已存在的版本标签（如 v1.0.0）
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: 已存在的版本标签
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  validate:
+    name: 校验版本标签
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref_name }}
+      - name: 核对 Cargo、标签、主分支与变更记录
+        id: version
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu") | .version')"
+          if [[ "$tag" != "v$version" ]]; then
+            echo "标签 $tag 与 Cargo 版本 $version 不一致" >&2
+            exit 1
+          fi
+          git fetch origin main --tags
+          tag_commit="$(git rev-list -n 1 "$tag")"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "标签 $tag 不属于 origin/main" >&2
+            exit 1
+          fi
+          if ! grep -Fqx "## $version" CHANGELOG.md; then
+            echo "CHANGELOG.md 缺少 ## $version" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   create-release:
     name: 创建 Release
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
-      - uses: taiki-e/create-gh-release-action@v1
         with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+      - name: 检查 Release 是否已存在
+        id: existing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 从变更记录创建 Release
+        if: steps.existing.outputs.exists != 'true'
+        uses: taiki-e/create-gh-release-action@v1
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
           changelog: CHANGELOG.md
+          title: 言序 $version
+          branch: main
 
   binaries:
     name: ${{ matrix.target }}
-    needs: create-release
+    needs: [validate, create-release]
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +117,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
-      - name: 构建并上传二进制
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+      - name: 构建并上传二进制与校验和
         uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: yanxu
@@ -53,4 +128,5 @@ jobs:
           include: LICENSE README.md
           checksum: sha256
           locked: true
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
           token: ${{ secrets.GITHUB_TOKEN }}

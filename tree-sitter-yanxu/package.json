@@ -1,0 +1,8 @@
+{
+  "name": "tree-sitter-yanxu",
+  "version": "1.0.0",
+  "description": "Tree-sitter grammar for the Yanxu programming language",
+  "main": "bindings/node",
+  "keywords": ["tree-sitter", "yanxu", "language"],
+  "license": "MIT"
+}

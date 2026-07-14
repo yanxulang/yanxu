@@ -5,7 +5,7 @@
 ## 开始之前
 
 - 小型修复可直接提交 Pull Request。
-- 新语法、破坏兼容性的改动或较大的架构调整，请先创建 Discussion 或 Issue，说明动机、示例和兼容性影响。
+- 新语法、标准库或公共格式改动须先按[YXP 提案模板](proposals/README.md)创建 Discussion 或 Issue；破坏性变化还受[1.x 兼容政策](COMPATIBILITY.md)约束。
 - 请不要把多个无关改动放进同一个 Pull Request。
 
 ## 本地开发
@@ -16,6 +16,8 @@
 cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
+cargo run -- 兼容
+cargo check --target wasm32-wasip1 --lib
 ```
 
 运行示例：
@@ -25,6 +27,12 @@ cargo run -- examples/初见.yx
 ```
 
 文档、官网和编辑器扩展分别维护在 `YanXuLang/docs`、`YanXuLang/website` 与 `YanXuLang/vscode-extension`。跨项目改动请在对应仓库分别提交。
+
+## 版本发布
+
+更新`Cargo.toml`中的包版本、同步`Cargo.lock`，并在`CHANGELOG.md`加入完全相同的`## X.Y.Z`章节。这些变更进入`main`后，`Auto Release`工作流会自动创建`vX.Y.Z`标签，并调用可复用`Release`工作流生成 GitHub Release、六个平台的二进制压缩包与独立 SHA-256 校验文件。
+
+已有标签需要修复发布时，可从 Actions 手工运行`Release`并传入标签。标签版本、Cargo 版本、主分支归属或变更记录任一不一致时，发布会直接失败。
 
 ## 提交约定
 
