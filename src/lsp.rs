@@ -12,8 +12,8 @@ use std::io::{self, BufRead, Write};
 
 const KEYWORDS: &[&str] = &[
     "令", "定", "置", "为", "言", "若", "则", "否则", "终", "当", "逐", "于", "异", "候", "法",
-    "归", "类", "承", "协", "纳", "域", "公", "私", "只", "静", "此", "引", "试", "救", "抛", "真",
-    "假", "空", "且", "或", "非",
+    "归", "类", "承", "父", "协", "纳", "域", "公", "私", "只", "静", "此", "引", "试", "救", "抛",
+    "真", "假", "空", "是", "且", "或", "非",
 ];
 
 const INTRINSICS: &[(&str, &str)] = &[
@@ -547,6 +547,15 @@ mod tests {
                 .any(|item| item["label"] == "求和"
                     && item["detail"].as_str().unwrap().contains("数"))
         );
+        for keyword in ["父", "是"] {
+            assert!(
+                completion["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["label"] == keyword && item["kind"] == 14)
+            );
+        }
 
         let definition = semantic_response(
             "textDocument/definition",

@@ -327,6 +327,10 @@ impl Formatter {
             },
             ExprKind::Variable(name) => self.output.push_str(name),
             ExprKind::This => self.output.push('此'),
+            ExprKind::Super { method } => {
+                self.output.push_str("父.");
+                self.output.push_str(method);
+            }
             ExprKind::List(items) => self.items(items, '【', '】'),
             ExprKind::Tuple(items) => self.items(items, '（', '）'),
             ExprKind::Map(entries) => {
@@ -361,6 +365,13 @@ impl Formatter {
                 self.output.push_str(operator_text(operator));
                 self.output.push(' ');
                 self.expression(right);
+                self.output.push('）');
+            }
+            ExprKind::TypeTest { value, type_ref } => {
+                self.output.push('（');
+                self.expression(value);
+                self.output.push_str(" 是 ");
+                self.output.push_str(&type_ref.name);
                 self.output.push('）');
             }
             ExprKind::Call { callee, arguments } => {

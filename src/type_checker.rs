@@ -352,6 +352,7 @@ struct Checker {
     class_parents: HashMap<String, String>,
     class_protocols: HashMap<String, HashSet<String>>,
     current_class: Option<String>,
+    current_method_static: bool,
     current_dir: Option<PathBuf>,
     module_cache: HashMap<PathBuf, ObjectShape>,
     loading_modules: Vec<PathBuf>,
@@ -367,6 +368,7 @@ impl Checker {
             class_parents: HashMap::new(),
             class_protocols: HashMap::new(),
             current_class: None,
+            current_method_static: false,
             current_dir: None,
             module_cache: HashMap::new(),
             loading_modules: Vec::new(),
@@ -633,9 +635,15 @@ impl Checker {
                     if !method.is_static {
                         child.insert("此".into(), binding(TypeSet::named(name), false));
                     }
+                    let previous_static =
+                        std::mem::replace(&mut self.current_method_static, method.is_static);
                     self.statement(method, &mut child, None);
+                    self.current_method_static = previous_static;
                 }
                 self.current_class = previous_class;
+                if let Some(superclass) = superclass {
+                    self.verify_overrides(name, superclass, &statement.span);
+                }
                 self.verify_protocols(name, protocols, &statement.span);
             }
             StmtKind::Protocol { .. } => {}
@@ -683,6 +691,40 @@ impl Checker {
             ExprKind::This => scope
                 .get("此")
                 .map_or_else(TypeSet::any, |item| item.ty.clone()),
+            ExprKind::Super { method } => {
+                if self.current_method_static {
+                    self.error("静法不可使用“父”", expression.span.clone());
+                    return TypeSet::any();
+                }
+                let Some(class_name) = self.current_class.clone() else {
+                    self.error("“父”只可用于类之法内", expression.span.clone());
+                    return TypeSet::any();
+                };
+                let Some(parent) = self.class_parents.get(&class_name) else {
+                    self.error("无父类之类不可使用“父”", expression.span.clone());
+                    return TypeSet::any();
+                };
+                let Some(member) = self.member(parent, method).cloned() else {
+                    self.error(
+                        format!("父类“{parent}”无方法“{method}”"),
+                        expression.span.clone(),
+                    );
+                    return TypeSet::any();
+                };
+                if member.function.is_none() || member.is_static {
+                    self.error(
+                        format!("父类成员“{method}”不是实例法"),
+                        expression.span.clone(),
+                    );
+                }
+                if member.visibility == Visibility::Private && member.owner != class_name {
+                    self.error(
+                        format!("父类私法“{method}”不可由子类调用"),
+                        expression.span.clone(),
+                    );
+                }
+                member_type(&member)
+            }
             ExprKind::List(items) => TypeSet::single(StaticType::List(Box::new(TypeSet::union(
                 items
                     .iter()
@@ -751,6 +793,10 @@ impl Checker {
                     TokenKind::And | TokenKind::Or => TypeSet::union(vec![left_type, right_type]),
                     _ => TypeSet::named("理"),
                 }
+            }
+            ExprKind::TypeTest { value, .. } => {
+                self.expression(value, scope);
+                TypeSet::named("理")
             }
             ExprKind::Call { callee, arguments } => {
                 let callee_type = self.expression(callee, scope);
@@ -1097,6 +1143,64 @@ impl Checker {
         self.member(type_name, name).cloned()
     }
 
+    fn inherited_member(&self, type_name: &str, name: &str) -> Option<(bool, MemberType)> {
+        if let Some(shape) = self.classes.get(type_name) {
+            if let Some(field) = shape.fields.get(name) {
+                return Some((false, field.clone()));
+            }
+            if let Some(method) = shape.methods.get(name) {
+                return Some((true, method.clone()));
+            }
+        }
+        self.class_parents
+            .get(type_name)
+            .and_then(|parent| self.inherited_member(parent, name))
+    }
+
+    fn verify_overrides(&mut self, class_name: &str, superclass: &str, span: &Span) {
+        let Some(class) = self.classes.get(class_name).cloned() else {
+            return;
+        };
+        for name in class.fields.keys() {
+            if self.inherited_member(superclass, name).is_some() {
+                self.error(
+                    format!("类“{class_name}”不可重声明继承成员“{name}”为域"),
+                    span.clone(),
+                );
+            }
+        }
+        for (name, method) in &class.methods {
+            let Some((parent_is_method, inherited)) = self.inherited_member(superclass, name)
+            else {
+                continue;
+            };
+            if !parent_is_method {
+                self.error(
+                    format!("类“{class_name}”不可将继承域“{name}”覆写为法"),
+                    span.clone(),
+                );
+                continue;
+            }
+            if method.is_static != inherited.is_static {
+                self.error(
+                    format!("覆写法“{name}”不可改变静法/实例法属性"),
+                    span.clone(),
+                );
+            }
+            if inherited.visibility == Visibility::Public
+                && method.visibility == Visibility::Private
+            {
+                self.error(format!("覆写法“{name}”不可收窄为私有"), span.clone());
+            }
+            if method.function != inherited.function {
+                self.error(
+                    format!("覆写法“{name}”之参数或归值须与父类签名一致"),
+                    span.clone(),
+                );
+            }
+        }
+    }
+
     fn verify_protocols(&mut self, class_name: &str, protocols: &[String], span: &Span) {
         let Some(class) = self.classes.get(class_name).cloned() else {
             return;
@@ -1140,7 +1244,7 @@ impl Checker {
     }
 
     fn require(&mut self, expected: &TypeSet, actual: &TypeSet, span: &Span, subject: String) {
-        if !expected.accepts(actual) && !self.protocol_assignable(expected, actual) {
+        if !expected.accepts(actual) && !self.named_assignable(expected, actual) {
             self.error(
                 format!("{subject}应为 {expected}，实为 {actual}"),
                 span.clone(),
@@ -1148,18 +1252,27 @@ impl Checker {
         }
     }
 
-    fn protocol_assignable(&self, expected: &TypeSet, actual: &TypeSet) -> bool {
+    fn named_assignable(&self, expected: &TypeSet, actual: &TypeSet) -> bool {
         actual.variants.iter().all(|actual| {
             let StaticType::Named(class_name) = actual else {
                 return false;
             };
             expected.variants.iter().any(|expected| {
-                let StaticType::Named(protocol_name) = expected else {
+                let StaticType::Named(expected_name) = expected else {
                     return false;
                 };
-                self.class_conforms(class_name, protocol_name)
+                self.class_is_a(class_name, expected_name)
             })
         })
+    }
+
+    fn class_is_a(&self, class_name: &str, expected_name: &str) -> bool {
+        class_name == expected_name
+            || self.class_conforms(class_name, expected_name)
+            || self
+                .class_parents
+                .get(class_name)
+                .is_some_and(|parent| self.class_is_a(parent, expected_name))
     }
 
     fn class_conforms(&self, class_name: &str, protocol_name: &str) -> bool {
@@ -1413,6 +1526,21 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 "发文",
                 vec![TypeSet::named("文"), TypeSet::named("文")],
                 TypeSet::named("文"),
+            );
+            insert_std_function(
+                &mut shape,
+                "请求",
+                vec![
+                    TypeSet::named("文"),
+                    TypeSet::named("文"),
+                    TypeSet::named("文"),
+                    TypeSet::named("数"),
+                    TypeSet::named("数"),
+                ],
+                TypeSet::single(StaticType::Map(
+                    Box::new(TypeSet::named("文")),
+                    Box::new(TypeSet::any()),
+                )),
             );
         }
         "测试" => {
@@ -1740,6 +1868,30 @@ fn binding(ty: TypeSet, mutable: bool) -> Binding {
 }
 
 fn narrow_condition(condition: &Expr, scope: &mut Scope, truthy: bool) {
+    if let ExprKind::TypeTest { value, type_ref } = &condition.kind
+        && let ExprKind::Variable(name) = &value.kind
+    {
+        let expected = TypeSet::from_ref(type_ref);
+        if let Some(binding) = scope.get_mut(name) {
+            binding.ty = if truthy {
+                expected
+            } else {
+                let excluded = expected
+                    .variants
+                    .iter()
+                    .filter_map(|variant| match variant {
+                        StaticType::Named(name) => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                excluded
+                    .into_iter()
+                    .fold(binding.ty.clone(), |ty, name| ty.without_named(name))
+            };
+            binding.function = binding.ty.function();
+        }
+        return;
+    }
     let ExprKind::Binary {
         left,
         operator,

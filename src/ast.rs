@@ -120,6 +120,9 @@ pub enum ExprKind {
     Literal(Literal),
     Variable(String),
     This,
+    Super {
+        method: String,
+    },
     List(Vec<Expr>),
     Tuple(Vec<Expr>),
     Map(Vec<(Expr, Expr)>),
@@ -131,6 +134,10 @@ pub enum ExprKind {
         left: Box<Expr>,
         operator: TokenKind,
         right: Box<Expr>,
+    },
+    TypeTest {
+        value: Box<Expr>,
+        type_ref: TypeRef,
     },
     Call {
         callee: Box<Expr>,

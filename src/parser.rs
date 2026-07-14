@@ -527,9 +527,28 @@ impl Parser {
 
     fn equality(&mut self) -> Result<Expr, ParseError> {
         self.binary(
-            Self::comparison,
+            Self::type_test,
             &[TokenKind::EqualEqual, TokenKind::BangEqual],
         )
+    }
+
+    fn type_test(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.comparison()?;
+        while self.matches(&TokenKind::Is) {
+            let (kind, type_span) = self.type_union().map_err(|mut error| {
+                error.message = "“是”之后须有完整类型".into();
+                error
+            })?;
+            let span = expr.span.through(&type_span);
+            expr = Expr::new(
+                ExprKind::TypeTest {
+                    value: Box::new(expr),
+                    type_ref: TypeRef::new(kind, type_span),
+                },
+                span,
+            );
+        }
+        Ok(expr)
     }
 
     fn comparison(&mut self) -> Result<Expr, ParseError> {
@@ -730,6 +749,14 @@ impl Parser {
             }
             TokenKind::Identifier(name) => Ok(Expr::new(ExprKind::Variable(name), span)),
             TokenKind::This => Ok(Expr::new(ExprKind::This, span)),
+            TokenKind::Super => {
+                self.consume(&TokenKind::Dot, "“父”之后须以点号指定父类方法")?;
+                let (method, method_span) = self.identifier_token("“父.”之后须有父类方法名")?;
+                Ok(Expr::new(
+                    ExprKind::Super { method },
+                    span.through(&method_span),
+                ))
+            }
             TokenKind::LeftBracket => self.list_literal(span),
             TokenKind::LeftBrace => self.map_literal(span),
             TokenKind::LeftParen => self.group_or_tuple(span),
@@ -1040,6 +1067,27 @@ mod tests {
         assert!(
             matches!(&statements[0].kind, StmtKind::Class { name, methods, .. } if name == "人" && methods.len() == 1)
         );
+    }
+
+    #[test]
+    fn parses_super_calls_and_type_tests() {
+        let statements = parse(
+            lexer::scan(
+                "类 人 承 生灵 则 法 自述（）：文 则 令 值：数|文 为「」；若 值 是 文 则 归 父.自述（）；终 归「」；终 终",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let StmtKind::Class { methods, .. } = &statements[0].kind else {
+            panic!("expected class");
+        };
+        let StmtKind::Function { body, .. } = &methods[0].kind else {
+            panic!("expected method");
+        };
+        let StmtKind::If { condition, .. } = &body[1].kind else {
+            panic!("expected if");
+        };
+        assert!(matches!(condition.kind, ExprKind::TypeTest { .. }));
     }
 
     #[test]

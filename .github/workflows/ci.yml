@@ -75,7 +75,7 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP"
           "$GITHUB_WORKSPACE/target/debug/yanxu" 兼容 "$GITHUB_WORKSPACE/compat" --json > compatibility.json
-          jq -e '.schema_version == 1 and (.cases | length) >= 10 and ([.cases[].passed] | all)' compatibility.json >/dev/null
+          jq -e '.schema_version == 1 and (.cases | length) >= 11 and ([.cases[].passed] | all)' compatibility.json >/dev/null
       - name: 校验标准库机器清单
         shell: bash
         run: |

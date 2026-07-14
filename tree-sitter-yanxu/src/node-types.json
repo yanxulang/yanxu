@@ -196,7 +196,15 @@
           "named": true
         },
         {
+          "type": "super_expression",
+          "named": true
+        },
+        {
           "type": "tuple",
+          "named": true
+        },
+        {
+          "type": "type_test_expression",
           "named": true
         },
         {
@@ -945,6 +953,21 @@
     }
   },
   {
+    "type": "super_expression",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "throw_statement",
     "named": true,
     "fields": {},
@@ -1084,6 +1107,25 @@
       "multiple": false,
       "required": true,
       "types": [
+        {
+          "type": "type",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "type_test_expression",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "expression",
+          "named": true
+        },
         {
           "type": "type",
           "named": true
@@ -1386,11 +1428,19 @@
     "named": false
   },
   {
+    "type": "是",
+    "named": false
+  },
+  {
     "type": "此",
     "named": false
   },
   {
     "type": "法",
+    "named": false
+  },
+  {
+    "type": "父",
     "named": false
   },
   {

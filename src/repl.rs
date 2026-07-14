@@ -92,6 +92,8 @@ pub fn completions(prefix: &str, history: &[String]) -> Vec<String> {
         "候",
         "法",
         "类",
+        "承",
+        "父",
         "协",
         "纳",
         "域",
@@ -108,6 +110,7 @@ pub fn completions(prefix: &str, history: &[String]) -> Vec<String> {
         "真",
         "假",
         "空",
+        "是",
         "长度",
         "类型",
         "范围",
@@ -258,6 +261,8 @@ mod tests {
     fn completes_keywords_and_history_words() {
         let items = completions("法", &["法 求和（）".into()]);
         assert!(items.contains(&"法".into()));
+        assert!(completions("父", &[]).contains(&"父".into()));
+        assert!(completions("是", &[]).contains(&"是".into()));
     }
 
     #[test]

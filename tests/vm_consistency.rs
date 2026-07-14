@@ -137,6 +137,25 @@ fn shared_language_semantics_match_the_tree_interpreter() {
             "#,
         ),
         (
+            "父类调用、继承类型与原生类型判断",
+            r#"
+                协 可名 则 法 自述（）：文；终
+                类 生灵 则
+                    公 域 名：文；
+                    法 初始化（名：文）则 置 此.名 为 名；终
+                    法 自述（）：文 则 归「生灵：」加 此.名；终
+                终
+                类 人 承 生灵 纳 可名 则
+                    法 初始化（名：文）则 父.初始化（名）；终
+                    法 自述（）：文 则 归 父.自述（）加「：人」；终
+                终
+                定 子：人 为 人（「子路」）；
+                定 长者：生灵 为 子；
+                言 子.自述（）；言 长者 是 生灵；言 子 是 可名；
+                言 子 是 文；言【1，2】是 列<数>；
+            "#,
+        ),
+        (
             "结构化错误",
             r#"
                 法 失败（）：数 则 归 1 除 0；终
@@ -410,13 +429,21 @@ fn network_standard_module_matches_both_runtimes() {
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).unwrap();
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n\xe5\x96\x84\xe5\x93\x89")
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\n\xe5\x96\x84\xe5\x93\x89\r\n0\r\n\r\n")
                 .unwrap();
         }
     });
-    let source = format!("引「标准:网络」为 网络；言 网络.获取（「http://{address}/问」）；");
+    let source = format!(
+        r#"
+        引「标准:网络」为 网络；
+        定 应：典<文,任意> 为 网络.请求（「GET」，「http://{address}/问」，「」，1000，64）；
+        言 应【「正文」】；言 应【「状态」】；
+        试 则 网络.请求（「GET」，「ftp://example.com」，「」，1000，64）；
+        救 错 则 言 错.代码；言 错.类别；终
+        "#
+    );
     let (tree, vm) = execute_both(&source, Path::new("."));
-    assert_eq!(tree, ["善哉"]);
+    assert_eq!(tree, ["善哉", "200", "NET_URL", "网络"]);
     assert_eq!(tree, vm);
     server.join().unwrap();
 }

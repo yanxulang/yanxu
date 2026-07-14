@@ -53,6 +53,8 @@ pub enum TokenKind {
     Static,
     Public,
     This,
+    Super,
+    Is,
     Import,
     As,
     Return,

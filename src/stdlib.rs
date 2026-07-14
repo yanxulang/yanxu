@@ -8,8 +8,6 @@ use base64::Engine as _;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::{Component, Path, PathBuf};
 use url::Url;
 
@@ -18,6 +16,7 @@ pub const API_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub fn api_manifest() -> Result<serde_json::Value, serde_json::Error> {
     serde_json::from_str(include_str!("../stdlib/api-v1.json"))
 }
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
 pub fn path_join(left: &str, right: &str) -> String {
@@ -724,65 +723,189 @@ pub fn csv_stringify(rows: &[Vec<String>]) -> String {
         .join("\n")
 }
 
-/// 发送一个小型 HTTP/1.1 请求。当前刻意只支持明文 `http://` 与非分块响应；
-/// 这些限制会以明确错误返回，避免把 TLS 或分块内容误作成功结果。
-pub fn http_request(method: &str, url: &str, body: Option<&str>) -> Result<String, String> {
-    let target = url
-        .strip_prefix("http://")
-        .ok_or_else(|| "网络模块当前仅支持 http:// 地址".to_string())?;
-    let (authority, path) = target
-        .split_once('/')
-        .map_or((target, "/".into()), |(authority, path)| {
-            (authority, format!("/{path}"))
-        });
-    let (host, port) = authority
-        .rsplit_once(':')
-        .map_or((authority, 80), |(host, port)| {
-            (host, port.parse::<u16>().unwrap_or(0))
-        });
-    if host.is_empty() || port == 0 {
-        return Err("HTTP 地址之主机或端口无效".into());
+pub const HTTP_DEFAULT_TIMEOUT_MILLIS: u64 = 10_000;
+pub const HTTP_DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl NetworkError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
     }
-    let mut stream = TcpStream::connect((host, port))
-        .map_err(|error| format!("不能连接 {authority}：{error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| format!("不能设置网络超时：{error}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| format!("不能设置网络超时：{error}"))?;
-    let body = body.unwrap_or("");
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("HTTP 请求写入失败：{error}"))?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| format!("HTTP 响应读取失败：{error}"))?;
-    let response = String::from_utf8(response).map_err(|_| "HTTP 响应不是 UTF-8 文字")?;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "HTTP 响应缺少首部终止符".to_string())?;
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|status| status.parse::<u16>().ok())
-        .ok_or_else(|| "HTTP 响应状态行无效".to_string())?;
-    if !(200..300).contains(&status) {
-        return Err(format!("HTTP 请求失败，状态 {status}"));
+
+    pub const fn category(&self) -> &'static str {
+        "网络"
     }
-    if headers
-        .lines()
-        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
+}
+
+impl std::fmt::Display for NetworkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "[{}] {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for NetworkError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+pub fn http_request(method: &str, url: &str, body: Option<&str>) -> Result<String, NetworkError> {
+    http_request_with_options(
+        method,
+        url,
+        body,
+        HTTP_DEFAULT_TIMEOUT_MILLIS,
+        HTTP_DEFAULT_MAX_BYTES,
+    )
+    .map(|response| response.body)
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn http_request_with_options(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    timeout_millis: u64,
+    max_bytes: u64,
+) -> Result<HttpResponse, NetworkError> {
+    use ureq::ResponseExt as _;
+
+    let parsed = Url::parse(url)
+        .map_err(|error| NetworkError::new("NET_URL", format!("网络地址无效：{error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(NetworkError::new(
+            "NET_URL",
+            "网络地址须使用 http:// 或 https:// 且含主机",
+        ));
+    }
+    if timeout_millis == 0 {
+        return Err(NetworkError::new("NET_URL", "网络超时须大于零毫秒"));
+    }
+    if max_bytes == 0 {
+        return Err(NetworkError::new("NET_LIMIT", "响应大小上限须大于零字节"));
+    }
+    let method = ureq::http::Method::from_bytes(method.as_bytes())
+        .map_err(|error| NetworkError::new("NET_PROTOCOL", format!("HTTP 方法无效：{error}")))?;
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(timeout_millis)))
+        .build()
+        .new_agent();
+    let request = ureq::http::Request::builder()
+        .method(method)
+        .uri(parsed.as_str())
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("accept", "text/plain, application/json;q=0.9, */*;q=0.1")
+        .body(body.unwrap_or("").as_bytes())
+        .map_err(|error| NetworkError::new("NET_URL", format!("不能建立 HTTP 请求：{error}")))?;
+    let mut response = agent.run(request).map_err(network_error_from_ureq)?;
+    let status = response.status().as_u16();
+    let final_url = response.get_uri().to_string();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or("<非文字首部>").to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if response
+        .body()
+        .content_length()
+        .is_some_and(|length| length > max_bytes)
     {
-        return Err("暂不支持分块 HTTP 响应".into());
+        return Err(NetworkError::new(
+            "NET_LIMIT",
+            format!("HTTP 响应超过 {max_bytes} 字节上限"),
+        ));
     }
-    Ok(body.into())
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(max_bytes)
+        .read_to_vec()
+        .map_err(network_error_from_ureq)?;
+    let body = String::from_utf8(bytes)
+        .map_err(|_| NetworkError::new("NET_UTF8", "HTTP 响应正文不是 UTF-8 文字"))?;
+    Ok(HttpResponse {
+        status,
+        url: final_url,
+        headers,
+        body,
+    })
+}
+
+#[cfg(target_family = "wasm")]
+pub fn http_request_with_options(
+    _method: &str,
+    _url: &str,
+    _body: Option<&str>,
+    _timeout_millis: u64,
+    _max_bytes: u64,
+) -> Result<HttpResponse, NetworkError> {
+    Err(NetworkError::new(
+        "NET_PROTOCOL",
+        "WASI 运行时未授予原生网络传输能力",
+    ))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn network_error_from_ureq(error: ureq::Error) -> NetworkError {
+    use std::io::ErrorKind;
+
+    let code = match &error {
+        ureq::Error::BadUri(_) | ureq::Error::Http(_) | ureq::Error::InvalidProxyUrl => "NET_URL",
+        ureq::Error::HostNotFound => "NET_DNS",
+        ureq::Error::Timeout(_) => "NET_TIMEOUT",
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) => "NET_TLS",
+        ureq::Error::ConnectionFailed => "NET_CONNECT",
+        ureq::Error::BodyExceedsLimit(_) => "NET_LIMIT",
+        ureq::Error::StatusCode(_) => "NET_STATUS",
+        ureq::Error::Protocol(_) | ureq::Error::RedirectFailed | ureq::Error::TooManyRedirects => {
+            "NET_PROTOCOL"
+        }
+        ureq::Error::Io(io_error)
+            if matches!(io_error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+        {
+            "NET_TIMEOUT"
+        }
+        ureq::Error::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::NotConnected
+                    | ErrorKind::AddrNotAvailable
+            ) =>
+        {
+            "NET_CONNECT"
+        }
+        ureq::Error::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                ErrorKind::BrokenPipe | ErrorKind::WriteZero
+            ) =>
+        {
+            "NET_WRITE"
+        }
+        ureq::Error::Io(_) => "NET_READ",
+        _ => "NET_PROTOCOL",
+    };
+    NetworkError::new(code, error.to_string())
 }
 
 #[cfg(test)]
@@ -919,10 +1042,115 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_http_schemes_before_network_access() {
-        assert_eq!(
-            http_request("GET", "https://example.com", None).unwrap_err(),
-            "网络模块当前仅支持 http:// 地址"
-        );
+        let error = http_request("GET", "ftp://example.com", None).unwrap_err();
+        assert_eq!(error.code, "NET_URL");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn decodes_chunked_http_and_enforces_response_limits() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\n\xe5\x96\x84\xe5\x93\x89\r\n0\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let response =
+            http_request_with_options("GET", &format!("http://{address}/chunked"), None, 1_000, 64)
+                .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.body, "善哉");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nyanxu!",
+                )
+                .unwrap();
+        });
+        let error =
+            http_request_with_options("GET", &format!("http://{address}/large"), None, 1_000, 5)
+                .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.code, "NET_LIMIT");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn applies_an_end_to_end_network_timeout() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        let error =
+            http_request_with_options("GET", &format!("http://{address}/slow"), None, 20, 64)
+                .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.code, "NET_TIMEOUT");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn classifies_http_status_and_non_utf8_responses() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let error =
+            http_request_with_options("GET", &format!("http://{address}/missing"), None, 1_000, 64)
+                .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.code, "NET_STATUS");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\xff\xfe",
+                )
+                .unwrap();
+        });
+        let error =
+            http_request_with_options("GET", &format!("http://{address}/binary"), None, 1_000, 64)
+                .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.code, "NET_UTF8");
     }
 
     #[test]

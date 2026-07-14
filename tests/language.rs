@@ -152,6 +152,47 @@ fn classes_reuse_parent_methods() {
 }
 
 #[test]
+fn type_checker_accepts_super_calls_subtyping_and_type_narrowing() {
+    let source = r#"
+        类 生灵 则
+            法 自述（）：文 则 归「生灵」；终
+        终
+        类 人 承 生灵 则
+            法 自述（）：文 则 归 父.自述（）加「人」；终
+        终
+        定 子：生灵 为 人（）；
+        令 值：数|文 为「言序」；
+        若 值 是 文 则
+            定 复制：文 为 值 加「语言」；
+        否则
+            定 数值：数 为 值 加 1；
+        终
+    "#;
+    let statements = yanxu::parse(source).unwrap();
+    yanxu::type_checker::check(&statements).unwrap();
+}
+
+#[test]
+fn type_checker_rejects_incompatible_overrides_and_super_usage() {
+    let bad_override = yanxu::parse(
+        r#"
+            类 生灵 则 法 自述（值：文）：文 则 归 值；终 终
+            类 人 承 生灵 则 法 自述（值：数）：文 则 归「坏」；终 终
+        "#,
+    )
+    .unwrap();
+    let errors = yanxu::type_checker::check(&bad_override).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.message.contains("参数或归值须与父类签名一致"))
+    );
+
+    let error = yanxu::parse("类 独 则 法 坏（）：空 则 父.坏（）；终 终").unwrap_err();
+    assert!(error.to_string().contains("父"));
+}
+
+#[test]
 fn static_checker_reads_module_api_without_executing_module() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path = root.join("tests/fixtures/类型入口.yx");

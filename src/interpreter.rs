@@ -47,6 +47,7 @@ enum GuardedNative {
     ReadDirectory,
     HttpGet,
     HttpPost,
+    HttpRequest,
     EnvRead,
     EnvExists,
 }
@@ -154,6 +155,7 @@ impl Value {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
+    pub code: &'static str,
     pub message: String,
     pub frames: Vec<String>,
     pub span: Option<Span>,
@@ -162,9 +164,27 @@ pub struct RuntimeError {
 impl RuntimeError {
     fn new(message: impl Into<String>) -> Self {
         Self {
+            code: "RUN000",
             message: message.into(),
             frames: Vec::new(),
             span: None,
+        }
+    }
+
+    fn network(error: crate::stdlib::NetworkError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            frames: Vec::new(),
+            span: None,
+        }
+    }
+
+    fn category(&self) -> &'static str {
+        if self.code.starts_with("NET_") {
+            "网络"
+        } else {
+            "运行"
         }
     }
 
@@ -184,9 +204,13 @@ impl RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(span) = &self.span {
-            write!(f, "{}", span.render("运行有误", &self.message))?;
+            write!(
+                f,
+                "{}",
+                span.render("运行有误", &format!("[{}] {}", self.code, self.message))
+            )?;
         } else {
-            write!(f, "运行有误：{}", self.message)?;
+            write!(f, "运行有误：[{}] {}", self.code, self.message)?;
         }
         for frame in &self.frames {
             write!(f, "\n  经 {frame}")?;
@@ -322,12 +346,23 @@ impl YanxuClass {
                 .is_some_and(|class| class.has_instance_fields())
     }
 
-    fn conforms_to(&self, protocol: &str) -> bool {
-        self.protocols.contains(protocol)
+    fn is_a(&self, type_name: &str) -> bool {
+        self.name == type_name
+            || self.protocols.contains(type_name)
             || self
                 .superclass
                 .as_ref()
-                .is_some_and(|class| class.conforms_to(protocol))
+                .is_some_and(|class| class.is_a(type_name))
+    }
+
+    fn superclass_of(&self, owner: &str) -> Option<Rc<YanxuClass>> {
+        if self.name == owner {
+            self.superclass.clone()
+        } else {
+            self.superclass
+                .as_ref()
+                .and_then(|class| class.superclass_of(owner))
+        }
     }
 
     fn initial_fields(&self) -> HashMap<String, Value> {
@@ -421,6 +456,8 @@ pub enum YanxuIterator {
 }
 
 pub struct YanxuErrorValue {
+    code: &'static str,
+    category: String,
     message: String,
     frames: Vec<String>,
     span: Option<Span>,
@@ -1071,6 +1108,8 @@ impl Interpreter {
                 Err(error) => {
                     let catch_env = Environment::child(env);
                     let error_value = Value::Error(Rc::new(YanxuErrorValue {
+                        code: error.code,
+                        category: error.category().into(),
                         message: error.message,
                         frames: error.frames,
                         span: error.span,
@@ -1085,6 +1124,7 @@ impl Interpreter {
                 let value = self.evaluate(expr, env)?;
                 match value {
                     Value::Error(error) => Err(RuntimeError {
+                        code: error.code,
                         message: error.message.clone(),
                         frames: error.frames.clone(),
                         span: error.span.clone(),
@@ -1139,6 +1179,34 @@ impl Interpreter {
             }),
             ExprKind::Variable(name) => env.borrow().get(name),
             ExprKind::This => env.borrow().get("此"),
+            ExprKind::Super { method } => {
+                let Value::Instance(instance) = env.borrow().get("此")? else {
+                    return Err(RuntimeError::new("“父”只可用于实例法"));
+                };
+                let owner = self
+                    .access_classes
+                    .last()
+                    .ok_or_else(|| RuntimeError::new("“父”只可用于类之法内"))?;
+                let parent = instance
+                    .borrow()
+                    .class
+                    .superclass_of(owner)
+                    .ok_or_else(|| RuntimeError::new(format!("类“{owner}”没有父类")))?;
+                let spec = parent.method_spec(method).ok_or_else(|| {
+                    RuntimeError::new(format!("父类“{}”无方法“{method}”", parent.name))
+                })?;
+                if spec.is_static {
+                    return Err(RuntimeError::new(format!(
+                        "父类方法“{method}”乃静法，不可绑定此实例"
+                    )));
+                }
+                if spec.visibility == Visibility::Private && spec.owner != *owner {
+                    return Err(RuntimeError::new(format!(
+                        "父类私法“{method}”不可由子类调用"
+                    )));
+                }
+                Ok(Value::Function(Rc::new(spec.function.bind(instance))))
+            }
             ExprKind::List(items) => {
                 let values = items
                     .iter()
@@ -1192,6 +1260,10 @@ impl Interpreter {
                 }
                 let right = self.evaluate(right, env)?;
                 self.binary(left, operator, right)
+            }
+            ExprKind::TypeTest { value, type_ref } => {
+                let value = self.evaluate(value, env)?;
+                Ok(Value::Bool(value_matches_type(&value, &type_ref.kind)))
             }
             ExprKind::Call { callee, arguments } => {
                 let callee = self.evaluate(callee, env.clone())?;
@@ -1495,14 +1567,35 @@ impl Interpreter {
             GuardedNative::HttpGet => {
                 self.permissions
                     .check_network(string_argument(arguments, 0, "网络.获取")?)
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    .map_err(|error| {
+                        RuntimeError::network(crate::stdlib::NetworkError::new(
+                            "NET_PERMISSION",
+                            error.to_string(),
+                        ))
+                    })?;
                 native_http_get(arguments)
             }
             GuardedNative::HttpPost => {
                 self.permissions
                     .check_network(string_argument(arguments, 0, "网络.发文")?)
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    .map_err(|error| {
+                        RuntimeError::network(crate::stdlib::NetworkError::new(
+                            "NET_PERMISSION",
+                            error.to_string(),
+                        ))
+                    })?;
                 native_http_post(arguments)
+            }
+            GuardedNative::HttpRequest => {
+                self.permissions
+                    .check_network(string_argument(arguments, 1, "网络.请求")?)
+                    .map_err(|error| {
+                        RuntimeError::network(crate::stdlib::NetworkError::new(
+                            "NET_PERMISSION",
+                            error.to_string(),
+                        ))
+                    })?;
+                native_http_request(arguments)
             }
             GuardedNative::EnvRead => {
                 self.permissions
@@ -1721,6 +1814,8 @@ impl Interpreter {
                 })
             }
             Value::Error(error) => match name {
+                "代码" => Ok(Value::String(error.code.into())),
+                "类别" => Ok(Value::String(error.category.clone())),
                 "消息" => Ok(Value::String(error.message.clone())),
                 "踪迹" => Ok(Value::List(Rc::new(RefCell::new(
                     error.frames.iter().cloned().map(Value::String).collect(),
@@ -2308,6 +2403,13 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
                 "发文",
                 2,
                 NativeKind::Guarded(GuardedNative::HttpPost),
+            );
+            define_export_intrinsic(
+                &environment,
+                &mut exports,
+                "请求",
+                5,
+                NativeKind::Guarded(GuardedNative::HttpRequest),
             );
         }
         "测试" => {
@@ -3271,6 +3373,37 @@ fn native_http_post(arguments: &[Value]) -> Result<Value, RuntimeError> {
     .map(Value::String)
 }
 
+fn native_http_request(arguments: &[Value]) -> Result<Value, RuntimeError> {
+    let timeout = positive_u64_argument(arguments, 3, "网络.请求", "超时毫秒")?;
+    let max_bytes = positive_u64_argument(arguments, 4, "网络.请求", "最大字节")?;
+    let response = crate::stdlib::http_request_with_options(
+        string_argument(arguments, 0, "网络.请求")?,
+        string_argument(arguments, 1, "网络.请求")?,
+        Some(string_argument(arguments, 2, "网络.请求")?),
+        timeout,
+        max_bytes,
+    )
+    .map_err(RuntimeError::network)?;
+    let headers = Value::Map(Rc::new(RefCell::new(YanxuMap {
+        entries: response
+            .headers
+            .into_iter()
+            .map(|(name, value)| (Value::String(name), Value::String(value)))
+            .collect(),
+    })));
+    Ok(Value::Map(Rc::new(RefCell::new(YanxuMap {
+        entries: vec![
+            ("状态".into(), Value::Number(f64::from(response.status))),
+            ("地址".into(), Value::String(response.url)),
+            ("首部".into(), headers),
+            ("正文".into(), Value::String(response.body)),
+        ]
+        .into_iter()
+        .map(|(key, value)| (Value::String(key), value))
+        .collect(),
+    }))))
+}
+
 fn native_assert(arguments: &[Value]) -> Result<Value, RuntimeError> {
     if arguments[0].truthy() {
         Ok(Value::Nil)
@@ -3401,6 +3534,21 @@ fn number_argument(arguments: &[Value], index: usize, function: &str) -> Result<
             value.type_name()
         ))),
     }
+}
+
+fn positive_u64_argument(
+    arguments: &[Value],
+    index: usize,
+    function: &str,
+    name: &str,
+) -> Result<u64, RuntimeError> {
+    let number = number_argument(arguments, index, function)?;
+    if number <= 0.0 || number.fract() != 0.0 || number > 9_007_199_254_740_991.0 {
+        return Err(RuntimeError::new(format!(
+            "“{function}”之{name}须为安全正整数"
+        )));
+    }
+    Ok(number as u64)
 }
 
 fn string_argument<'a>(
@@ -3561,7 +3709,7 @@ fn value_to_json(value: &Value) -> Result<serde_json::Value, RuntimeError> {
 }
 
 fn http_request(method: &str, url: &str, body: Option<&str>) -> Result<String, RuntimeError> {
-    crate::stdlib::http_request(method, url, body).map_err(RuntimeError::new)
+    crate::stdlib::http_request(method, url, body).map_err(RuntimeError::network)
 }
 
 fn ensure_type(
@@ -3626,8 +3774,7 @@ fn value_matches_type(value: &Value, expected: &TypeKind) -> bool {
             "误" => matches!(value, Value::Error(_)),
             "任务" => matches!(value, Value::Task(_)),
             class_name => matches!(value, Value::Instance(instance)
-            if instance.borrow().class.name == class_name
-                || instance.borrow().class.conforms_to(class_name)),
+            if instance.borrow().class.is_a(class_name)),
         },
     }
 }
@@ -4171,8 +4318,8 @@ mod tests {
         server.join().unwrap();
         assert_eq!(network.output(), &["yanxu!"]);
 
-        let error = run_with(&mut network, "网络.获取（「https://example.com」）；").unwrap_err();
-        assert!(error.to_string().contains("仅支持 http://"));
+        let error = run_with(&mut network, "网络.获取（「ftp://example.com」）；").unwrap_err();
+        assert!(error.to_string().contains("NET_URL"));
         fs::remove_dir_all(root).ok();
     }
 

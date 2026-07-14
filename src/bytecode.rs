@@ -97,7 +97,9 @@ pub enum Instruction {
     Slice,
     SetIndex,
     GetProperty(String),
+    GetSuper(String),
     SetProperty(String),
+    IsType(String),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
     Jump(usize),
@@ -572,6 +574,12 @@ impl Compiler {
             ExprKind::This => {
                 self.emit(Instruction::Load("此".into()), expression.span.clone());
             }
+            ExprKind::Super { method } => {
+                self.emit(
+                    Instruction::GetSuper(method.clone()),
+                    expression.span.clone(),
+                );
+            }
             ExprKind::List(items) | ExprKind::Tuple(items) => {
                 for item in items {
                     self.expression(item)?;
@@ -633,6 +641,13 @@ impl Compiler {
                         TokenKind::LessEqual => Instruction::LessEqual,
                         _ => unreachable!("parser limits binary operators"),
                     },
+                    expression.span.clone(),
+                );
+            }
+            ExprKind::TypeTest { value, type_ref } => {
+                self.expression(value)?;
+                self.emit(
+                    Instruction::IsType(type_ref.name.clone()),
                     expression.span.clone(),
                 );
             }

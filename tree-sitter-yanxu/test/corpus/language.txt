@@ -165,3 +165,64 @@
     (throw_statement
       (expression
         (identifier)))))
+
+==================
+父类调用与类型判断
+==================
+
+类 鹤 承 生灵 则
+    法 自述（）：文 则
+        归 父.自述（） 加 「，鹤」；
+    终
+终
+定 来客：生灵 为 鹤（）；
+若 来客 是 鹤|空 则
+    言 来客；
+终
+
+---
+
+(source_file
+  (class_declaration
+    (identifier)
+    (identifier)
+    (class_member
+      (method_declaration
+        (identifier)
+        (type_annotation
+          (type
+            (named_type
+              (identifier))))
+        (return_statement
+          (expression
+            (binary_expression
+              (expression
+                (call_expression
+                  (expression
+                    (super_expression
+                      (identifier)))))
+              (expression
+                (string))))))))
+  (declaration
+    (identifier)
+    (type_annotation
+      (type
+        (named_type
+          (identifier))))
+    (expression
+      (call_expression
+        (expression
+          (identifier)))))
+  (if_statement
+    (expression
+      (type_test_expression
+        (expression
+          (identifier))
+        (type
+          (union_type
+            (named_type
+              (identifier))
+            (named_type)))))
+    (print_statement
+      (expression
+        (identifier)))))

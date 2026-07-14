@@ -288,6 +288,8 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "静" => TokenKind::Static,
         "公" => TokenKind::Public,
         "此" => TokenKind::This,
+        "父" => TokenKind::Super,
+        "是" => TokenKind::Is,
         "引" => TokenKind::Import,
         "作" => TokenKind::As,
         "归" => TokenKind::Return,

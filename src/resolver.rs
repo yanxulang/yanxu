@@ -21,6 +21,7 @@ pub fn resolve(statements: &[Stmt]) -> Result<(), SemanticError> {
     Resolver {
         function_depth: 0,
         class_depth: 0,
+        class_has_superclass: Vec::new(),
     }
     .scope(statements, &[])
 }
@@ -28,6 +29,7 @@ pub fn resolve(statements: &[Stmt]) -> Result<(), SemanticError> {
 struct Resolver {
     function_depth: usize,
     class_depth: usize,
+    class_has_superclass: Vec<bool>,
 }
 
 impl Resolver {
@@ -131,7 +133,9 @@ impl Resolver {
                     }
                 }
                 self.class_depth += 1;
+                self.class_has_superclass.push(superclass.is_some());
                 let result = methods.iter().try_for_each(|method| self.statement(method));
+                self.class_has_superclass.pop();
                 self.class_depth -= 1;
                 result
             }
@@ -200,6 +204,15 @@ impl Resolver {
                     Ok(())
                 }
             }
+            ExprKind::Super { .. } => {
+                if self.class_depth == 0 {
+                    Err(self.error("“父”只能用于类之法内", expression.span.clone()))
+                } else if !self.class_has_superclass.last().copied().unwrap_or(false) {
+                    Err(self.error("无父类之类不可使用“父”", expression.span.clone()))
+                } else {
+                    Ok(())
+                }
+            }
             ExprKind::List(items) | ExprKind::Tuple(items) => {
                 items.iter().try_for_each(|item| self.expression(item))
             }
@@ -213,6 +226,7 @@ impl Resolver {
                 self.expression(left)?;
                 self.expression(right)
             }
+            ExprKind::TypeTest { value, .. } => self.expression(value),
             ExprKind::Call { callee, arguments } => {
                 self.expression(callee)?;
                 arguments

@@ -54,8 +54,9 @@
     {
       "name": "网络", "permissions": ["network"], "platforms": ["native"], "deterministic": false,
       "members": [
-        {"name":"获取","signature":"法（文）：文","errors":["权限","仅 http","HTTP 状态","传输","非 UTF-8"]},
-        {"name":"发文","signature":"法（文，文）：文","errors":["权限","仅 http","HTTP 状态","传输","非 UTF-8"]}
+        {"name":"获取","signature":"法（文）：文","errors":["NET_PERMISSION","NET_URL","NET_DNS","NET_CONNECT","NET_TLS","NET_TIMEOUT","NET_READ","NET_LIMIT","NET_PROTOCOL","NET_STATUS","NET_UTF8"]},
+        {"name":"发文","signature":"法（文，文）：文","errors":["NET_PERMISSION","NET_URL","NET_DNS","NET_CONNECT","NET_TLS","NET_TIMEOUT","NET_WRITE","NET_READ","NET_LIMIT","NET_PROTOCOL","NET_STATUS","NET_UTF8"]},
+        {"name":"请求","signature":"法（方法：文，地址：文，正文：文，超时毫秒：数，最大字节：数）：典<文，任意>","errors":["NET_PERMISSION","NET_URL","NET_DNS","NET_CONNECT","NET_TLS","NET_TIMEOUT","NET_WRITE","NET_READ","NET_LIMIT","NET_PROTOCOL","NET_STATUS","NET_UTF8"]}
       ]
     },
     {

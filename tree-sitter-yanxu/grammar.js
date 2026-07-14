@@ -59,14 +59,16 @@ module.exports = grammar({
     _type_primary: $ => choice($.nullable_type, $.generic_type, $.function_type, $.named_type),
     nullable_type: $ => prec(3, seq(choice($.generic_type, $.function_type, $.named_type), '?')),
     generic_type: $ => prec(2, seq($.identifier, '<', commaSep1($.type), '>')),
-    function_type: $ => seq('法', '（', optional(commaSep1($.type)), '）', '：', $.type),
+    function_type: $ => prec(4, seq('法', '（', optional(commaSep1($.type)), '）', '：', $.type)),
     named_type: $ => choice($.identifier, '法', '类', '空'),
 
     expression: $ => choice(
-      $.identifier, $.number, $.string, '真', '假', '空', '此',
+      $.identifier, $.number, $.string, '真', '假', '空', '此', $.super_expression,
       $.list, $.tuple, $.map, $.unary_expression, $.await_expression, $.binary_expression,
-      $.call_expression, $.member_expression, $.index_expression
+      $.type_test_expression, $.call_expression, $.member_expression, $.index_expression
     ),
+    super_expression: $ => prec(9, seq('父', '.', $.identifier)),
+    type_test_expression: $ => prec.left(3, seq($.expression, '是', $.type)),
     list: $ => seq('【', optional(commaSep($.expression)), '】'),
     tuple: $ => seq('（', commaSep1($.expression), '）'),
     map: $ => seq('{', optional(commaSep(seq($.expression, '：', $.expression))), '}'),

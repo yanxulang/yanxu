@@ -117,6 +117,7 @@ impl fmt::Display for VmValue {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmError {
+    pub code: &'static str,
     pub message: String,
     pub span: Span,
     pub frames: Vec<String>,
@@ -127,7 +128,8 @@ impl fmt::Display for VmError {
         write!(
             formatter,
             "{}",
-            self.span.render("VM 运行有误", &self.message)
+            self.span
+                .render("VM 运行有误", &format!("[{}] {}", self.code, self.message))
         )?;
         for frame in &self.frames {
             write!(formatter, "\n  经 {frame}")?;
@@ -137,6 +139,16 @@ impl fmt::Display for VmError {
 }
 
 impl std::error::Error for VmError {}
+
+impl VmError {
+    fn category(&self) -> &'static str {
+        if self.code.starts_with("NET_") {
+            "网络"
+        } else {
+            "运行"
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Binding {
@@ -252,12 +264,23 @@ impl VmClass {
         }
     }
 
-    fn conforms(&self, protocol: &str) -> bool {
-        self.protocols.contains(protocol)
+    fn is_a(&self, type_name: &str) -> bool {
+        self.name == type_name
+            || self.protocols.contains(type_name)
             || self
                 .superclass
                 .as_ref()
-                .is_some_and(|class| class.conforms(protocol))
+                .is_some_and(|class| class.is_a(type_name))
+    }
+
+    fn superclass_of(&self, owner: &str) -> Option<Rc<VmClass>> {
+        if self.name == owner {
+            self.superclass.clone()
+        } else {
+            self.superclass
+                .as_ref()
+                .and_then(|class| class.superclass_of(owner))
+        }
     }
 }
 
@@ -273,6 +296,8 @@ pub struct VmModule {
 }
 
 pub struct VmErrorValue {
+    code: &'static str,
+    category: String,
     message: String,
     frames: Vec<String>,
     span: Span,
@@ -389,6 +414,7 @@ enum StandardNative {
     JsonStringify,
     HttpGet,
     HttpPost,
+    HttpRequest,
     Assert,
     AssertEqual,
     AssertNotNil,
@@ -706,6 +732,8 @@ impl Vm {
                         current_env = handler.environment;
                         ip = handler.target;
                         pending_error = Some(VmValue::Error(Rc::new(VmErrorValue {
+                            code: runtime_error.code,
+                            category: runtime_error.category().into(),
                             message: runtime_error.message,
                             frames: runtime_error.frames,
                             span: runtime_error.span,
@@ -864,11 +892,20 @@ impl Vm {
                 let value = self.get_property(object, &name, span, offset)?;
                 self.stack.push(value);
             }
+            Instruction::GetSuper(name) => {
+                let value = self.get_super(environment, &name, span)?;
+                self.stack.push(value);
+            }
             Instruction::SetProperty(name) => {
                 let value = self.pop(span)?;
                 let object = self.pop(span)?;
                 self.set_property(object, &name, value.clone(), span, offset)?;
                 *last = value;
+            }
+            Instruction::IsType(type_name) => {
+                let value = self.pop(span)?;
+                self.stack
+                    .push(VmValue::Bool(vm_value_matches_type(&value, &type_name)));
             }
             Instruction::JumpIfFalse(target) => {
                 if !self.peek(span)?.truthy() {
@@ -1314,6 +1351,8 @@ impl Vm {
                 value.ok_or_else(|| error(span, format!("模块“{}”未导出“{name}”", module.name)))
             }
             VmValue::Error(value) => match name {
+                "代码" => Ok(VmValue::String(value.code.into())),
+                "类别" => Ok(VmValue::String(value.category.clone())),
                 "消息" => Ok(VmValue::String(value.message.clone())),
                 "踪迹" => Ok(VmValue::List(Rc::new(RefCell::new(
                     value.frames.iter().cloned().map(VmValue::String).collect(),
@@ -1326,6 +1365,39 @@ impl Vm {
                 format!("{}无可访问之成员“{name}”", value.type_name()),
             )),
         }
+    }
+
+    fn get_super(&self, environment: &EnvRef, name: &str, span: &Span) -> Result<VmValue, VmError> {
+        let owner = self
+            .frames
+            .last()
+            .and_then(|frame| frame.owner_class.as_deref())
+            .ok_or_else(|| error(span, "“父”只可用于类之法内"))?;
+        let instance = environment
+            .borrow()
+            .get("此")
+            .ok_or_else(|| error(span, "“父”只可用于实例法"))?;
+        let VmValue::Instance(instance) = instance else {
+            return Err(error(span, "“父”只可用于实例法"));
+        };
+        let parent = instance
+            .borrow()
+            .class
+            .superclass_of(owner)
+            .ok_or_else(|| error(span, format!("类“{owner}”没有父类")))?;
+        let method = parent
+            .method(name)
+            .ok_or_else(|| error(span, format!("父类“{}”无方法“{name}”", parent.name)))?;
+        if method.closure.prototype.is_static {
+            return Err(error(
+                span,
+                format!("父类方法“{name}”乃静法，不可绑定此实例"),
+            ));
+        }
+        if method.closure.prototype.visibility == Visibility::Private && method.owner != owner {
+            return Err(error(span, format!("父类私法“{name}”不可由子类调用")));
+        }
+        Ok(VmValue::BoundMethod(method.closure.clone(), instance))
     }
 
     fn set_index(
@@ -2087,28 +2159,85 @@ impl Vm {
                 "GET",
                 {
                     let url = vm_string(&arguments[0], "网络.获取", span)?;
-                    self.permissions
-                        .check_network(url)
-                        .map_err(|permission| error(span, permission.to_string()))?;
+                    self.permissions.check_network(url).map_err(|permission| {
+                        network_error(
+                            span,
+                            crate::stdlib::NetworkError::new(
+                                "NET_PERMISSION",
+                                permission.to_string(),
+                            ),
+                        )
+                    })?;
                     url
                 },
                 None,
             )
             .map(VmValue::String)
-            .map_err(|message| error(span, message)),
+            .map_err(|source| network_error(span, source)),
             Std::HttpPost => crate::stdlib::http_request(
                 "POST",
                 {
                     let url = vm_string(&arguments[0], "网络.发文", span)?;
-                    self.permissions
-                        .check_network(url)
-                        .map_err(|permission| error(span, permission.to_string()))?;
+                    self.permissions.check_network(url).map_err(|permission| {
+                        network_error(
+                            span,
+                            crate::stdlib::NetworkError::new(
+                                "NET_PERMISSION",
+                                permission.to_string(),
+                            ),
+                        )
+                    })?;
                     url
                 },
                 Some(vm_string(&arguments[1], "网络.发文", span)?),
             )
             .map(VmValue::String)
-            .map_err(|message| error(span, message)),
+            .map_err(|source| network_error(span, source)),
+            Std::HttpRequest => {
+                let method = vm_string(&arguments[0], "网络.请求", span)?;
+                let url = vm_string(&arguments[1], "网络.请求", span)?;
+                self.permissions.check_network(url).map_err(|permission| {
+                    network_error(
+                        span,
+                        crate::stdlib::NetworkError::new("NET_PERMISSION", permission.to_string()),
+                    )
+                })?;
+                let body = vm_string(&arguments[2], "网络.请求", span)?;
+                let timeout = vm_positive_u64(&arguments[3], "网络.请求", "超时毫秒", span)?;
+                let max_bytes = vm_positive_u64(&arguments[4], "网络.请求", "最大字节", span)?;
+                let response = crate::stdlib::http_request_with_options(
+                    method,
+                    url,
+                    Some(body),
+                    timeout,
+                    max_bytes,
+                )
+                .map_err(|source| network_error(span, source))?;
+                let headers = VmValue::Map(Rc::new(RefCell::new(VmMap {
+                    entries: response
+                        .headers
+                        .into_iter()
+                        .map(|(name, value)| (VmValue::String(name), VmValue::String(value)))
+                        .collect(),
+                })));
+                Ok(VmValue::Map(Rc::new(RefCell::new(VmMap {
+                    entries: vec![
+                        (
+                            VmValue::String("状态".into()),
+                            VmValue::Number(f64::from(response.status)),
+                        ),
+                        (
+                            VmValue::String("地址".into()),
+                            VmValue::String(response.url),
+                        ),
+                        (VmValue::String("首部".into()), headers),
+                        (
+                            VmValue::String("正文".into()),
+                            VmValue::String(response.body),
+                        ),
+                    ],
+                }))))
+            }
             Std::Assert => {
                 if arguments[0].truthy() {
                     Ok(VmValue::Nil)
@@ -2565,6 +2694,7 @@ impl Vm {
             "网络" => &[
                 ("获取", 1, NativeKind::Standard(StandardNative::HttpGet)),
                 ("发文", 2, NativeKind::Standard(StandardNative::HttpPost)),
+                ("请求", 5, NativeKind::Standard(StandardNative::HttpRequest)),
             ],
             "测试" => &[
                 ("断言", 2, NativeKind::Standard(StandardNative::Assert)),
@@ -3219,8 +3349,7 @@ fn vm_value_matches_type(value: &VmValue, expected: &str) -> bool {
         "误" => matches!(value, VmValue::Error(_)),
         "任务" => matches!(value, VmValue::Task(_)),
         class_name => matches!(value, VmValue::Instance(instance)
-            if instance.borrow().class.name == class_name
-                || instance.borrow().class.conforms(class_name)),
+            if instance.borrow().class.is_a(class_name)),
     }
 }
 
@@ -3298,6 +3427,19 @@ fn number(value: &VmValue, span: &Span) -> Result<f64, VmError> {
             format!("须为有限数，不可为{}", value.type_name()),
         )),
     }
+}
+
+fn vm_positive_u64(
+    value: &VmValue,
+    function: &str,
+    name: &str,
+    span: &Span,
+) -> Result<u64, VmError> {
+    let number = number(value, span)?;
+    if number <= 0.0 || number.fract() != 0.0 || number > 9_007_199_254_740_991.0 {
+        return Err(error(span, format!("“{function}”之{name}须为安全正整数")));
+    }
+    Ok(number as u64)
 }
 
 fn vm_string<'a>(value: &'a VmValue, function: &str, span: &Span) -> Result<&'a str, VmError> {
@@ -3517,6 +3659,7 @@ fn ensure_callable(value: &VmValue, span: &Span) -> Result<(), VmError> {
 fn thrown(value: VmValue, span: &Span) -> VmError {
     match value {
         VmValue::Error(value) => VmError {
+            code: value.code,
             message: value.message.clone(),
             span: value.span.clone(),
             frames: value.frames.clone(),
@@ -3527,7 +3670,17 @@ fn thrown(value: VmValue, span: &Span) -> VmError {
 
 fn error(span: &Span, message: impl Into<String>) -> VmError {
     VmError {
+        code: "RUN000",
         message: message.into(),
+        span: span.clone(),
+        frames: Vec::new(),
+    }
+}
+
+fn network_error(span: &Span, source: crate::stdlib::NetworkError) -> VmError {
+    VmError {
+        code: source.code,
+        message: source.message,
         span: span.clone(),
         frames: Vec::new(),
     }
