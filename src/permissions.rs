@@ -208,10 +208,20 @@ fn normalize_existing_or_lexical(path: &Path) -> PathBuf {
 }
 
 fn normalize_host(authority: &str) -> &str {
-    authority
-        .rsplit_once(':')
-        .filter(|(_, port)| port.parse::<u16>().is_ok())
-        .map_or(authority, |(host, _)| host)
+    let host = if authority.starts_with('[') {
+        authority
+            .split_once(']')
+            .map_or(authority, |(host, _)| host)
+    } else if authority.matches(':').count() == 1 {
+        authority
+            .rsplit_once(':')
+            .filter(|(_, port)| port.parse::<u16>().is_ok())
+            .map_or(authority, |(host, _)| host)
+    } else {
+        authority
+    };
+    let host = host.strip_prefix('[').unwrap_or(host);
+    host.strip_suffix(']').unwrap_or(host)
 }
 
 #[cfg(test)]
@@ -232,5 +242,8 @@ mod tests {
         assert!(permissions.check_environment("YANXU_TEST").is_ok());
         assert!(permissions.check_environment("HOME").is_err());
         assert!(permissions.check_process().is_err());
+
+        let ipv6 = PermissionSet::sandboxed().allow_network("::1");
+        assert!(ipv6.check_network("[::1]:8080").is_ok());
     }
 }

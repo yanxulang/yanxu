@@ -8,6 +8,8 @@
 
 `抛`把普通值转换为误，或保留既有误的代码、类别、消息、位置和踪迹。`试…救`只捕获运行错误；词法、语法、名称解析、静态类型和编译错误发生在执行前。运行错误必须优先定位最内层失败表达式，并按调用、模块或结构化任务边界增加踪迹。
 
-捕获后的误提供只读`代码`、`类别`、`消息`、`位置`和`踪迹`。普通运行错误的代码为`RUN000`、类别为`运行`；网络错误类别为`网络`，代码使用稳定的`NET_`前缀。稳定网络代码包括`NET_PERMISSION`、`NET_URL`、`NET_DNS`、`NET_CONNECT`、`NET_TLS`、`NET_TIMEOUT`、`NET_WRITE`、`NET_READ`、`NET_LIMIT`、`NET_PROTOCOL`、`NET_STATUS`和`NET_UTF8`。代码用于程序判断，消息可在不改变错误语义时改进。
+捕获后的误提供只读`代码`、`类别`、`消息`、`位置`和`踪迹`。普通运行错误的代码为`RUN000`、类别为`运行`；网络错误类别为`网络`，代码使用稳定的`NET_`前缀；套接字错误类别为`套接字`，代码使用稳定的`SOCKET_`前缀。稳定网络代码包括`NET_PERMISSION`、`NET_URL`、`NET_DNS`、`NET_CONNECT`、`NET_TLS`、`NET_TIMEOUT`、`NET_WRITE`、`NET_READ`、`NET_LIMIT`、`NET_PROTOCOL`、`NET_STATUS`和`NET_UTF8`。稳定套接字代码包括`SOCKET_PERMISSION`、`SOCKET_ADDRESS`、`SOCKET_DNS`、`SOCKET_CONNECT`、`SOCKET_BIND`、`SOCKET_ACCEPT`、`SOCKET_TIMEOUT`、`SOCKET_READ`、`SOCKET_WRITE`、`SOCKET_LIMIT`、`SOCKET_STATE`、`SOCKET_UTF8`和`SOCKET_UNSUPPORTED`。代码用于程序判断，消息可在不改变错误语义时改进。
 
 原生`网络`模块支持`http`和经根证书验证的`https`，并解码 HTTP/1.1 分块正文。`获取/发文`的全程超时默认为 10 秒、最大响应为 4 MiB；`请求（方法，地址，正文，超时毫秒，最大字节）`允许显式正整数预算并返回含`状态/地址/首部/正文`的典。超限必须以`NET_LIMIT`失败，不得把截断正文作为成功结果。WASI 不隐式获得网络能力。
+
+原生`套接字`模块提供 TCP 流与监听器、UDP 数据报及地址查询。`TCP连接（地址，超时毫秒）`、`TCP监听（地址）`、`接受（监听器，超时毫秒）`、`发送（流，正文，超时毫秒）`、`接收（流，最大字节，超时毫秒）`、`UDP绑定（地址）`、`UDP发送至（套接字，正文，地址，超时毫秒）`和`UDP接收自（套接字，最大字节，超时毫秒）`构成稳定入口。超时须在 1..=86,400,000 毫秒，单次读取须在 1..=4,194,304 字节；超限或非完整 UTF-8 不得返回截断成功值。`关闭`幂等，关闭后的资源操作报`SOCKET_STATE`。TCP 是无消息边界字节流，一次`接收`只执行一次有界读取；协议分帧由调用方负责。WASI 不隐式获得原生套接字能力。

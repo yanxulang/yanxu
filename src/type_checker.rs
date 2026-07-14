@@ -1543,6 +1543,81 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 )),
             );
         }
+        "套接字" => {
+            let socket = TypeSet::named("套接字");
+            insert_std_function(
+                &mut shape,
+                "TCP连接",
+                vec![TypeSet::named("文"), TypeSet::named("数")],
+                socket.clone(),
+            );
+            insert_std_function(
+                &mut shape,
+                "TCP监听",
+                vec![TypeSet::named("文")],
+                socket.clone(),
+            );
+            insert_std_function(
+                &mut shape,
+                "接受",
+                vec![socket.clone(), TypeSet::named("数")],
+                TypeSet::single(StaticType::Map(
+                    Box::new(TypeSet::named("文")),
+                    Box::new(TypeSet::any()),
+                )),
+            );
+            insert_std_function(
+                &mut shape,
+                "发送",
+                vec![socket.clone(), TypeSet::named("文"), TypeSet::named("数")],
+                TypeSet::named("数"),
+            );
+            insert_std_function(
+                &mut shape,
+                "接收",
+                vec![socket.clone(), TypeSet::named("数"), TypeSet::named("数")],
+                TypeSet::named("文"),
+            );
+            insert_std_function(
+                &mut shape,
+                "UDP绑定",
+                vec![TypeSet::named("文")],
+                socket.clone(),
+            );
+            insert_std_function(
+                &mut shape,
+                "UDP发送至",
+                vec![
+                    socket.clone(),
+                    TypeSet::named("文"),
+                    TypeSet::named("文"),
+                    TypeSet::named("数"),
+                ],
+                TypeSet::named("数"),
+            );
+            insert_std_function(
+                &mut shape,
+                "UDP接收自",
+                vec![socket.clone(), TypeSet::named("数"), TypeSet::named("数")],
+                TypeSet::single(StaticType::Map(
+                    Box::new(TypeSet::named("文")),
+                    Box::new(TypeSet::named("文")),
+                )),
+            );
+            insert_std_function(
+                &mut shape,
+                "本地地址",
+                vec![socket.clone()],
+                TypeSet::named("文"),
+            );
+            insert_std_function(
+                &mut shape,
+                "对端地址",
+                vec![socket.clone()],
+                TypeSet::union(vec![TypeSet::named("文"), TypeSet::named("空")]),
+            );
+            insert_std_function(&mut shape, "关闭", vec![socket], TypeSet::named("空"));
+        }
         "测试" => {
             insert_std_function(
                 &mut shape,

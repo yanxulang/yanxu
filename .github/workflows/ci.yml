@@ -75,13 +75,13 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP"
           "$GITHUB_WORKSPACE/target/debug/yanxu" 兼容 "$GITHUB_WORKSPACE/compat" --json > compatibility.json
-          jq -e '.schema_version == 1 and (.cases | length) >= 11 and ([.cases[].passed] | all)' compatibility.json >/dev/null
+          jq -e '.schema_version == 1 and (.cases | length) >= 12 and ([.cases[].passed] | all)' compatibility.json >/dev/null
       - name: 校验标准库机器清单
         shell: bash
         run: |
           set -euo pipefail
           target/debug/yanxu 标准库 --json > stdlib.json
-          jq -e '.schema_version == 1 and (.modules | length) == 21' stdlib.json >/dev/null
+          jq -e '.schema_version == 1 and (.modules | length) == 22' stdlib.json >/dev/null
       - name: 编译模糊测试目标
         run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
       - name: 隔离验证 Cargo 发布包

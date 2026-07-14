@@ -17,7 +17,11 @@ pub fn api_manifest() -> Result<serde_json::Value, serde_json::Error> {
     serde_json::from_str(include_str!("../stdlib/api-v1.json"))
 }
 #[cfg(not(target_family = "wasm"))]
-use std::time::Duration;
+use std::io::{Read, Write};
+#[cfg(not(target_family = "wasm"))]
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+#[cfg(not(target_family = "wasm"))]
+use std::time::{Duration, Instant};
 
 pub fn path_join(left: &str, right: &str) -> String {
     Path::new(left).join(right).to_string_lossy().into_owned()
@@ -753,6 +757,484 @@ impl std::fmt::Display for NetworkError {
 
 impl std::error::Error for NetworkError {}
 
+pub const SOCKET_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+pub const SOCKET_MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl SocketError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub const fn category(&self) -> &'static str {
+        "套接字"
+    }
+}
+
+impl std::fmt::Display for SocketError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "[{}] {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for SocketError {}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+pub enum SocketHandle {
+    TcpStream(TcpStream),
+    TcpListener(TcpListener),
+    Udp(UdpSocket),
+    Closed,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Debug)]
+pub struct SocketHandle;
+
+impl SocketHandle {
+    pub fn kind_name(&self) -> &'static str {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            match self {
+                Self::TcpStream(_) => "TCP流",
+                Self::TcpListener(_) => "TCP监听器",
+                Self::Udp(_) => "UDP套接字",
+                Self::Closed => "已关闭套接字",
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            "不可用套接字"
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_tcp_connect(address: &str, timeout_millis: u64) -> Result<SocketHandle, SocketError> {
+    let timeout = socket_timeout(timeout_millis)?;
+    let addresses = resolve_socket_addresses(address)?;
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    for address in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SocketError::new("SOCKET_TIMEOUT", "TCP 连接已超过超时上限"));
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => {
+                stream
+                    .set_nodelay(true)
+                    .map_err(|error| socket_io_error("SOCKET_CONNECT", "配置 TCP 流", error))?;
+                return Ok(SocketHandle::TcpStream(stream));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let error = last_error.expect("地址列表非空");
+    Err(socket_io_error("SOCKET_CONNECT", "连接 TCP 地址", error))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_tcp_connect(
+    _address: &str,
+    _timeout_millis: u64,
+) -> Result<SocketHandle, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_tcp_listen(address: &str) -> Result<SocketHandle, SocketError> {
+    let addresses = resolve_socket_addresses(address)?;
+    let mut last_error = None;
+    for address in addresses {
+        match TcpListener::bind(address) {
+            Ok(listener) => return Ok(SocketHandle::TcpListener(listener)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(socket_io_error(
+        "SOCKET_BIND",
+        "绑定 TCP 监听地址",
+        last_error.expect("地址列表非空"),
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_tcp_listen(_address: &str) -> Result<SocketHandle, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_accept(
+    handle: &mut SocketHandle,
+    timeout_millis: u64,
+) -> Result<(SocketHandle, String), SocketError> {
+    let timeout = socket_timeout(timeout_millis)?;
+    let SocketHandle::TcpListener(listener) = handle else {
+        return Err(socket_state(handle, "接受", "TCP监听器"));
+    };
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| socket_io_error("SOCKET_ACCEPT", "配置 TCP 监听器", error))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                stream.set_nonblocking(false).map_err(|error| {
+                    socket_io_error("SOCKET_ACCEPT", "配置已接受 TCP 流", error)
+                })?;
+                stream.set_nodelay(true).map_err(|error| {
+                    socket_io_error("SOCKET_ACCEPT", "配置已接受 TCP 流", error)
+                })?;
+                return Ok((SocketHandle::TcpStream(stream), peer.to_string()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(SocketError::new(
+                        "SOCKET_TIMEOUT",
+                        "等待 TCP 连接已超过超时上限",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => {
+                return Err(socket_io_error("SOCKET_ACCEPT", "接受 TCP 连接", error));
+            }
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_accept(
+    _handle: &mut SocketHandle,
+    _timeout_millis: u64,
+) -> Result<(SocketHandle, String), SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_send(
+    handle: &mut SocketHandle,
+    text: &str,
+    timeout_millis: u64,
+) -> Result<u64, SocketError> {
+    let timeout = socket_timeout(timeout_millis)?;
+    let SocketHandle::TcpStream(stream) = handle else {
+        return Err(socket_state(handle, "发送", "TCP流"));
+    };
+    let deadline = Instant::now() + timeout;
+    let bytes = text.as_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SocketError::new(
+                "SOCKET_TIMEOUT",
+                "写入 TCP 流已超过超时上限",
+            ));
+        }
+        stream
+            .set_write_timeout(Some(remaining))
+            .map_err(|error| socket_io_error("SOCKET_WRITE", "配置 TCP 写超时", error))?;
+        let count = stream
+            .write(&bytes[written..])
+            .map_err(|error| socket_io_error("SOCKET_WRITE", "写入 TCP 流", error))?;
+        if count == 0 {
+            return Err(SocketError::new("SOCKET_WRITE", "写入 TCP 流未产生进度"));
+        }
+        written += count;
+    }
+    Ok(text.len() as u64)
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_send(
+    _handle: &mut SocketHandle,
+    _text: &str,
+    _timeout_millis: u64,
+) -> Result<u64, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_receive(
+    handle: &mut SocketHandle,
+    max_bytes: u64,
+    timeout_millis: u64,
+) -> Result<String, SocketError> {
+    let timeout = socket_timeout(timeout_millis)?;
+    let capacity = socket_read_capacity(max_bytes)?;
+    let SocketHandle::TcpStream(stream) = handle else {
+        return Err(socket_state(handle, "接收", "TCP流"));
+    };
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| socket_io_error("SOCKET_READ", "配置 TCP 读超时", error))?;
+    let mut bytes = vec![0; capacity + 1];
+    let length = stream
+        .read(&mut bytes)
+        .map_err(|error| socket_io_error("SOCKET_READ", "读取 TCP 流", error))?;
+    if length > capacity {
+        return Err(SocketError::new(
+            "SOCKET_LIMIT",
+            format!("TCP 单次接收超过 {max_bytes} 字节上限"),
+        ));
+    }
+    bytes.truncate(length);
+    String::from_utf8(bytes)
+        .map_err(|_| SocketError::new("SOCKET_UTF8", "TCP 接收内容不是完整 UTF-8 文字"))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_receive(
+    _handle: &mut SocketHandle,
+    _max_bytes: u64,
+    _timeout_millis: u64,
+) -> Result<String, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_udp_bind(address: &str) -> Result<SocketHandle, SocketError> {
+    let addresses = resolve_socket_addresses(address)?;
+    let mut last_error = None;
+    for address in addresses {
+        match UdpSocket::bind(address) {
+            Ok(socket) => return Ok(SocketHandle::Udp(socket)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(socket_io_error(
+        "SOCKET_BIND",
+        "绑定 UDP 地址",
+        last_error.expect("地址列表非空"),
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_udp_bind(_address: &str) -> Result<SocketHandle, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_udp_send_to(
+    handle: &mut SocketHandle,
+    text: &str,
+    address: &str,
+    timeout_millis: u64,
+) -> Result<u64, SocketError> {
+    let timeout = socket_timeout(timeout_millis)?;
+    let addresses = resolve_socket_addresses(address)?;
+    let SocketHandle::Udp(socket) = handle else {
+        return Err(socket_state(handle, "UDP发送至", "UDP套接字"));
+    };
+    socket
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| socket_io_error("SOCKET_WRITE", "配置 UDP 写超时", error))?;
+    let mut last_error = None;
+    for address in addresses {
+        match socket.send_to(text.as_bytes(), address) {
+            Ok(written) => return Ok(written as u64),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(socket_io_error(
+        "SOCKET_WRITE",
+        "发送 UDP 数据报",
+        last_error.expect("地址列表非空"),
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_udp_send_to(
+    _handle: &mut SocketHandle,
+    _text: &str,
+    _address: &str,
+    _timeout_millis: u64,
+) -> Result<u64, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_udp_receive_from(
+    handle: &mut SocketHandle,
+    max_bytes: u64,
+    timeout_millis: u64,
+) -> Result<(String, String), SocketError> {
+    let timeout = socket_timeout(timeout_millis)?;
+    let capacity = socket_read_capacity(max_bytes)?;
+    let SocketHandle::Udp(socket) = handle else {
+        return Err(socket_state(handle, "UDP接收自", "UDP套接字"));
+    };
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| socket_io_error("SOCKET_READ", "配置 UDP 读超时", error))?;
+    let mut bytes = vec![0; capacity + 1];
+    let (length, peer) = socket
+        .recv_from(&mut bytes)
+        .map_err(|error| socket_io_error("SOCKET_READ", "接收 UDP 数据报", error))?;
+    if length > capacity {
+        return Err(SocketError::new(
+            "SOCKET_LIMIT",
+            format!("UDP 数据报超过 {max_bytes} 字节上限"),
+        ));
+    }
+    bytes.truncate(length);
+    let text = String::from_utf8(bytes)
+        .map_err(|_| SocketError::new("SOCKET_UTF8", "UDP 数据报不是完整 UTF-8 文字"))?;
+    Ok((text, peer.to_string()))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_udp_receive_from(
+    _handle: &mut SocketHandle,
+    _max_bytes: u64,
+    _timeout_millis: u64,
+) -> Result<(String, String), SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_local_address(handle: &SocketHandle) -> Result<String, SocketError> {
+    let result = match handle {
+        SocketHandle::TcpStream(stream) => stream.local_addr(),
+        SocketHandle::TcpListener(listener) => listener.local_addr(),
+        SocketHandle::Udp(socket) => socket.local_addr(),
+        SocketHandle::Closed => return Err(socket_state(handle, "本地地址", "开放套接字")),
+    };
+    result
+        .map(|address| address.to_string())
+        .map_err(|error| socket_io_error("SOCKET_STATE", "读取本地地址", error))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_local_address(_handle: &SocketHandle) -> Result<String, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_peer_address(handle: &SocketHandle) -> Result<Option<String>, SocketError> {
+    match handle {
+        SocketHandle::TcpStream(stream) => stream
+            .peer_addr()
+            .map(|address| Some(address.to_string()))
+            .map_err(|error| socket_io_error("SOCKET_STATE", "读取对端地址", error)),
+        SocketHandle::TcpListener(_) | SocketHandle::Udp(_) => Ok(None),
+        SocketHandle::Closed => Err(socket_state(handle, "对端地址", "开放套接字")),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_peer_address(_handle: &SocketHandle) -> Result<Option<String>, SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn socket_close(handle: &mut SocketHandle) -> Result<(), SocketError> {
+    let previous = std::mem::replace(handle, SocketHandle::Closed);
+    if let SocketHandle::TcpStream(stream) = previous {
+        match stream.shutdown(Shutdown::Both) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+            Err(error) => {
+                return Err(socket_io_error("SOCKET_STATE", "关闭 TCP 流", error));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_family = "wasm")]
+pub fn socket_close(_handle: &mut SocketHandle) -> Result<(), SocketError> {
+    Err(socket_unsupported())
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn resolve_socket_addresses(address: &str) -> Result<Vec<SocketAddr>, SocketError> {
+    let address = address.trim();
+    let (_, port) = address.rsplit_once(':').ok_or_else(|| {
+        SocketError::new("SOCKET_ADDRESS", "套接字地址须为主机:端口或 [IPv6]:端口")
+    })?;
+    if port.parse::<u16>().is_err() {
+        return Err(SocketError::new(
+            "SOCKET_ADDRESS",
+            "套接字端口须为 0..65535 的整数",
+        ));
+    }
+    let addresses = address.to_socket_addrs().map_err(|error| {
+        SocketError::new(
+            "SOCKET_DNS",
+            format!("不能解析套接字地址“{address}”：{error}"),
+        )
+    })?;
+    let addresses = addresses.collect::<Vec<_>>();
+    if addresses.is_empty() {
+        Err(SocketError::new(
+            "SOCKET_DNS",
+            format!("套接字地址“{address}”没有可用结果"),
+        ))
+    } else {
+        Ok(addresses)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn socket_timeout(timeout_millis: u64) -> Result<Duration, SocketError> {
+    if timeout_millis == 0 || timeout_millis > SOCKET_MAX_TIMEOUT_MILLIS {
+        Err(SocketError::new(
+            "SOCKET_TIMEOUT",
+            format!("套接字超时须在 1..={SOCKET_MAX_TIMEOUT_MILLIS} 毫秒之间"),
+        ))
+    } else {
+        Ok(Duration::from_millis(timeout_millis))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn socket_read_capacity(max_bytes: u64) -> Result<usize, SocketError> {
+    if max_bytes == 0 || max_bytes > SOCKET_MAX_READ_BYTES {
+        return Err(SocketError::new(
+            "SOCKET_LIMIT",
+            format!("套接字单次接收上限须在 1..={SOCKET_MAX_READ_BYTES} 字节之间"),
+        ));
+    }
+    Ok(max_bytes as usize)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn socket_io_error(code: &'static str, action: &str, error: std::io::Error) -> SocketError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        SocketError::new("SOCKET_TIMEOUT", format!("{action}超时：{error}"))
+    } else {
+        SocketError::new(code, format!("{action}失败：{error}"))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn socket_state(handle: &SocketHandle, action: &str, expected: &str) -> SocketError {
+    SocketError::new(
+        "SOCKET_STATE",
+        format!("{action}须使用{expected}，当前资源为{}", handle.kind_name()),
+    )
+}
+
+#[cfg(target_family = "wasm")]
+fn socket_unsupported() -> SocketError {
+    SocketError::new("SOCKET_UNSUPPORTED", "WASI 运行时未授予原生套接字能力")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
@@ -1153,12 +1635,111 @@ mod tests {
         assert_eq!(error.code, "NET_UTF8");
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn tcp_socket_client_and_listener_cover_the_full_resource_lifecycle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 16];
+            let length = stream.read(&mut request).unwrap();
+            assert_eq!(&request[..length], "问安".as_bytes());
+            stream.write_all("安好".as_bytes()).unwrap();
+        });
+        let mut client = socket_tcp_connect(&address.to_string(), 1_000).unwrap();
+        assert_eq!(client.kind_name(), "TCP流");
+        assert!(socket_local_address(&client).unwrap().contains(':'));
+        assert_eq!(
+            socket_peer_address(&client).unwrap().as_deref(),
+            Some(address.to_string().as_str())
+        );
+        assert_eq!(socket_send(&mut client, "问安", 1_000).unwrap(), 6);
+        assert_eq!(socket_receive(&mut client, 16, 1_000).unwrap(), "安好");
+        socket_close(&mut client).unwrap();
+        socket_close(&mut client).unwrap();
+        assert_eq!(
+            socket_send(&mut client, "晚安", 1_000).unwrap_err().code,
+            "SOCKET_STATE"
+        );
+        server.join().unwrap();
+
+        let mut listener = socket_tcp_listen("127.0.0.1:0").unwrap();
+        let address = socket_local_address(&listener).unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all("来客".as_bytes()).unwrap();
+        });
+        let (mut accepted, peer) = socket_accept(&mut listener, 1_000).unwrap();
+        assert!(peer.contains(':'));
+        assert_eq!(socket_receive(&mut accepted, 16, 1_000).unwrap(), "来客");
+        client.join().unwrap();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn udp_sockets_preserve_datagrams_and_enforce_limits_and_utf8() {
+        let mut receiver = socket_udp_bind("127.0.0.1:0").unwrap();
+        let receiver_address = socket_local_address(&receiver).unwrap();
+        let mut sender = socket_udp_bind("127.0.0.1:0").unwrap();
+        assert_eq!(
+            socket_udp_send_to(&mut sender, "善哉", &receiver_address, 1_000).unwrap(),
+            6
+        );
+        let (text, peer) = socket_udp_receive_from(&mut receiver, 16, 1_000).unwrap();
+        assert_eq!(text, "善哉");
+        assert_eq!(peer, socket_local_address(&sender).unwrap());
+
+        socket_udp_send_to(&mut sender, "12345", &receiver_address, 1_000).unwrap();
+        assert_eq!(
+            socket_udp_receive_from(&mut receiver, 4, 1_000)
+                .unwrap_err()
+                .code,
+            "SOCKET_LIMIT"
+        );
+
+        let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
+        raw.send_to(&[0xff, 0xfe], &receiver_address).unwrap();
+        assert_eq!(
+            socket_udp_receive_from(&mut receiver, 4, 1_000)
+                .unwrap_err()
+                .code,
+            "SOCKET_UTF8"
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn socket_errors_distinguish_address_timeout_and_hard_limits() {
+        assert_eq!(
+            socket_tcp_connect("没有端口", 10).unwrap_err().code,
+            "SOCKET_ADDRESS"
+        );
+        assert_eq!(
+            socket_tcp_connect("127.0.0.1:1", 0).unwrap_err().code,
+            "SOCKET_TIMEOUT"
+        );
+        let mut receiver = socket_udp_bind("127.0.0.1:0").unwrap();
+        assert_eq!(
+            socket_udp_receive_from(&mut receiver, 8, 10)
+                .unwrap_err()
+                .code,
+            "SOCKET_TIMEOUT"
+        );
+        assert_eq!(
+            socket_udp_receive_from(&mut receiver, SOCKET_MAX_READ_BYTES + 1, 10)
+                .unwrap_err()
+                .code,
+            "SOCKET_LIMIT"
+        );
+    }
+
     #[test]
     fn api_manifest_audits_all_unique_modules_and_members() {
         let manifest = api_manifest().unwrap();
         assert_eq!(manifest["schema_version"], API_MANIFEST_SCHEMA_VERSION);
         let modules = manifest["modules"].as_array().unwrap();
-        assert_eq!(modules.len(), 21);
+        assert_eq!(modules.len(), 22);
         let mut module_names = std::collections::HashSet::new();
         for module in modules {
             let name = module["name"].as_str().unwrap();

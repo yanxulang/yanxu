@@ -38,6 +38,7 @@ pub enum VmValue {
     Iterator(Rc<RefCell<VmIterator>>),
     Error(Rc<VmErrorValue>),
     Task(Rc<RefCell<VmTask>>),
+    Socket(Rc<RefCell<crate::stdlib::SocketHandle>>),
 }
 
 impl fmt::Debug for VmValue {
@@ -74,6 +75,7 @@ impl VmValue {
             Self::Iterator(_) => "遍器".into(),
             Self::Error(_) => "误".into(),
             Self::Task(_) => "任务".into(),
+            Self::Socket(_) => "套接字".into(),
         }
     }
 }
@@ -111,6 +113,9 @@ impl fmt::Display for VmValue {
             Self::Iterator(_) => formatter.write_str("<遍器>"),
             Self::Error(error) => write!(formatter, "<误 {}>", error.message),
             Self::Task(task) => write!(formatter, "<任务 {}>", task.borrow().status()),
+            Self::Socket(socket) => {
+                write!(formatter, "<套接字 {}>", socket.borrow().kind_name())
+            }
         }
     }
 }
@@ -144,6 +149,8 @@ impl VmError {
     fn category(&self) -> &'static str {
         if self.code.starts_with("NET_") {
             "网络"
+        } else if self.code.starts_with("SOCKET_") {
+            "套接字"
         } else {
             "运行"
         }
@@ -415,6 +422,17 @@ enum StandardNative {
     HttpGet,
     HttpPost,
     HttpRequest,
+    SocketTcpConnect,
+    SocketTcpListen,
+    SocketAccept,
+    SocketSend,
+    SocketReceive,
+    SocketUdpBind,
+    SocketUdpSendTo,
+    SocketUdpReceiveFrom,
+    SocketLocalAddress,
+    SocketPeerAddress,
+    SocketClose,
     Assert,
     AssertEqual,
     AssertNotNil,
@@ -2238,6 +2256,98 @@ impl Vm {
                     ],
                 }))))
             }
+            Std::SocketTcpConnect => {
+                let address = vm_string(&arguments[0], "套接字.TCP连接", span)?;
+                check_socket_permission(&self.permissions, address, span)?;
+                let timeout = vm_socket_timeout(&arguments[1], "套接字.TCP连接", span)?;
+                crate::stdlib::socket_tcp_connect(address, timeout)
+                    .map(|socket| VmValue::Socket(Rc::new(RefCell::new(socket))))
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketTcpListen => {
+                let address = vm_string(&arguments[0], "套接字.TCP监听", span)?;
+                check_socket_permission(&self.permissions, address, span)?;
+                crate::stdlib::socket_tcp_listen(address)
+                    .map(|socket| VmValue::Socket(Rc::new(RefCell::new(socket))))
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketAccept => {
+                let socket = vm_socket(&arguments[0], "套接字.接受", span)?;
+                let timeout = vm_socket_timeout(&arguments[1], "套接字.接受", span)?;
+                let (accepted, peer) =
+                    crate::stdlib::socket_accept(&mut socket.borrow_mut(), timeout)
+                        .map_err(|source| socket_error(span, source))?;
+                Ok(vm_string_key_map(vec![
+                    ("套接字", VmValue::Socket(Rc::new(RefCell::new(accepted)))),
+                    ("对端", VmValue::String(peer)),
+                ]))
+            }
+            Std::SocketSend => {
+                let socket = vm_socket(&arguments[0], "套接字.发送", span)?;
+                let text = vm_string(&arguments[1], "套接字.发送", span)?;
+                let timeout = vm_socket_timeout(&arguments[2], "套接字.发送", span)?;
+                crate::stdlib::socket_send(&mut socket.borrow_mut(), text, timeout)
+                    .map(|written| VmValue::Number(written as f64))
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketReceive => {
+                let socket = vm_socket(&arguments[0], "套接字.接收", span)?;
+                let max_bytes = vm_socket_max_bytes(&arguments[1], "套接字.接收", span)?;
+                let timeout = vm_socket_timeout(&arguments[2], "套接字.接收", span)?;
+                crate::stdlib::socket_receive(&mut socket.borrow_mut(), max_bytes, timeout)
+                    .map(VmValue::String)
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketUdpBind => {
+                let address = vm_string(&arguments[0], "套接字.UDP绑定", span)?;
+                check_socket_permission(&self.permissions, address, span)?;
+                crate::stdlib::socket_udp_bind(address)
+                    .map(|socket| VmValue::Socket(Rc::new(RefCell::new(socket))))
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketUdpSendTo => {
+                let socket = vm_socket(&arguments[0], "套接字.UDP发送至", span)?;
+                let text = vm_string(&arguments[1], "套接字.UDP发送至", span)?;
+                let address = vm_string(&arguments[2], "套接字.UDP发送至", span)?;
+                check_socket_permission(&self.permissions, address, span)?;
+                let timeout = vm_socket_timeout(&arguments[3], "套接字.UDP发送至", span)?;
+                crate::stdlib::socket_udp_send_to(&mut socket.borrow_mut(), text, address, timeout)
+                    .map(|written| VmValue::Number(written as f64))
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketUdpReceiveFrom => {
+                let socket = vm_socket(&arguments[0], "套接字.UDP接收自", span)?;
+                let max_bytes = vm_socket_max_bytes(&arguments[1], "套接字.UDP接收自", span)?;
+                let timeout = vm_socket_timeout(&arguments[2], "套接字.UDP接收自", span)?;
+                let (text, peer) = crate::stdlib::socket_udp_receive_from(
+                    &mut socket.borrow_mut(),
+                    max_bytes,
+                    timeout,
+                )
+                .map_err(|source| socket_error(span, source))?;
+                Ok(vm_string_key_map(vec![
+                    ("正文", VmValue::String(text)),
+                    ("对端", VmValue::String(peer)),
+                ]))
+            }
+            Std::SocketLocalAddress => {
+                let socket = vm_socket(&arguments[0], "套接字.本地地址", span)?;
+                crate::stdlib::socket_local_address(&socket.borrow())
+                    .map(VmValue::String)
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketPeerAddress => {
+                let socket = vm_socket(&arguments[0], "套接字.对端地址", span)?;
+                crate::stdlib::socket_peer_address(&socket.borrow())
+                    .map(vm_optional_string)
+                    .map_err(|source| socket_error(span, source))
+            }
+            Std::SocketClose => {
+                let socket = vm_socket(&arguments[0], "套接字.关闭", span)?;
+                crate::stdlib::socket_close(&mut socket.borrow_mut())
+                    .map(|()| VmValue::Nil)
+                    .map_err(|source| socket_error(span, source))
+            }
             Std::Assert => {
                 if arguments[0].truthy() {
                     Ok(VmValue::Nil)
@@ -2696,6 +2806,55 @@ impl Vm {
                 ("发文", 2, NativeKind::Standard(StandardNative::HttpPost)),
                 ("请求", 5, NativeKind::Standard(StandardNative::HttpRequest)),
             ],
+            "套接字" => &[
+                (
+                    "TCP连接",
+                    2,
+                    NativeKind::Standard(StandardNative::SocketTcpConnect),
+                ),
+                (
+                    "TCP监听",
+                    1,
+                    NativeKind::Standard(StandardNative::SocketTcpListen),
+                ),
+                (
+                    "接受",
+                    2,
+                    NativeKind::Standard(StandardNative::SocketAccept),
+                ),
+                ("发送", 3, NativeKind::Standard(StandardNative::SocketSend)),
+                (
+                    "接收",
+                    3,
+                    NativeKind::Standard(StandardNative::SocketReceive),
+                ),
+                (
+                    "UDP绑定",
+                    1,
+                    NativeKind::Standard(StandardNative::SocketUdpBind),
+                ),
+                (
+                    "UDP发送至",
+                    4,
+                    NativeKind::Standard(StandardNative::SocketUdpSendTo),
+                ),
+                (
+                    "UDP接收自",
+                    3,
+                    NativeKind::Standard(StandardNative::SocketUdpReceiveFrom),
+                ),
+                (
+                    "本地地址",
+                    1,
+                    NativeKind::Standard(StandardNative::SocketLocalAddress),
+                ),
+                (
+                    "对端地址",
+                    1,
+                    NativeKind::Standard(StandardNative::SocketPeerAddress),
+                ),
+                ("关闭", 1, NativeKind::Standard(StandardNative::SocketClose)),
+            ],
             "测试" => &[
                 ("断言", 2, NativeKind::Standard(StandardNative::Assert)),
                 ("相等", 2, NativeKind::Standard(StandardNative::AssertEqual)),
@@ -3135,6 +3294,7 @@ fn values_equal(left: &VmValue, right: &VmValue) -> bool {
         (VmValue::Module(left), VmValue::Module(right)) => Rc::ptr_eq(left, right),
         (VmValue::Iterator(left), VmValue::Iterator(right)) => Rc::ptr_eq(left, right),
         (VmValue::Task(left), VmValue::Task(right)) => Rc::ptr_eq(left, right),
+        (VmValue::Socket(left), VmValue::Socket(right)) => Rc::ptr_eq(left, right),
         _ => false,
     }
 }
@@ -3313,6 +3473,7 @@ fn vm_value_matches_type(value: &VmValue, expected: &str) -> bool {
                 .all(|(item, expected)| vm_value_matches_type(item, expected)),
             ("遍器", VmValue::Iterator(_)) if arguments.len() == 1 => true,
             ("任务", VmValue::Task(_)) if arguments.len() == 1 => true,
+            ("套接字", VmValue::Socket(_)) if arguments.is_empty() => true,
             _ => false,
         };
     }
@@ -3348,6 +3509,7 @@ fn vm_value_matches_type(value: &VmValue, expected: &str) -> bool {
         "遍器" => matches!(value, VmValue::Iterator(_)),
         "误" => matches!(value, VmValue::Error(_)),
         "任务" => matches!(value, VmValue::Task(_)),
+        "套接字" => matches!(value, VmValue::Socket(_)),
         class_name => matches!(value, VmValue::Instance(instance)
             if instance.borrow().class.is_a(class_name)),
     }
@@ -3442,6 +3604,46 @@ fn vm_positive_u64(
     Ok(number as u64)
 }
 
+fn vm_socket_timeout(value: &VmValue, _function: &str, span: &Span) -> Result<u64, VmError> {
+    let number = number(value, span)?;
+    if number <= 0.0
+        || number.fract() != 0.0
+        || number > crate::stdlib::SOCKET_MAX_TIMEOUT_MILLIS as f64
+    {
+        return Err(socket_error(
+            span,
+            crate::stdlib::SocketError::new(
+                "SOCKET_TIMEOUT",
+                format!(
+                    "套接字超时须在 1..={} 毫秒之间",
+                    crate::stdlib::SOCKET_MAX_TIMEOUT_MILLIS
+                ),
+            ),
+        ));
+    }
+    Ok(number as u64)
+}
+
+fn vm_socket_max_bytes(value: &VmValue, _function: &str, span: &Span) -> Result<u64, VmError> {
+    let number = number(value, span)?;
+    if number <= 0.0
+        || number.fract() != 0.0
+        || number > crate::stdlib::SOCKET_MAX_READ_BYTES as f64
+    {
+        return Err(socket_error(
+            span,
+            crate::stdlib::SocketError::new(
+                "SOCKET_LIMIT",
+                format!(
+                    "套接字单次接收上限须在 1..={} 字节之间",
+                    crate::stdlib::SOCKET_MAX_READ_BYTES
+                ),
+            ),
+        ));
+    }
+    Ok(number as u64)
+}
+
 fn vm_string<'a>(value: &'a VmValue, function: &str, span: &Span) -> Result<&'a str, VmError> {
     match value {
         VmValue::String(text) => Ok(text),
@@ -3450,6 +3652,42 @@ fn vm_string<'a>(value: &'a VmValue, function: &str, span: &Span) -> Result<&'a 
             format!("“{function}”参数须为文，不可为{}", value.type_name()),
         )),
     }
+}
+
+fn vm_socket(
+    value: &VmValue,
+    function: &str,
+    span: &Span,
+) -> Result<Rc<RefCell<crate::stdlib::SocketHandle>>, VmError> {
+    match value {
+        VmValue::Socket(socket) => Ok(socket.clone()),
+        value => Err(error(
+            span,
+            format!("“{function}”参数须为套接字，不可为{}", value.type_name()),
+        )),
+    }
+}
+
+fn check_socket_permission(
+    permissions: &crate::permissions::PermissionSet,
+    address: &str,
+    span: &Span,
+) -> Result<(), VmError> {
+    permissions.check_network(address).map_err(|permission| {
+        socket_error(
+            span,
+            crate::stdlib::SocketError::new("SOCKET_PERMISSION", permission.to_string()),
+        )
+    })
+}
+
+fn vm_string_key_map(entries: Vec<(&'static str, VmValue)>) -> VmValue {
+    VmValue::Map(Rc::new(RefCell::new(VmMap {
+        entries: entries
+            .into_iter()
+            .map(|(key, value)| (VmValue::String(key.into()), value))
+            .collect(),
+    })))
 }
 
 fn vm_optional_string(value: Option<String>) -> VmValue {
@@ -3686,6 +3924,15 @@ fn network_error(span: &Span, source: crate::stdlib::NetworkError) -> VmError {
     }
 }
 
+fn socket_error(span: &Span, source: crate::stdlib::SocketError) -> VmError {
+    VmError {
+        code: source.code,
+        message: source.message,
+        span: span.clone(),
+        frames: Vec::new(),
+    }
+}
+
 fn render_items(
     formatter: &mut fmt::Formatter<'_>,
     items: &[VmValue],
@@ -3902,5 +4149,40 @@ mod tests {
         vm.execute_in_directory(&chunk, &root).unwrap();
         assert_eq!(vm.output(), &["1", "1", "222"]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn socket_module_runs_tcp_in_the_independent_vm() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 16];
+            let length = stream.read(&mut request).unwrap();
+            assert_eq!(&request[..length], "问安".as_bytes());
+            stream.write_all("安好".as_bytes()).unwrap();
+        });
+        let source = format!(
+            r#"
+                引「标准:套接字」为 套接字；
+                定 流 为 套接字.TCP连接（「{address}」，1000）；
+                言 类型（流）；
+                言 流 是 套接字；
+                言 套接字.发送（流，「问安」，1000）；
+                言 套接字.接收（流，16，1000）；
+                言 套接字.对端地址（流）等于「{address}」；
+                套接字.关闭（流）；
+                试 则 套接字.发送（流，「晚安」，1000）；
+                救 错 则 言 错.代码；言 错.类别；终
+            "#
+        );
+        let vm = run(&source);
+        server.join().unwrap();
+        assert_eq!(
+            vm.output(),
+            &["套接字", "真", "6", "安好", "真", "SOCKET_STATE", "套接字"]
+        );
     }
 }
