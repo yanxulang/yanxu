@@ -12,6 +12,13 @@ download() {
   curl --disable --fail --location --silent --show-error \
     --proto '=https' --tlsv1.2 "$@"
 }
+github_api() {
+  if [ -n "${YANXU_GITHUB_TOKEN:-}" ]; then
+    download --header "Authorization: Bearer ${YANXU_GITHUB_TOKEN}" "$@"
+  else
+    download "$@"
+  fi
+}
 
 need curl
 need tar
@@ -32,7 +39,7 @@ target="${arch}-${system}"
 asset="yanxu-${target}.tar.gz"
 checksum_asset="yanxu-${target}.sha256"
 if [ "$VERSION" = "latest" ]; then
-  release_json="$(download \
+  release_json="$(github_api \
     --header "Accept: application/vnd.github+json" \
     --header "X-GitHub-Api-Version: 2022-11-28" \
     "https://api.github.com/repos/${REPOSITORY}/releases?per_page=1")" || fail "无法查询最新发行版"

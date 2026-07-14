@@ -24,6 +24,13 @@ fn assert_consistent(name: &str, source: &str) {
     assert_eq!(tree, vm, "{name} 的树解释器与 VM 输出不一致");
 }
 
+fn source_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('」', "\\」")
+}
+
 #[test]
 fn shared_language_semantics_match_the_tree_interpreter() {
     let cases = [
@@ -230,6 +237,7 @@ fn baseline_standard_modules_are_fully_available_in_both_runtimes() {
     let root = std::env::temp_dir().join(format!("yanxu-vm-stdlib-{unique}"));
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("资料.txt"), "天地玄黄").unwrap();
+    let file = source_path(&root.join("资料.txt"));
     let source = format!(
         r#"
         引「标准:文字」为 文字；引「标准:数学」为 数学；
@@ -242,10 +250,8 @@ fn baseline_standard_modules_are_fully_available_in_both_runtimes() {
         言 数据【「名」】；言 JSON.序列化（【真，空，3】）；
         测试.相等（文字.修剪（「  善  」），「善」）；
         时间.等待（0）；
-        言 文件.读取（「{}」）；言 文件.存在（「{}」）；
-        "#,
-        root.join("资料.txt").display(),
-        root.join("资料.txt").display()
+        言 文件.读取（「{file}」）；言 文件.存在（「{file}」）；
+        "#
     );
     let (tree, vm) = execute_both(&source, &root);
     assert_eq!(tree, vm);
@@ -300,21 +306,17 @@ fn file_standard_module_mutations_match_in_isolated_directories() {
     fs::create_dir_all(&tree_root).unwrap();
     fs::create_dir_all(&vm_root).unwrap();
     let program = |directory: &Path| {
-        let path = directory.join("资料.txt");
+        let path = source_path(&directory.join("资料.txt"));
+        let directory = source_path(directory);
         format!(
             r#"
             引「标准:文件」为 文件；
-            文件.写入（「{}」，「甲」）；
-            文件.追加（「{}」，「乙」）；
-            言 文件.读取（「{}」）；
-            言 文件.存在（「{}」）；
-            言 文件.目录（「{}」）；
-        "#,
-            path.display(),
-            path.display(),
-            path.display(),
-            path.display(),
-            directory.display()
+            文件.写入（「{path}」，「甲」）；
+            文件.追加（「{path}」，「乙」）；
+            言 文件.读取（「{path}」）；
+            言 文件.存在（「{path}」）；
+            言 文件.目录（「{directory}」）；
+        "#
         )
     };
     let statements = yanxu::parse(&program(&tree_root)).unwrap();

@@ -20,7 +20,14 @@ $Asset = "yanxu-$Target.zip"
 $ChecksumAsset = "yanxu-$Target.sha256"
 if ($Version -eq "latest") {
     try {
-        $Releases = @(Invoke-RestMethod -Headers @{ Accept = "application/vnd.github+json" } -Uri "https://api.github.com/repos/$Repository/releases?per_page=1")
+        $ApiHeaders = @{
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+        }
+        if ($env:YANXU_GITHUB_TOKEN) {
+            $ApiHeaders.Authorization = "Bearer $($env:YANXU_GITHUB_TOKEN)"
+        }
+        $Releases = @(Invoke-RestMethod -Headers $ApiHeaders -Uri "https://api.github.com/repos/$Repository/releases?per_page=1")
         if (-not $Releases -or -not $Releases[0].tag_name) { throw "仓库尚未发布可安装版本" }
         $Tag = $Releases[0].tag_name
     } catch {

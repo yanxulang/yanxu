@@ -51,6 +51,7 @@ jobs:
         shell: sh
         env:
           YANXU_INSTALL_DIR: ${{ runner.temp }}/yanxu/bin
+          YANXU_GITHUB_TOKEN: ${{ github.token }}
         run: |
           sh -n scripts/install.sh
           sh scripts/install.sh
@@ -60,6 +61,7 @@ jobs:
         shell: pwsh
         env:
           YANXU_INSTALL_DIR: ${{ runner.temp }}\yanxu\bin
+          YANXU_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $errors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile(
