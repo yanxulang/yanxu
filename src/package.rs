@@ -17,7 +17,7 @@ pub const MANIFEST_NAME: &str = "言序.toml";
 pub const LOCK_NAME: &str = "言序.lock";
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 pub const LOCK_FORMAT_VERSION: u32 = 1;
-const DEFAULT_REGISTRY: &str = "https://packages.yanxu.dev/v1";
+pub const DEFAULT_REGISTRY: &str = "https://packages.yanxu.dev/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -341,16 +341,19 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
     })
 }
 
-/// TOML 的 bare key 仅接受 ASCII；言序清单允许惯用的 `[包]`、`名 =`。
-/// 这里仅为键补引号，字符串值和注释原样保留，行数也保持不变。
-fn normalize_manifest_toml(text: &str) -> String {
+/// 将言序允许的中文裸键补成标准 TOML 引号键。
+///
+/// TOML 裸键仅接受 ASCII，而言序清单允许惯用的`[包]`、`名 =`。这里仅
+/// 为键补引号，字符串值、注释与行数保持不变。已经使用单引号或双引号的
+/// 标准 TOML 键也保持不变，包管理器和编辑器可直接复用此兼容规则。
+pub fn normalize_manifest_toml(text: &str) -> String {
     text.lines()
         .map(|line| {
             let indentation = &line[..line.len() - line.trim_start().len()];
             let trimmed = line.trim_start();
             if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
                 let section = &trimmed[1..trimmed.len() - 1];
-                if !section.is_ascii() {
+                if !section.starts_with(['\'', '"']) && !section.is_ascii() {
                     return format!("{indentation}[\"{section}\"]");
                 }
             }
@@ -365,14 +368,27 @@ fn normalize_manifest_toml(text: &str) -> String {
                     );
                 }
             }
-            for key in ["路径", "版", "修订", "源"] {
-                normalized = normalized.replace(&format!("{key} ="), &format!("\"{key}\" ="));
-                normalized = normalized.replace(&format!("{key}="), &format!("\"{key}\"="));
-            }
+            normalized = normalize_inline_source_keys(&normalized);
             normalized
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn normalize_inline_source_keys(line: &str) -> String {
+    let mut normalized = line.to_owned();
+    for key in ["路径", "版", "修订", "源"] {
+        for separator in ['{', ','] {
+            for spacing in ["", " "] {
+                for equals in ["=", " ="] {
+                    let bare = format!("{separator}{spacing}{key}{equals}");
+                    let quoted = format!("{separator}{spacing}\"{key}\"{equals}");
+                    normalized = normalized.replace(&bare, &quoted);
+                }
+            }
+        }
+    }
+    normalized
 }
 
 fn parse_dependency(
@@ -782,7 +798,7 @@ fn canonical_dependency_root(path: &Path) -> Result<PathBuf, ManifestError> {
     }
 }
 
-fn validate_package_name(name: &str) -> Result<(), String> {
+pub fn validate_package_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.starts_with(['.', '-'])
         || name
@@ -795,7 +811,7 @@ fn validate_package_name(name: &str) -> Result<(), String> {
     }
 }
 
-fn validate_entry(entry: &Path) -> Result<(), String> {
+pub fn validate_entry(entry: &Path) -> Result<(), String> {
     if entry.is_absolute()
         || entry
             .components()
@@ -1119,6 +1135,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("不支持包清单格式版本 2"));
+    }
+
+    #[test]
+    fn accepts_standard_toml_quoted_chinese_keys() {
+        let root = temp("quoted-manifest");
+        let path = root.join(MANIFEST_NAME);
+        let text = r#"
+            ["包"]
+            "格式" = 1
+            "名" = "标准清单"
+            "版" = "1.0.0"
+            "入口" = "主.yx"
+
+            ["依赖"]
+            "工具" = { "路径" = "../工具", "版" = "^1" }
+        "#;
+        let manifest = parse(text, path, root).unwrap();
+        assert_eq!(manifest.name, "标准清单");
+        assert!(matches!(
+            manifest.dependencies["工具"],
+            Dependency::Path { .. }
+        ));
     }
 
     #[test]
