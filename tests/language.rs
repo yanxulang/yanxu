@@ -84,7 +84,8 @@ fn thrown_values_are_catchable() {
 fn module_frontend_errors_keep_the_module_location() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path = root.join("tests/fixtures/坏模块入口.yx");
-    let expected_module = root.join("tests/fixtures/坏模块.yx");
+    let expected_module =
+        std::fs::canonicalize(root.join("tests/fixtures/坏模块.yx")).expect("测试模块应当存在");
     let mut interpreter = Interpreter::silent();
     let error = run_file_with(&mut interpreter, path)
         .unwrap_err()
