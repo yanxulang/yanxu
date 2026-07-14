@@ -420,6 +420,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -718,9 +728,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "simd-adler32"
-version = "0.3.9"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "smallvec"
@@ -1048,13 +1058,14 @@ dependencies = [
 
 [[package]]
 name = "yanxu"
-version = "1.1.4-A"
+version = "1.1.5"
 dependencies = [
  "base64",
  "flate2",
  "getrandom 0.2.17",
  "hmac",
  "httpdate",
+ "libloading",
  "regex",
  "rustyline",
  "semver",
@@ -1065,6 +1076,7 @@ dependencies = [
  "toml",
  "ureq",
  "url",
+ "yanxu-package",
 ]
 
 [[package]]
@@ -1073,6 +1085,19 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "yanxu",
+]
+
+[[package]]
+name = "yanxu-package"
+version = "1.1.5"
+dependencies = [
+ "flate2",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "toml",
 ]
 
 [[package]]

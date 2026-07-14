@@ -335,13 +335,21 @@ pub fn resolve_dependency_scoped(
     let graph = cached_or_resolve_graph(&manifest, offline)?;
     let canonical_base =
         fs::canonicalize(current_base).unwrap_or_else(|_| current_base.to_path_buf());
+    let canonical_manifest_root =
+        fs::canonicalize(&manifest.root).unwrap_or_else(|_| manifest.root.clone());
+    let current_is_application_source = canonical_base.starts_with(&canonical_manifest_root);
     let (alias, export) = name
         .split_once('/')
         .map_or((name, None), |(alias, export)| (alias, Some(export)));
     let dependency_edges = graph
         .packages
         .values()
-        .filter(|dependency| canonical_base.starts_with(&dependency.root))
+        .filter(|dependency| {
+            canonical_base.starts_with(&dependency.root)
+                && (!current_is_application_source
+                    || (dependency.root != canonical_manifest_root
+                        && dependency.root.starts_with(&canonical_manifest_root)))
+        })
         .max_by_key(|dependency| dependency.root.components().count())
         .map_or(&graph.root_dependencies, |dependency| {
             &dependency.locked.dependencies
@@ -2818,6 +2826,31 @@ mod tests {
             resolve_dependency_scoped(Some(&application), &application.join("src"), "乙").is_err()
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn application_nested_inside_a_path_dependency_uses_its_root_edges() {
+        let parent = temp("nested-application-parent");
+        let application = parent.join("examples/应用");
+        write(
+            &parent.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='父库'\n版本='1.0.0'\n入口='src/库.yx'\n[导出]\n默认='src/库.yx'\n",
+        );
+        write(&parent.join("src/库.yx"), "公 定 值：数 为 42；\n");
+        write(
+            &application.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='0.1.0'\n入口='主.yx'\n[依赖]\n父={包='父库',路径='../..',版='^1'}\n",
+        );
+        write(&application.join("主.yx"), "引「包:父」为 父；\n");
+
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        let dependency = resolve_dependency_scoped(Some(&application), &application, "父").unwrap();
+        assert_eq!(
+            dependency.entry,
+            fs::canonicalize(parent.join("src/库.yx")).unwrap()
+        );
+        fs::remove_dir_all(parent).ok();
     }
 
     #[test]

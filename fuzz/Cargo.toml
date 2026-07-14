@@ -31,3 +31,5 @@ path = "fuzz_targets/bytecode_archive.rs"
 test = false
 doc = false
 bench = false
+
+[workspace]

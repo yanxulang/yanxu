@@ -6,3 +6,5 @@ publish = false
 
 [dependencies]
 yanxu = { path = "../../.." }
+
+[workspace]
