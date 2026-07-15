@@ -15,6 +15,33 @@ function Get-Sha256([string]$Path) {
     }
 }
 
+function Invoke-YanxuVersion([string]$Path) {
+    $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $StartInfo.FileName = $Path
+    $StartInfo.Arguments = "--version"
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+    $StartInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $StartInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+    $Process = New-Object System.Diagnostics.Process
+    $Process.StartInfo = $StartInfo
+    try {
+        if (-not $Process.Start()) { throw "could not start the downloaded yanxu.exe" }
+        $Stdout = $Process.StandardOutput.ReadToEnd()
+        $Stderr = $Process.StandardError.ReadToEnd()
+        $Process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $Process.ExitCode
+            Text = ($Stdout + $Stderr).Trim()
+        }
+    } finally {
+        $Process.Dispose()
+    }
+}
+
 $Repository = if ($env:YANXU_REPOSITORY) { $env:YANXU_REPOSITORY } else { "YanXuLang/yanxu" }
 $Version = if ($env:YANXU_VERSION) { $env:YANXU_VERSION } else { "latest" }
 $InstallDir = if ($env:YANXU_INSTALL_DIR) { $env:YANXU_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\Yanxu\bin" }
@@ -25,10 +52,14 @@ try {
     throw "Yanxu installation failed: invalid installation directory: $($_.Exception.Message)"
 }
 
-$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$Architecture = if ($env:PROCESSOR_ARCHITEW6432) {
+    $env:PROCESSOR_ARCHITEW6432
+} else {
+    $env:PROCESSOR_ARCHITECTURE
+}
 switch ($Architecture) {
-    "X64" { $Target = "x86_64-pc-windows-msvc" }
-    "Arm64" { $Target = "aarch64-pc-windows-msvc" }
+    "AMD64" { $Target = "x86_64-pc-windows-msvc" }
+    "ARM64" { $Target = "aarch64-pc-windows-msvc" }
     default { throw "Yanxu installation failed: unsupported processor architecture $Architecture" }
 }
 
@@ -94,9 +125,9 @@ try {
     $InstalledPath = Join-Path $InstallDir "yanxu.exe"
     $StagedPath = Join-Path $InstallDir (".yanxu-" + [guid]::NewGuid() + ".exe")
     Copy-Item $Binary.FullName $StagedPath
-    $VersionOutput = @(& $StagedPath --version 2>&1)
-    if ($LASTEXITCODE -ne 0) { throw "the downloaded yanxu.exe cannot run on this system: $($VersionOutput -join [Environment]::NewLine)" }
-    $VersionText = ($VersionOutput -join " ").Trim()
+    $VersionProbe = Invoke-YanxuVersion $StagedPath
+    if ($VersionProbe.ExitCode -ne 0) { throw "the downloaded yanxu.exe cannot run on this system: $($VersionProbe.Text)" }
+    $VersionText = $VersionProbe.Text
     if (-not $VersionText) { throw "the downloaded yanxu.exe returned no version information" }
     $ProductName = [string]::Concat([char]0x8A00, [char]0x5E8F)
     $ExpectedVersion = "$ProductName " + $Tag.TrimStart("v")
