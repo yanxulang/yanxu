@@ -1,3 +1,4 @@
+﻿# Keep the UTF-8 BOM: Windows PowerShell 5.1 otherwise reads this file using the legacy system code page.
 $ErrorActionPreference = "Stop"
 
 $Repository = if ($env:YANXU_REPOSITORY) { $env:YANXU_REPOSITORY } else { "YanXuLang/yanxu" }

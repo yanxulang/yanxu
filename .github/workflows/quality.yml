@@ -231,6 +231,12 @@ jobs:
           )
           if ($errors.Count) { $errors | Format-List; exit 1 }
 
+          $windowsPowerShellParse = Start-Process -FilePath powershell.exe -ArgumentList @(
+            "-NoProfile", "-Command",
+            '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path ''scripts/install.ps1''), [ref]$null, [ref]$errors); if ($errors.Count) { $errors | Format-List; exit 1 }'
+          ) -NoNewWindow -Wait -PassThru
+          if ($windowsPowerShellParse.ExitCode -ne 0) { throw "Windows PowerShell 5.1 无法解析安装脚本" }
+
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $version = ($metadata.packages | Where-Object name -eq "yanxu").version
           $target = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq "Arm64") {
@@ -246,14 +252,17 @@ jobs:
           (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant() | Set-Content -NoNewline $checksum
           $env:YANXU_VERSION = $version
           $env:YANXU_ASSET_DIR = $assetDir
-          & scripts/install.ps1
+          $install = Start-Process -FilePath powershell.exe -ArgumentList @(
+            "-NoProfile", "-File", (Resolve-Path scripts/install.ps1)
+          ) -NoNewWindow -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Windows PowerShell 5.1 安装失败" }
           $installed = Join-Path $env:YANXU_INSTALL_DIR "yanxu.exe"
           $actual = & $installed --version
           if ($actual -ne "言序 $version") { throw "安装版本不符：$actual" }
           $before = (Get-FileHash -Algorithm SHA256 $installed).Hash
 
           ("0" * 64) | Set-Content -NoNewline $checksum
-          $failure = Start-Process -FilePath pwsh -ArgumentList @(
+          $failure = Start-Process -FilePath powershell.exe -ArgumentList @(
             "-NoProfile", "-File", (Resolve-Path scripts/install.ps1)
           ) -NoNewWindow -Wait -PassThru
           if ($failure.ExitCode -eq 0) { throw "损坏校验和不应安装成功" }
@@ -265,7 +274,7 @@ jobs:
           Remove-Item $archive
           Compress-Archive -Path (Join-Path $fakeDir "yanxu.exe") -DestinationPath $archive
           (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant() | Set-Content -NoNewline $checksum
-          $failure = Start-Process -FilePath pwsh -ArgumentList @(
+          $failure = Start-Process -FilePath powershell.exe -ArgumentList @(
             "-NoProfile", "-File", (Resolve-Path scripts/install.ps1)
           ) -NoNewWindow -Wait -PassThru
           if ($failure.ExitCode -eq 0) { throw "不可运行制品不应安装成功" }
