@@ -1,5 +1,5 @@
-﻿# Keep the UTF-8 BOM: Windows PowerShell 5.1 otherwise reads this file using the legacy system code page.
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
+# Keep the UTF-8 BOM before the first variable: Windows PowerShell 5.1 needs it for files and accepts it through iex.
 
 function Get-Sha256([string]$Path) {
     $Stream = [System.IO.File]::OpenRead($Path)
