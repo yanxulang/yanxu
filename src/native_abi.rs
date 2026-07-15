@@ -32,6 +32,31 @@ const NATIVE_MAX_NAME_BYTES: usize = 1_024;
 const NATIVE_MAX_ERROR_CODE_BYTES: usize = 256;
 const NATIVE_MAX_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
 
+/// Opens an already verified library with a dependency search policy that does
+/// not consult the process current directory on Windows. The DLL's own private
+/// content-addressed directory and trusted system/application locations remain
+/// available for legitimate dependencies.
+#[cfg(all(not(target_family = "wasm"), target_os = "windows"))]
+pub(crate) unsafe fn load_dynamic_library_safely(
+    path: &Path,
+) -> Result<libloading::Library, libloading::Error> {
+    use libloading::os::windows::{
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    };
+    let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+    // SAFETY: The caller owns the verified path and accepts module initialization.
+    unsafe { libloading::os::windows::Library::load_with_flags(path, flags) }
+        .map(libloading::Library::from)
+}
+
+#[cfg(all(not(target_family = "wasm"), not(target_os = "windows")))]
+pub(crate) unsafe fn load_dynamic_library_safely(
+    path: &Path,
+) -> Result<libloading::Library, libloading::Error> {
+    // SAFETY: The caller owns the verified path and accepts module initialization.
+    unsafe { libloading::Library::new(path) }
+}
+
 pub type NativeFreeBytes = unsafe extern "C" fn(*mut u8, usize);
 pub type NativeDropResource = unsafe extern "C" fn(*mut c_void);
 
@@ -182,9 +207,9 @@ impl Drop for NativeInner {
 }
 
 #[cfg(not(target_family = "wasm"))]
-struct StagedLibrary {
-    root: PathBuf,
-    path: PathBuf,
+pub(crate) struct StagedLibrary {
+    pub(crate) root: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -196,7 +221,10 @@ impl Drop for StagedLibrary {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn stage_verified_library(bytes: &[u8], checksum: &str) -> Result<StagedLibrary, NativeError> {
+pub(crate) fn stage_verified_library(
+    bytes: &[u8],
+    checksum: &str,
+) -> Result<StagedLibrary, NativeError> {
     let mut nonce = [0_u8; 16];
     getrandom::getrandom(&mut nonce)
         .map_err(|error| native_error("NATIVE_IO", format!("不能创建安全随机暂存名：{error}")))?;
@@ -475,7 +503,7 @@ impl NativeExtension {
     unsafe fn load(staged: StagedLibrary, expected_name: &str) -> Result<Self, NativeError> {
         let path = staged.path.as_path();
         // SAFETY: The caller has completed security gates; Library remains owned by NativeInner.
-        let library = unsafe { libloading::Library::new(path) }.map_err(|error| {
+        let library = unsafe { load_dynamic_library_safely(path) }.map_err(|error| {
             native_error(
                 "NATIVE_LOAD",
                 format!("不能打开 {}：{error}", path.display()),
@@ -855,7 +883,7 @@ unsafe fn copy_native_error(error: YanxuNativeErrorV1) -> NativeError {
     native_error(code, message)
 }
 
-fn native_error(code: impl Into<String>, message: impl Into<String>) -> NativeError {
+pub(crate) fn native_error(code: impl Into<String>, message: impl Into<String>) -> NativeError {
     NativeError {
         code: code.into(),
         message: message.into(),

@@ -196,8 +196,122 @@ fn with_package_completions(
 ) -> Value {
     if let Some(items) = completion["items"].as_array_mut() {
         items.extend(package_completion_items(uri, source, line, column));
+        items.extend(package_member_completion_items(uri, source, line, column));
     }
     completion
+}
+
+fn package_member_completion_items(
+    uri: &str,
+    source: &str,
+    line: usize,
+    column: usize,
+) -> Vec<Value> {
+    let Some(alias) = module_alias_at_completion(source, line, column) else {
+        return Vec::new();
+    };
+    let import_pattern =
+        regex::Regex::new(r#"引\s*「包:([^」]+)」\s*为\s*([\p{L}_][\p{L}\p{N}_]*)"#)
+            .expect("static package import regex");
+    let Some(package_path) = import_pattern.captures_iter(source).find_map(|captures| {
+        (captures.get(2)?.as_str() == alias).then(|| captures.get(1).unwrap().as_str().to_owned())
+    }) else {
+        return Vec::new();
+    };
+    let Some(path) = uri_file_path(uri) else {
+        return Vec::new();
+    };
+    let Some(manifest) = crate::package::discover(&path).ok().flatten() else {
+        return Vec::new();
+    };
+    // Language servers must never introduce network I/O while completing.
+    let Ok(graph) = crate::package::resolve_graph(&manifest, true) else {
+        return Vec::new();
+    };
+    let (dependency_alias, export_name) = package_path
+        .split_once('/')
+        .map_or((package_path.as_str(), "默认"), |(alias, export)| {
+            (alias, export)
+        });
+    let Some(id) = graph.root_dependencies.get(dependency_alias) else {
+        return Vec::new();
+    };
+    let Some(dependency) = graph.packages.get(id) else {
+        return Vec::new();
+    };
+    let Some(export) = dependency.locked.exports.get(export_name) else {
+        return Vec::new();
+    };
+    let module_path = dependency.root.join(export);
+    let Ok(metadata) = std::fs::symlink_metadata(&module_path) else {
+        return Vec::new();
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 8 * 1024 * 1024
+    {
+        return Vec::new();
+    }
+    let Ok(module_source) = std::fs::read_to_string(&module_path) else {
+        return Vec::new();
+    };
+    let module_name = module_path.display().to_string();
+    let Ok(tokens) = crate::lexer::scan_named(&module_source, &module_name) else {
+        return Vec::new();
+    };
+    let Ok(statements) = crate::parser::parse(tokens) else {
+        return Vec::new();
+    };
+    let public = statements
+        .iter()
+        .filter(|statement| statement.public)
+        .filter_map(|statement| match &statement.kind {
+            crate::ast::StmtKind::Let { name, .. }
+            | crate::ast::StmtKind::Function { name, .. }
+            | crate::ast::StmtKind::Class { name, .. }
+            | crate::ast::StmtKind::Protocol { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let Ok(index) = SemanticIndex::build(&module_source, &module_name) else {
+        return Vec::new();
+    };
+    index
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.container.is_none() && public.contains(symbol.name.as_str()))
+        .map(|symbol| {
+            json!({
+                "label": symbol.name,
+                "kind": symbol.kind.completion_kind(),
+                "detail": symbol.detail,
+                "documentation": symbol.documentation.clone().unwrap_or_else(|| {
+                    format!("包:{package_path}.{}", symbol.name)
+                }),
+                "sortText": format!("0-package-member-{}", symbol.name)
+            })
+        })
+        .collect()
+}
+
+fn module_alias_at_completion(source: &str, line: usize, column: usize) -> Option<String> {
+    let prefix = source
+        .lines()
+        .nth(line.saturating_sub(1))?
+        .chars()
+        .take(column.saturating_sub(1))
+        .collect::<String>();
+    let tokens = crate::lexer::scan(&prefix).ok()?;
+    let mut kinds = tokens
+        .iter()
+        .map(|token| &token.kind)
+        .filter(|kind| !matches!(kind, TokenKind::Eof))
+        .rev();
+    if !matches!(kinds.next(), Some(TokenKind::Dot)) {
+        return None;
+    }
+    match kinds.next() {
+        Some(TokenKind::Identifier(alias)) => Some(alias.clone()),
+        _ => None,
+    }
 }
 
 fn package_completion_items(uri: &str, source: &str, line: usize, column: usize) -> Vec<Value> {
@@ -894,6 +1008,16 @@ mod tests {
         let exports =
             package_completion_items(&uri, export_source, 1, export_source.chars().count() + 1);
         assert!(exports.iter().any(|item| item["label"] == "配置"));
+
+        let member_source = "引「包:工具别名」为 工具；\n工具.";
+        let members =
+            package_member_completion_items(&uri, member_source, 2, "工具.".chars().count() + 1);
+        assert!(members.iter().any(|item| {
+            item["label"] == "值"
+                && item["documentation"]
+                    .as_str()
+                    .is_some_and(|documentation| documentation.contains("包:工具别名"))
+        }));
 
         let source = "引「包:未声明」为 未知；";
         std::fs::write(

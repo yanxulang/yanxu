@@ -47,9 +47,60 @@ pub struct ApplicationArchive {
     pub entry_module: String,
     pub modules: BTreeMap<String, ApplicationModule>,
     pub resources: BTreeMap<String, ApplicationResource>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub native_modules: BTreeMap<String, ApplicationNativeModule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<ApplicationMetadata>,
+    /// SPDX expressions or package-declared license identifiers captured at
+    /// compile time. Bundle creation never has to rediscover source packages.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub licenses: BTreeMap<String, String>,
     pub permissions: PermissionSummary,
     pub lock_checksum: Option<String>,
     pub content_checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationNativeModule {
+    pub name: String,
+    pub abi: u32,
+    pub target: String,
+    pub file: String,
+    pub checksum: String,
+    pub size: u64,
+    pub package: String,
+    pub package_version: String,
+    pub bytes_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationMetadata {
+    pub kind: String,
+    pub name: String,
+    pub identifier: String,
+    pub version: String,
+    pub icon: Option<String>,
+    pub company: Option<String>,
+    pub minimum_system_version: Option<String>,
+    pub window: ApplicationWindowMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationWindowMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub minimum_width: u32,
+    pub minimum_height: u32,
+    pub maximum_width: Option<u32>,
+    pub maximum_height: Option<u32>,
+    pub resizable: bool,
+    pub high_dpi: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedNativeModule {
+    pub metadata: ApplicationNativeModule,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +133,20 @@ pub struct PermissionSummary {
     pub environment: Vec<String>,
     pub process: bool,
     pub native_extensions: bool,
+    #[serde(default)]
+    pub graphical_interface: bool,
+    #[serde(default)]
+    pub clipboard: bool,
+    #[serde(default)]
+    pub file_dialog: bool,
+    #[serde(default)]
+    pub system_notifications: bool,
+    #[serde(default)]
+    pub tray: bool,
+    #[serde(default)]
+    pub open_external_url: bool,
+    #[serde(default)]
+    pub global_shortcuts: bool,
 }
 
 impl PermissionSummary {
@@ -107,6 +172,13 @@ impl PermissionSummary {
                 .collect(),
             process: permissions.process_allowed(),
             native_extensions: permissions.native_extensions_allowed(),
+            graphical_interface: permissions.graphical_interface_allowed(),
+            clipboard: permissions.clipboard_allowed(),
+            file_dialog: permissions.file_dialog_allowed(),
+            system_notifications: permissions.system_notifications_allowed(),
+            tray: permissions.tray_allowed(),
+            open_external_url: permissions.open_external_url_allowed(),
+            global_shortcuts: permissions.global_shortcuts_allowed(),
         }
     }
 
@@ -135,6 +207,27 @@ impl PermissionSummary {
         }
         if self.native_extensions {
             permissions = permissions.allow_native_extensions();
+        }
+        if self.graphical_interface {
+            permissions = permissions.allow_graphical_interface();
+        }
+        if self.clipboard {
+            permissions = permissions.allow_clipboard();
+        }
+        if self.file_dialog {
+            permissions = permissions.allow_file_dialog();
+        }
+        if self.system_notifications {
+            permissions = permissions.allow_system_notifications();
+        }
+        if self.tray {
+            permissions = permissions.allow_tray();
+        }
+        if self.open_external_url {
+            permissions = permissions.allow_open_external_url();
+        }
+        if self.global_shortcuts {
+            permissions = permissions.allow_global_shortcuts();
         }
         permissions
     }
@@ -181,6 +274,9 @@ pub fn compile_application(
             let lock_checksum = checksum_file(&manifest.root.join(package::LOCK_NAME)).ok();
             let summary =
                 PermissionSummary::from_permissions(&manifest.permissions, &manifest.root);
+            let native_modules = collect_native_modules(&graph)?;
+            let application = manifest.application.as_ref().map(application_metadata);
+            let licenses = collect_licenses(&manifest, &graph)?;
             compile_resolved_application(
                 entry,
                 fs::canonicalize(&manifest.root).map_err(io_error)?,
@@ -192,6 +288,9 @@ pub fn compile_application(
                 summary,
                 Some(graph),
                 resources,
+                native_modules,
+                application,
+                licenses,
                 lock_checksum,
                 profile,
             )
@@ -219,6 +318,9 @@ pub fn compile_application(
         PermissionSummary::from_permissions(&PermissionSet::unrestricted(), Path::new(".")),
         None,
         BTreeMap::new(),
+        BTreeMap::new(),
+        None,
+        BTreeMap::new(),
         None,
         profile,
     )
@@ -233,6 +335,9 @@ fn compile_resolved_application(
     permissions: PermissionSummary,
     graph: Option<ResolutionGraph>,
     resources: BTreeMap<String, ApplicationResource>,
+    native_modules: BTreeMap<String, ApplicationNativeModule>,
+    application: Option<ApplicationMetadata>,
+    licenses: BTreeMap<String, String>,
     lock_checksum: Option<String>,
     profile: &str,
 ) -> Result<ApplicationArchive, ApplicationError> {
@@ -256,6 +361,9 @@ fn compile_resolved_application(
         entry_module,
         modules: compiler.modules,
         resources,
+        native_modules,
+        application,
+        licenses,
         permissions,
         lock_checksum,
         content_checksum: String::new(),
@@ -472,6 +580,13 @@ fn collect_resources(
         let path = manifest.root.join(resource);
         collect_resource_files(&manifest.root, &path, &mut files)?;
     }
+    if let Some(icon) = manifest
+        .application
+        .as_ref()
+        .and_then(|application| application.icon.as_ref())
+    {
+        collect_resource_files(&manifest.root, &manifest.root.join(icon), &mut files)?;
+    }
     files.sort();
     files.dedup();
     if files.len() > RESOURCE_MAX_ENTRIES {
@@ -505,6 +620,145 @@ fn collect_resources(
         );
     }
     Ok(resources)
+}
+
+fn collect_native_modules(
+    graph: &ResolutionGraph,
+) -> Result<BTreeMap<String, ApplicationNativeModule>, ApplicationError> {
+    if graph.target != package::current_target() {
+        return Err(application_error(format!(
+            "锁定依赖目标 {} 与当前目标 {} 不符",
+            graph.target,
+            package::current_target()
+        )));
+    }
+    let mut modules = BTreeMap::new();
+    let mut total = 0_u64;
+    for dependency in graph.packages.values() {
+        let Some(artifact) = dependency.locked.native.as_ref() else {
+            continue;
+        };
+        if modules.len() >= package::NATIVE_ARTIFACT_MAX_COUNT {
+            return Err(application_error(format!(
+                "YXB 原生模块不得超过 {} 个",
+                package::NATIVE_ARTIFACT_MAX_COUNT
+            )));
+        }
+        if artifact.target != graph.target || !matches!(artifact.abi, 1 | 2) {
+            return Err(application_error(format!(
+                "锁定原生制品 {} 的目标或 ABI 无效",
+                dependency.locked.name
+            )));
+        }
+        let source = dependency.root.join(&artifact.path);
+        let metadata = fs::symlink_metadata(&source).map_err(|error| {
+            application_error(format!("不能检查原生制品 {}：{error}", source.display()))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(application_error(format!(
+                "原生制品 {} 必须是普通文件，不能是链接或特殊文件",
+                source.display()
+            )));
+        }
+        if metadata.len() != artifact.size || metadata.len() > package::NATIVE_ARTIFACT_MAX_BYTES {
+            return Err(application_error(format!(
+                "原生制品 {} 大小与锁文件不符或超过上限",
+                source.display()
+            )));
+        }
+        let bytes = read_limited_file(&source, package::NATIVE_ARTIFACT_MAX_BYTES, "原生制品")?;
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        if checksum != artifact.checksum.to_ascii_lowercase() {
+            return Err(application_error(format!(
+                "原生制品 {} 摘要与锁文件不符",
+                source.display()
+            )));
+        }
+        total = total
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| application_error("YXB 原生制品总大小溢出"))?;
+        if total > package::NATIVE_ARTIFACT_MAX_TOTAL_BYTES {
+            return Err(application_error(format!(
+                "YXB 原生制品总大小不得超过 {} 字节",
+                package::NATIVE_ARTIFACT_MAX_TOTAL_BYTES
+            )));
+        }
+        let file_name = Path::new(&artifact.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| application_error("原生制品文件名不是 UTF-8"))?;
+        let module = ApplicationNativeModule {
+            name: dependency.locked.name.clone(),
+            abi: artifact.abi,
+            target: artifact.target.clone(),
+            file: format!("native/{checksum}/{file_name}"),
+            checksum,
+            size: artifact.size,
+            package: dependency.locked.name.clone(),
+            package_version: dependency.locked.version.clone(),
+            bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        if modules
+            .insert(dependency.locked.name.clone(), module)
+            .is_some()
+        {
+            return Err(application_error(format!(
+                "锁定依赖图含多个名为“{}”的原生模块，不能写入 YXB",
+                dependency.locked.name
+            )));
+        }
+    }
+    Ok(modules)
+}
+
+fn collect_licenses(
+    manifest: &Manifest,
+    graph: &ResolutionGraph,
+) -> Result<BTreeMap<String, String>, ApplicationError> {
+    let mut licenses = BTreeMap::new();
+    if let Some(license) = manifest.license.as_ref() {
+        licenses.insert(
+            format!("{}@{}", manifest.name, manifest.version),
+            license.clone(),
+        );
+    }
+    for dependency in graph.packages.values() {
+        let dependency_manifest = package::discover(&dependency.root)
+            .map_err(package_error)?
+            .ok_or_else(|| application_error("锁定依赖缺少言序清单"))?;
+        if let Some(license) = dependency_manifest.license {
+            licenses.insert(
+                format!(
+                    "{}@{}",
+                    dependency_manifest.name, dependency_manifest.version
+                ),
+                license,
+            );
+        }
+    }
+    Ok(licenses)
+}
+
+fn application_metadata(application: &package::ApplicationConfig) -> ApplicationMetadata {
+    ApplicationMetadata {
+        kind: application.kind.as_str().into(),
+        name: application.name.clone(),
+        identifier: application.identifier.clone(),
+        version: application.version.to_string(),
+        icon: application.icon.as_ref().map(|path| relative_string(path)),
+        company: application.company.clone(),
+        minimum_system_version: application.minimum_system_version.clone(),
+        window: ApplicationWindowMetadata {
+            width: application.window.width,
+            height: application.window.height,
+            minimum_width: application.window.minimum_width,
+            minimum_height: application.window.minimum_height,
+            maximum_width: application.window.maximum_width,
+            maximum_height: application.window.maximum_height,
+            resizable: application.window.resizable,
+            high_dpi: application.window.high_dpi,
+        },
+    }
 }
 
 fn collect_resource_files(
@@ -713,6 +967,18 @@ pub fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationE
     if archive.runtime_version.len() > 64 || archive.build_commit.len() > 128 {
         return Err(application_error("YXB 构建身份字段过长"));
     }
+    if archive.licenses.len() > YXB_MAX_MODULES
+        || archive.licenses.iter().any(|(package, license)| {
+            package.is_empty()
+                || package.len() > 512
+                || package.contains(['\0', '\r', '\n'])
+                || license.is_empty()
+                || license.len() > 512
+                || license.contains(['\0', '\r', '\n'])
+        })
+    {
+        return Err(application_error("YXB 许可证索引非法或超过限制"));
+    }
     if archive.modules.len() > YXB_MAX_MODULES {
         return Err(application_error(format!(
             "YXB 模块不得超过 {YXB_MAX_MODULES} 个"
@@ -764,6 +1030,8 @@ pub fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationE
         )));
     }
     validate_resources(archive)?;
+    validate_native_modules(archive)?;
+    validate_application_metadata(archive)?;
     let actual = archive_checksum(archive)?;
     if archive.content_checksum != actual {
         return Err(application_error(format!(
@@ -772,6 +1040,160 @@ pub fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationE
         )));
     }
     Ok(())
+}
+
+pub fn decode_native_modules(
+    archive: &ApplicationArchive,
+) -> Result<Rc<BTreeMap<String, DecodedNativeModule>>, ApplicationError> {
+    validate_native_modules(archive).map(Rc::new)
+}
+
+fn validate_native_modules(
+    archive: &ApplicationArchive,
+) -> Result<BTreeMap<String, DecodedNativeModule>, ApplicationError> {
+    if archive.native_modules.len() > package::NATIVE_ARTIFACT_MAX_COUNT {
+        return Err(application_error(format!(
+            "YXB 原生模块不得超过 {} 个",
+            package::NATIVE_ARTIFACT_MAX_COUNT
+        )));
+    }
+    let mut total = 0_u64;
+    let mut decoded = BTreeMap::new();
+    for (package_name, module) in &archive.native_modules {
+        if package_name != &module.package
+            || package_name != &module.name
+            || package_name.is_empty()
+            || module.package_version.parse::<semver::Version>().is_err()
+            || !matches!(module.abi, 1 | 2)
+            || module.target != archive.target
+            || module.checksum.len() != 64
+            || !module.checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(application_error(format!(
+                "YXB 原生模块“{package_name}”的锁定元数据无效"
+            )));
+        }
+        let normalized_file = normalize_resource_key(&module.file)?;
+        if normalized_file != module.file || !module.file.starts_with("native/") {
+            return Err(application_error(format!(
+                "YXB 原生模块“{package_name}”路径非法"
+            )));
+        }
+        let max_encoded = package::NATIVE_ARTIFACT_MAX_BYTES.div_ceil(3) * 4 + 4;
+        if module.bytes_base64.len() as u64 > max_encoded {
+            return Err(application_error(format!(
+                "YXB 原生模块“{package_name}”编码体积超过上限"
+            )));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&module.bytes_base64)
+            .map_err(|error| {
+                application_error(format!("YXB 原生模块“{package_name}”编码无效：{error}"))
+            })?;
+        if bytes.len() as u64 != module.size || module.size > package::NATIVE_ARTIFACT_MAX_BYTES {
+            return Err(application_error(format!(
+                "YXB 原生模块“{package_name}”大小不符或超过上限"
+            )));
+        }
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        if checksum != module.checksum.to_ascii_lowercase() {
+            return Err(application_error(format!(
+                "YXB 原生模块“{package_name}”摘要不符"
+            )));
+        }
+        total = total
+            .checked_add(module.size)
+            .ok_or_else(|| application_error("YXB 原生模块总大小溢出"))?;
+        if total > package::NATIVE_ARTIFACT_MAX_TOTAL_BYTES {
+            return Err(application_error(format!(
+                "YXB 原生模块总大小不得超过 {} 字节",
+                package::NATIVE_ARTIFACT_MAX_TOTAL_BYTES
+            )));
+        }
+        decoded.insert(
+            package_name.clone(),
+            DecodedNativeModule {
+                metadata: module.clone(),
+                bytes,
+            },
+        );
+    }
+    Ok(decoded)
+}
+
+fn validate_application_metadata(archive: &ApplicationArchive) -> Result<(), ApplicationError> {
+    let Some(application) = &archive.application else {
+        return Ok(());
+    };
+    if !matches!(application.kind.as_str(), "图形" | "命令行")
+        || application.name.trim().is_empty()
+        || application.name.chars().count() > 128
+        || application.version.parse::<semver::Version>().is_err()
+        || !valid_application_identifier(&application.identifier)
+    {
+        return Err(application_error(
+            "YXB 应用元数据中的类型、名称、标识或版本无效",
+        ));
+    }
+    let window = &application.window;
+    if !valid_dimension(window.width)
+        || !valid_dimension(window.height)
+        || !valid_dimension(window.minimum_width)
+        || !valid_dimension(window.minimum_height)
+        || window
+            .maximum_width
+            .is_some_and(|value| !valid_dimension(value))
+        || window
+            .maximum_height
+            .is_some_and(|value| !valid_dimension(value))
+        || window.minimum_width > window.width
+        || window.minimum_height > window.height
+        || window
+            .maximum_width
+            .is_some_and(|value| value < window.width)
+        || window
+            .maximum_height
+            .is_some_and(|value| value < window.height)
+    {
+        return Err(application_error("YXB 应用窗口尺寸无效"));
+    }
+    if application.kind == "图形" && !archive.permissions.graphical_interface {
+        return Err(application_error("YXB 图形应用未申请图形界面权限"));
+    }
+    if let Some(icon) = &application.icon {
+        let normalized = normalize_resource_key(icon)?;
+        if normalized != *icon || !archive.resources.contains_key(icon) {
+            return Err(application_error("YXB 应用图标未作为包内资源携带"));
+        }
+    }
+    Ok(())
+}
+
+fn valid_dimension(value: u32) -> bool {
+    (1..=16_384).contains(&value)
+}
+
+fn valid_application_identifier(identifier: &str) -> bool {
+    if identifier.len() > 255 || !identifier.is_ascii() {
+        return false;
+    }
+    let labels = identifier.split('.').collect::<Vec<_>>();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && label
+                    .bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 #[derive(Default)]
@@ -1235,6 +1657,87 @@ mod tests {
         let mut tampered = decoded;
         tampered.package.name = "篡改".into();
         assert!(serialize(&tampered).is_err());
+    }
+
+    #[test]
+    fn yxb_native_modules_reject_tampering_target_paths_and_count_attacks() {
+        let (root, mut archive) = compile_test_application("言 1；\n", "图形界面=true");
+        let bytes = b"locked native bytes";
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let module = ApplicationNativeModule {
+            name: "yanxu-gui".into(),
+            abi: 2,
+            target: archive.target.clone(),
+            file: format!("native/{checksum}/backend.bin"),
+            checksum,
+            size: bytes.len() as u64,
+            package: "yanxu-gui".into(),
+            package_version: "0.1.0".into(),
+            bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        archive
+            .native_modules
+            .insert("yanxu-gui".into(), module.clone());
+        archive.content_checksum = archive_checksum(&archive).unwrap();
+        assert_eq!(decode_native_modules(&archive).unwrap().len(), 1);
+
+        let mut tampered = archive.clone();
+        let mut altered_bytes = bytes.to_vec();
+        altered_bytes[0] ^= 1;
+        tampered
+            .native_modules
+            .get_mut("yanxu-gui")
+            .unwrap()
+            .bytes_base64 = base64::engine::general_purpose::STANDARD.encode(altered_bytes);
+        tampered.content_checksum = archive_checksum(&tampered).unwrap();
+        assert!(
+            validate_archive(&tampered)
+                .unwrap_err()
+                .message
+                .contains("摘要")
+        );
+
+        let mut wrong_target = archive.clone();
+        wrong_target
+            .native_modules
+            .get_mut("yanxu-gui")
+            .unwrap()
+            .target = "x86_64-pc-windows-msvc".into();
+        wrong_target.content_checksum = archive_checksum(&wrong_target).unwrap();
+        assert!(
+            validate_archive(&wrong_target)
+                .unwrap_err()
+                .message
+                .contains("锁定元数据")
+        );
+
+        let mut traversal = archive.clone();
+        traversal.native_modules.get_mut("yanxu-gui").unwrap().file = "native/../escape".into();
+        traversal.content_checksum = archive_checksum(&traversal).unwrap();
+        assert!(
+            validate_archive(&traversal)
+                .unwrap_err()
+                .message
+                .contains("路径")
+        );
+
+        let mut excessive = archive;
+        excessive.native_modules.clear();
+        for index in 0..=package::NATIVE_ARTIFACT_MAX_COUNT {
+            let name = format!("module-{index}");
+            let mut item = module.clone();
+            item.name = name.clone();
+            item.package = name.clone();
+            excessive.native_modules.insert(name, item);
+        }
+        excessive.content_checksum = archive_checksum(&excessive).unwrap();
+        assert!(
+            validate_archive(&excessive)
+                .unwrap_err()
+                .message
+                .contains("不得超过")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

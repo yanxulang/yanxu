@@ -1,6 +1,6 @@
 [package]
 name = "yanxu"
-version = "1.1.6"
+version = "1.1.7"
 edition = "2024"
 description = "言序：以 Rust 编写的文言风格解释型编程语言"
 license = "MIT"
@@ -39,7 +39,11 @@ include = [
 ]
 
 [workspace]
-members = ["crates/yanxu-package", "examples/native-extension-rust"]
+members = [
+    "crates/yanxu-package",
+    "examples/native-extension-rust",
+    "examples/native-extension-v2-rust",
+]
 resolver = "3"
 
 [lib]
@@ -57,6 +61,8 @@ flate2 = "1"
 getrandom = "0.2"
 hmac = "0.12"
 httpdate = "1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "ico"] }
+editpe = "0.2.3"
 regex = "1"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
@@ -65,7 +71,7 @@ sha2 = "0.10"
 toml = "0.8"
 tar = "0.4"
 url = "2"
-yanxu-package = { path = "crates/yanxu-package", version = "1.1.6" }
+yanxu-package = { path = "crates/yanxu-package", version = "1.1.7" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8"

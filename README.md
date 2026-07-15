@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/YanXuLang/yanxu?include_prereleases)](https://github.com/YanXuLang/yanxu/releases)
 [![License](https://img.shields.io/badge/license-MIT-c43b2f)](LICENSE)
 
-言序是一门面向现代软件工程的中文编程语言。它使用中文关键字、标识符与诊断信息，同时提供静态检查、模块与包、结构化错误、字节码虚拟机、自包含应用和可嵌入运行时。
+言序是一门面向现代软件工程的中文编程语言。它使用中文关键字、标识符与诊断信息，同时提供静态检查、模块与包、结构化错误、字节码虚拟机、自包含应用和可嵌入运行时。1.1.7 在保持 ABI v1 兼容的同时新增原生 ABI v2、官方桌面 GUI 包和跨平台 Bundle。
 
 - [官方网站](https://yanxu.dev/)
 - [语言文档](https://docs.yanxu.dev/)
@@ -58,6 +58,14 @@ yanbao test
 
 官方 GitHub 包可省略`yanxulang/`组织名和`yanxu-`前缀；例如`yanbao add http`会添加`yanxulang/yanxu-http`。详见[言包文档](https://docs.yanxu.dev/tooling/package-manager/)。
 
+创建桌面 GUI 应用：
+
+```sh
+yanbao new 我的窗口 --gui
+yanbao run --manifest-path 我的窗口
+yanbao bundle --manifest-path 我的窗口
+```
+
 ## 语言概览
 
 ```yanxu
@@ -85,7 +93,8 @@ yanbao test
 - 显式模块导出、格式 2 项目清单和完整依赖锁图；
 - 树解释器与独立字节码 VM 的共享语言语义；
 - 25 个标准模块，覆盖文字、文件、数据、网络、字节、进程和资源；
-- YXB 字节码应用、自包含程序、C ABI、Rust 嵌入和 WASI 接口。
+- YXB 字节码应用、自包含程序、桌面 Bundle、C ABI、Rust 嵌入和 WASI 接口；
+- ABI v2 类型值、持久回调、有界宿主事件队列和父子资源生命周期。
 
 语言语法与运行语义以[语言指南](https://docs.yanxu.dev/language/)和[版本化规范](spec/language/v1/README.md)为准。
 
@@ -97,7 +106,7 @@ yanbao test
 | `yanxu check <文卷.yx>` | 静态类型检查 |
 | `yanxu test <目录>` | 运行规格测试 |
 | `yanxu fmt --write <文卷.yx>` | 格式化源码 |
-| `yanxu compile <源码或项目> -o <制品>` | 构建 YXB；`--standalone`生成自包含程序 |
+| `yanxu compile <源码或项目> -o <制品>` | 构建 YXB；`--standalone`生成自包含程序，`--bundle`生成桌面应用目录 |
 | `yanxu run <项目、.yx 或 .yxb>` | 统一运行源码与编译制品 |
 | `yanxu doc <模块或目录>` | 生成 API 文档 |
 | `yanxu lsp` | 启动 LSP 服务 |
@@ -108,20 +117,24 @@ yanbao test
 
 ## 架构与安全边界
 
-言序核心由 Rust 实现，包含词法与语法分析、静态检查、树解释器、字节码编译器与 VM、包解析、应用封装、LSP、DAP 和嵌入接口。
+言序核心由 Rust 实现，包含词法与语法分析、静态检查、树解释器、字节码编译器与 VM、包解析、应用封装、原生 ABI、宿主事件调度、LSP、DAP 和嵌入接口。GUI 作为官方`yanxu-gui`包提供，核心不内置庞大的 GUI 标准模块；言包通过版本化工程协议复用核心的清单、锁文件、YXB 和 Bundle 实现。
 
-包清单显式声明文件、环境、网络、监听、进程和原生扩展权限。YXB 应用的有效权限始终受宿主授权上限约束；锁文件记录精确来源、修订、校验和与依赖边。原生扩展是进程内受信任代码，必须通过目标、SHA-256、ABI 版本和权限门禁。
+包清单显式声明文件、环境、网络、监听、进程、原生扩展、图形界面、剪贴板和文件对话框等独立权限。YXB 应用的有效权限始终受宿主授权上限约束；锁文件记录精确来源、修订、校验和与依赖边。原生扩展是进程内受信任代码，必须通过目标、SHA-256、ABI 版本和权限门禁。
 
 进一步阅读：
 
 - [运行时架构](https://docs.yanxu.dev/project/architecture/)
 - [兼容政策](COMPATIBILITY.md)
 - [原生 ABI v1](reference/native-abi-v1.md)
+- [原生 ABI v2](reference/native-abi-v2.md)
+- [GUI 架构](reference/gui-architecture.md)
+- [GUI Bundle](reference/gui-bundle.md)
 - [安全政策](SECURITY.md)
 
 ## 生态项目
 
 - [言包](https://github.com/YanXuLang/yanbao)：官方项目与包管理工具
+- [言窗](https://github.com/YanXuLang/yanxu-gui)：官方跨平台桌面 GUI 包
 - [言序文档](https://github.com/YanXuLang/docs)：语言、工具链与生态文档
 - [VS Code 扩展](https://github.com/YanXuLang/vscode-extension)：高亮、片段与运行命令
 - [言枢](https://github.com/YanXuLang/yanxu-web)：言序 Web 应用框架

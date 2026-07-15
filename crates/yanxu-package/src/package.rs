@@ -34,6 +34,9 @@ pub const ARCHIVE_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 pub const ARCHIVE_MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
 pub const ARCHIVE_MAX_ENTRIES: usize = 4_096;
 pub const ARCHIVE_MAX_PATH_BYTES: usize = 512;
+pub const NATIVE_ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const NATIVE_ARTIFACT_MAX_COUNT: usize = 32;
+pub const NATIVE_ARTIFACT_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,11 +56,78 @@ pub struct Manifest {
     pub exports: BTreeMap<String, PathBuf>,
     pub resources: Vec<PathBuf>,
     pub build: BuildConfig,
+    pub application: Option<ApplicationConfig>,
     pub workspace_members: Vec<PathBuf>,
     pub native: Option<NativePackage>,
     pub permissions: crate::permissions::PermissionSet,
     pub root: PathBuf,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationConfig {
+    pub kind: ApplicationKind,
+    pub name: String,
+    pub identifier: String,
+    pub version: Version,
+    pub icon: Option<PathBuf>,
+    pub company: Option<String>,
+    pub minimum_system_version: Option<String>,
+    pub window: WindowConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationKind {
+    CommandLine,
+    Graphical,
+}
+
+impl ApplicationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandLine => "命令行",
+            Self::Graphical => "图形",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowConfig {
+    pub width: u32,
+    pub height: u32,
+    pub minimum_width: u32,
+    pub minimum_height: u32,
+    pub maximum_width: Option<u32>,
+    pub maximum_height: Option<u32>,
+    pub resizable: bool,
+    pub high_dpi: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationConfigEdit {
+    pub kind: ApplicationKind,
+    pub name: String,
+    pub identifier: String,
+    pub version: String,
+    pub icon: Option<PathBuf>,
+    pub company: Option<String>,
+    pub minimum_system_version: Option<String>,
+    pub window: WindowConfig,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            width: 960,
+            height: 640,
+            minimum_width: 1,
+            minimum_height: 1,
+            maximum_width: None,
+            maximum_height: None,
+            resizable: true,
+            high_dpi: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,9 +151,17 @@ pub struct NativePackage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeArtifact {
+    #[serde(default = "default_native_abi")]
+    pub abi: u32,
     pub target: String,
     pub path: String,
     pub checksum: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+const fn default_native_abi() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,6 +532,7 @@ fn resolve_graph_mode_locked(
         visiting: Vec::new(),
         target: current_target(),
         native_allowed: manifest.permissions.native_extensions_allowed(),
+        gui_allowed: manifest.permissions.graphical_interface_allowed(),
     };
     let root_dependencies = builder.resolve_table(
         manifest,
@@ -582,7 +661,27 @@ pub fn validate_lock(manifest: &Manifest) -> Result<LockFile, ManifestError> {
 pub fn manifest_template(name: &str) -> Result<String, String> {
     validate_package_name(name)?;
     Ok(format!(
-        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.6\"\n入口 = \"src/主.yx\"\n\n[依赖]\n\n[权限]\n文件 = []\n网络 = []\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
+        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.7\"\n入口 = \"src/主.yx\"\n\n[依赖]\n\n[权限]\n文件 = []\n网络 = []\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n图形界面 = false\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
+    ))
+}
+
+/// Generate the official graphical application template consumed by yanbao.
+/// Registry resolution is the release default; a path may be supplied by
+/// workspace tooling and tests without changing package semantics.
+pub fn gui_manifest_template(name: &str, gui_path: Option<&Path>) -> Result<String, String> {
+    validate_package_name(name)?;
+    let identifier = format!("dev.yanxu.app-{}", &short_hash(name)[..12]);
+    let dependency = gui_path.map_or_else(
+        || "言窗 = { 包 = \"yanxu-gui\", 版 = \"^0.1\" }".to_string(),
+        |path| {
+            format!(
+                "言窗 = {{ 包 = \"yanxu-gui\", 路径 = {:?}, 版 = \"^0.1\" }}",
+                path.to_string_lossy()
+            )
+        },
+    );
+    Ok(format!(
+        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.7\"\n入口 = \"src/主.yx\"\n\n[依赖]\n{dependency}\n\n[应用]\n类型 = \"图形\"\n名称 = {name:?}\n标识 = {identifier:?}\n版本 = \"0.1.0\"\n\n[应用.窗口]\n宽 = 800\n高 = 600\n最小宽 = 480\n最小高 = 320\n可缩放 = true\n高分屏 = true\n\n[权限]\n文件 = []\n网络 = []\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n图形界面 = true\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
     ))
 }
 
@@ -644,6 +743,91 @@ pub fn edit_dependency(
                 ));
             }
         }
+    }
+    let updated = toml::to_string_pretty(&document)
+        .map_err(|error| manifest_error(manifest_path, None, format!("不能生成清单：{error}")))?;
+    atomic_write(manifest_path, updated.as_bytes(), "清单")?;
+    match load(manifest_path) {
+        Ok(manifest) => {
+            graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .remove(&graph_cache_key(&manifest.root));
+            Ok(manifest)
+        }
+        Err(error) => {
+            let _ = atomic_write(manifest_path, original.as_bytes(), "清单回滚");
+            Err(error)
+        }
+    }
+}
+
+/// 通过包核心原子写入或移除应用配置，写入后使用同一清单解析器复核。
+pub fn edit_application(
+    manifest_path: impl AsRef<Path>,
+    application: Option<&ApplicationConfigEdit>,
+) -> Result<Manifest, ManifestError> {
+    let manifest_path = manifest_path.as_ref();
+    let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let _project_lock = acquire_project_lock(root)?;
+    let original = fs::read_to_string(manifest_path)
+        .map_err(|error| manifest_error(manifest_path, None, format!("不能读取以修改：{error}")))?;
+    load(manifest_path)?;
+    let normalized = normalize_manifest_toml(&original);
+    let mut document: toml::Value = toml::from_str(&normalized)
+        .map_err(|error| manifest_error(manifest_path, None, error.to_string()))?;
+    let document = document
+        .as_table_mut()
+        .ok_or_else(|| manifest_error(manifest_path, None, "清单根必须为 TOML 表"))?;
+    document.remove("应用");
+    document.remove("application");
+    if let Some(application) = application {
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "类型".into(),
+            toml::Value::String(application.kind.as_str().into()),
+        );
+        table.insert("名称".into(), toml::Value::String(application.name.clone()));
+        table.insert(
+            "标识".into(),
+            toml::Value::String(application.identifier.clone()),
+        );
+        table.insert(
+            "版本".into(),
+            toml::Value::String(application.version.clone()),
+        );
+        if let Some(icon) = &application.icon {
+            table.insert(
+                "图标".into(),
+                toml::Value::String(icon.to_string_lossy().into_owned()),
+            );
+        }
+        if let Some(company) = &application.company {
+            table.insert("公司".into(), toml::Value::String(company.clone()));
+        }
+        if let Some(version) = &application.minimum_system_version {
+            table.insert("最低系统版本".into(), toml::Value::String(version.clone()));
+        }
+        let window = &application.window;
+        let mut window_table = toml::map::Map::new();
+        for (name, value) in [
+            ("宽", window.width),
+            ("高", window.height),
+            ("最小宽", window.minimum_width),
+            ("最小高", window.minimum_height),
+        ] {
+            window_table.insert(name.into(), toml::Value::Integer(i64::from(value)));
+        }
+        if let Some(value) = window.maximum_width {
+            window_table.insert("最大宽".into(), toml::Value::Integer(i64::from(value)));
+        }
+        if let Some(value) = window.maximum_height {
+            window_table.insert("最大高".into(), toml::Value::Integer(i64::from(value)));
+        }
+        window_table.insert("可缩放".into(), toml::Value::Boolean(window.resizable));
+        window_table.insert("高分屏".into(), toml::Value::Boolean(window.high_dpi));
+        table.insert("窗口".into(), toml::Value::Table(window_table));
+        document.insert("应用".into(), toml::Value::Table(table));
     }
     let updated = toml::to_string_pretty(&document)
         .map_err(|error| manifest_error(manifest_path, None, format!("不能生成清单：{error}")))?;
@@ -876,7 +1060,7 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         return Err(manifest_error(
             &path,
             None,
-            format!("1.1.6 仅支持“字节码”构建目标，不支持“{}”", build.target),
+            format!("1.1.7 仅支持“字节码”构建目标，不支持“{}”", build.target),
         ));
     }
 
@@ -892,6 +1076,7 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         .collect::<Result<Vec<_>, ManifestError>>()?;
 
     let native = parse_native_package(&document, &path)?;
+    let application = parse_application_config(&document, &path, &root)?;
     let mut permissions = crate::permissions::PermissionSet::sandboxed();
     if let Some(table) = table_alias(&document, &["权限", "permissions"]) {
         for permission_path in array_alias(table, &["文件", "file"]).unwrap_or_default() {
@@ -915,6 +1100,38 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         if bool_alias(table, &["原生扩展", "native_extensions"]).unwrap_or(false) {
             permissions = permissions.allow_native_extensions();
         }
+        if bool_alias(table, &["图形界面", "gui", "graphical_interface"]).unwrap_or(false) {
+            permissions = permissions.allow_graphical_interface();
+        }
+        if bool_alias(table, &["剪贴板", "clipboard"]).unwrap_or(false) {
+            permissions = permissions.allow_clipboard();
+        }
+        if bool_alias(table, &["文件对话框", "file_dialog"]).unwrap_or(false) {
+            permissions = permissions.allow_file_dialog();
+        }
+        if bool_alias(table, &["系统通知", "system_notifications"]).unwrap_or(false) {
+            permissions = permissions.allow_system_notifications();
+        }
+        if bool_alias(table, &["托盘", "tray"]).unwrap_or(false) {
+            permissions = permissions.allow_tray();
+        }
+        if bool_alias(table, &["打开外部地址", "open_external_url"]).unwrap_or(false) {
+            permissions = permissions.allow_open_external_url();
+        }
+        if bool_alias(table, &["全局快捷键", "global_shortcuts"]).unwrap_or(false) {
+            permissions = permissions.allow_global_shortcuts();
+        }
+    }
+    if application
+        .as_ref()
+        .is_some_and(|application| application.kind == ApplicationKind::Graphical)
+        && !permissions.graphical_interface_allowed()
+    {
+        return Err(manifest_error(
+            &path,
+            None,
+            "图形应用必须在【权限】中声明“图形界面 = true”",
+        ));
     }
     Ok(Manifest {
         format_version: format_version as u32,
@@ -932,6 +1149,7 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         exports,
         resources,
         build,
+        application,
         workspace_members,
         native,
         permissions,
@@ -953,7 +1171,18 @@ pub fn normalize_manifest_toml(text: &str) -> String {
             if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
                 let section = &trimmed[1..trimmed.len() - 1];
                 if !section.starts_with(['\'', '"']) && !section.is_ascii() {
-                    return format!("{indentation}[\"{section}\"]");
+                    let section = section
+                        .split('.')
+                        .map(|component| {
+                            if component.is_ascii() {
+                                component.to_owned()
+                            } else {
+                                format!("\"{component}\"")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    return format!("{indentation}[{section}]");
                 }
             }
             let mut normalized = line.to_owned();
@@ -1066,11 +1295,11 @@ fn parse_native_package(
         return Ok(None);
     };
     let abi_version = integer_alias(table, &["ABI", "abi"]).unwrap_or(1);
-    if abi_version != 1 {
+    if !matches!(abi_version, 1 | 2) {
         return Err(manifest_error(
             manifest_path,
             None,
-            format!("不支持原生扩展 ABI {abi_version}，1.1.6 仅支持 ABI 1"),
+            format!("不支持原生扩展 ABI {abi_version}，1.1.7 支持 ABI 1、2"),
         ));
     }
     let mut artifacts = BTreeMap::new();
@@ -1109,12 +1338,48 @@ fn parse_native_package(
                     format!("原生制品 {os}.{architecture} 的校验和须为 64 位十六进制 SHA-256"),
                 ));
             }
+            let full_path = manifest_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&relative);
+            let metadata = fs::symlink_metadata(&full_path).map_err(|error| {
+                manifest_error(&full_path, None, format!("不能检查原生制品：{error}"))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(manifest_error(
+                    &full_path,
+                    None,
+                    "原生制品必须是普通文件，不得为符号链接或特殊文件",
+                ));
+            }
+            if metadata.len() > NATIVE_ARTIFACT_MAX_BYTES {
+                return Err(manifest_error(
+                    &full_path,
+                    None,
+                    format!("原生制品不得超过 {NATIVE_ARTIFACT_MAX_BYTES} 字节"),
+                ));
+            }
+            let declared_size = integer_alias(artifact, &["大小", "size"])
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(metadata.len());
+            if declared_size != metadata.len() {
+                return Err(manifest_error(
+                    &full_path,
+                    None,
+                    format!(
+                        "原生制品声明大小 {declared_size} 与实际 {} 不符",
+                        metadata.len()
+                    ),
+                ));
+            }
             artifacts.insert(
                 target.clone(),
                 NativeArtifact {
+                    abi: abi_version as u32,
                     target,
                     path: path.to_owned(),
                     checksum: checksum.to_ascii_lowercase(),
+                    size: metadata.len(),
                 },
             );
         }
@@ -1126,10 +1391,239 @@ fn parse_native_package(
             "【原生】声明 ABI 后至少须提供一个平台制品",
         ));
     }
+    if artifacts.len() > NATIVE_ARTIFACT_MAX_COUNT {
+        return Err(manifest_error(
+            manifest_path,
+            None,
+            format!("原生制品不得超过 {NATIVE_ARTIFACT_MAX_COUNT} 个"),
+        ));
+    }
+    let total_size = artifacts
+        .values()
+        .try_fold(0_u64, |total, artifact| total.checked_add(artifact.size));
+    if total_size.is_none_or(|total| total > NATIVE_ARTIFACT_MAX_TOTAL_BYTES) {
+        return Err(manifest_error(
+            manifest_path,
+            None,
+            format!("原生制品总大小不得超过 {NATIVE_ARTIFACT_MAX_TOTAL_BYTES} 字节"),
+        ));
+    }
     Ok(Some(NativePackage {
         abi_version: abi_version as u32,
         artifacts,
     }))
+}
+
+fn parse_application_config(
+    document: &toml::Value,
+    manifest_path: &Path,
+    root: &Path,
+) -> Result<Option<ApplicationConfig>, ManifestError> {
+    let Some(table) = table_alias(document, &["应用", "application"]) else {
+        return Ok(None);
+    };
+    let kind = match string_alias(table, &["类型", "type", "kind"])
+        .ok_or_else(|| manifest_error(manifest_path, None, "【应用】缺少字符串“类型”"))?
+    {
+        "图形" | "gui" | "graphical" => ApplicationKind::Graphical,
+        "命令行" | "cli" | "console" => ApplicationKind::CommandLine,
+        other => {
+            return Err(manifest_error(
+                manifest_path,
+                None,
+                format!("应用类型只可为“图形”或“命令行”，不可为“{other}”"),
+            ));
+        }
+    };
+    let name = string_alias(table, &["名称", "名", "name"])
+        .filter(|name| !name.trim().is_empty() && name.chars().count() <= 128)
+        .ok_or_else(|| manifest_error(manifest_path, None, "应用名称须为 1–128 个字符"))?
+        .to_owned();
+    let identifier = string_alias(table, &["标识", "identifier", "bundle_identifier"])
+        .ok_or_else(|| manifest_error(manifest_path, None, "【应用】缺少字符串“标识”"))?;
+    validate_application_identifier(identifier)
+        .map_err(|message| manifest_error(manifest_path, None, message))?;
+    let version = string_alias(table, &["版本", "版", "version"])
+        .ok_or_else(|| manifest_error(manifest_path, None, "【应用】缺少字符串“版本”"))?;
+    let version = Version::parse(version).map_err(|error| {
+        manifest_error(
+            manifest_path,
+            None,
+            format!("应用版本须为语义化版本：{error}"),
+        )
+    })?;
+    let icon = string_alias(table, &["图标", "icon"])
+        .map(PathBuf::from)
+        .map(|icon| {
+            validate_relative_path(&icon, "应用图标")?;
+            let full_path = root.join(&icon);
+            let metadata = fs::symlink_metadata(&full_path).map_err(|error| {
+                manifest_error(&full_path, None, format!("不能检查应用图标：{error}"))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(manifest_error(
+                    &full_path,
+                    None,
+                    "应用图标必须是包内普通文件，不得为符号链接或特殊文件",
+                ));
+            }
+            let canonical_root = fs::canonicalize(root).map_err(|error| {
+                manifest_error(root, None, format!("不能定位包根目录：{error}"))
+            })?;
+            let canonical_icon = fs::canonicalize(&full_path).map_err(|error| {
+                manifest_error(&full_path, None, format!("不能定位应用图标：{error}"))
+            })?;
+            if !canonical_icon.starts_with(canonical_root) {
+                return Err(manifest_error(&full_path, None, "应用图标越出包根目录"));
+            }
+            Ok(icon)
+        })
+        .transpose()?;
+    let company = string_alias(table, &["公司", "company"])
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let minimum_system_version = string_alias(table, &["最低系统版本", "minimum_system_version"])
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let window = table
+        .iter()
+        .find_map(|(name, value)| {
+            matches!(name.as_str(), "窗口" | "window")
+                .then(|| value.as_table())
+                .flatten()
+        })
+        .map(|window| parse_window_config(window, manifest_path))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Some(ApplicationConfig {
+        kind,
+        name,
+        identifier: identifier.to_owned(),
+        version,
+        icon,
+        company,
+        minimum_system_version,
+        window,
+    }))
+}
+
+fn parse_window_config(
+    table: &toml::map::Map<String, toml::Value>,
+    manifest_path: &Path,
+) -> Result<WindowConfig, ManifestError> {
+    let defaults = WindowConfig::default();
+    let width = window_dimension(table, &["宽", "width"], defaults.width, manifest_path)?;
+    let height = window_dimension(table, &["高", "height"], defaults.height, manifest_path)?;
+    let minimum_width = window_dimension(
+        table,
+        &["最小宽", "minimum_width", "min_width"],
+        defaults.minimum_width,
+        manifest_path,
+    )?;
+    let minimum_height = window_dimension(
+        table,
+        &["最小高", "minimum_height", "min_height"],
+        defaults.minimum_height,
+        manifest_path,
+    )?;
+    let maximum_width = optional_window_dimension(
+        table,
+        &["最大宽", "maximum_width", "max_width"],
+        manifest_path,
+    )?;
+    let maximum_height = optional_window_dimension(
+        table,
+        &["最大高", "maximum_height", "max_height"],
+        manifest_path,
+    )?;
+    if minimum_width > width || minimum_height > height {
+        return Err(manifest_error(
+            manifest_path,
+            None,
+            "窗口最小尺寸不得大于默认尺寸",
+        ));
+    }
+    if maximum_width.is_some_and(|maximum| maximum < width)
+        || maximum_height.is_some_and(|maximum| maximum < height)
+    {
+        return Err(manifest_error(
+            manifest_path,
+            None,
+            "窗口最大尺寸不得小于默认尺寸",
+        ));
+    }
+    Ok(WindowConfig {
+        width,
+        height,
+        minimum_width,
+        minimum_height,
+        maximum_width,
+        maximum_height,
+        resizable: bool_alias(table, &["可缩放", "resizable"]).unwrap_or(true),
+        high_dpi: bool_alias(table, &["高分屏", "high_dpi"]).unwrap_or(true),
+    })
+}
+
+fn window_dimension(
+    table: &toml::map::Map<String, toml::Value>,
+    names: &[&str],
+    default: u32,
+    manifest_path: &Path,
+) -> Result<u32, ManifestError> {
+    optional_window_dimension(table, names, manifest_path).map(|value| value.unwrap_or(default))
+}
+
+fn optional_window_dimension(
+    table: &toml::map::Map<String, toml::Value>,
+    names: &[&str],
+    manifest_path: &Path,
+) -> Result<Option<u32>, ManifestError> {
+    let Some((name, value)) = names
+        .iter()
+        .find_map(|name| table.get(*name).map(|value| (*name, value)))
+    else {
+        return Ok(None);
+    };
+    let value = value
+        .as_integer()
+        .and_then(|value| u32::try_from(value).ok());
+    match value {
+        Some(value @ 1..=16_384) => Ok(Some(value)),
+        _ => Err(manifest_error(
+            manifest_path,
+            None,
+            format!("窗口尺寸“{name}”须为 1–16384 的整数"),
+        )),
+    }
+}
+
+fn validate_application_identifier(identifier: &str) -> Result<(), String> {
+    if identifier.len() > 255 || !identifier.is_ascii() {
+        return Err("应用标识须为不超过 255 字节的 ASCII 反向域名".into());
+    }
+    let labels = identifier.split('.').collect::<Vec<_>>();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                || !label
+                    .bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(
+            "应用标识须为反向域名（例如 dev.yanxu.myapp），标签仅含字母、数字和连字符".into(),
+        );
+    }
+    Ok(())
 }
 
 fn native_target(os: &str, architecture: &str) -> String {
@@ -1199,6 +1693,7 @@ struct GraphBuilder<'a> {
     visiting: Vec<String>,
     target: String,
     native_allowed: bool,
+    gui_allowed: bool,
 }
 
 impl GraphBuilder<'_> {
@@ -1255,12 +1750,17 @@ impl GraphBuilder<'_> {
                 &dependency_manifest.dependency_packages,
             )?;
             let native = selected_native_artifact(&dependency_manifest, &self.target)?;
-            if native.is_some() && !self.native_allowed {
+            let official_gui_native = native.as_ref().is_some_and(|artifact| {
+                self.gui_allowed
+                    && artifact.abi == 2
+                    && matches!(dependency_manifest.name.as_str(), "yanxu-gui" | "言窗")
+            });
+            if native.is_some() && !self.native_allowed && !official_gui_native {
                 return Err(manifest_error(
                     &manifest.path,
                     None,
                     format!(
-                        "依赖“{}”包含原生扩展；顶层【权限】必须显式设置 原生扩展 = true",
+                        "依赖“{}”包含原生扩展；顶层【权限】必须显式设置 原生扩展 = true（官方 yanxu-gui ABI v2 后端可改由 图形界面 = true 授权）",
                         dependency_manifest.name
                     ),
                 ));
@@ -1359,6 +1859,26 @@ fn selected_native_artifact(
         )
     })?;
     let path = manifest.root.join(&artifact.path);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| manifest_error(&path, None, format!("不能检查原生制品：{error}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(manifest_error(
+            &path,
+            None,
+            "原生制品必须是普通文件，不得为符号链接或特殊文件",
+        ));
+    }
+    if metadata.len() != artifact.size || metadata.len() > NATIVE_ARTIFACT_MAX_BYTES {
+        return Err(manifest_error(
+            &path,
+            None,
+            format!(
+                "原生制品大小不符或超限：锁定 {}，实际 {}",
+                artifact.size,
+                metadata.len()
+            ),
+        ));
+    }
     let actual = file_checksum(&path)?;
     if actual != artifact.checksum {
         return Err(manifest_error(
@@ -2758,6 +3278,89 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("不支持包清单格式版本 3"));
+    }
+
+    #[test]
+    fn graphical_application_template_is_complete_and_valid() {
+        let root = temp("gui-template");
+        write(&root.join("src/主.yx"), "言「善哉」；\n");
+        write(
+            &root.join(MANIFEST_NAME),
+            &gui_manifest_template("窗口应用", Some(Path::new("../yanxu-gui"))).unwrap(),
+        );
+
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let application = manifest.application.as_ref().unwrap();
+        assert_eq!(application.kind, ApplicationKind::Graphical);
+        assert_eq!(application.name, "窗口应用");
+        assert!(application.identifier.starts_with("dev.yanxu.app-"));
+        assert_eq!(application.window.width, 800);
+        assert_eq!(application.window.minimum_width, 480);
+        assert!(manifest.permissions.check_graphical_interface().is_ok());
+        assert!(manifest.permissions.check_clipboard().is_err());
+        assert!(matches!(
+            manifest.dependencies.get("言窗"),
+            Some(Dependency::Path { requirement: Some(requirement), .. })
+                if requirement.to_string() == "^0.1"
+        ));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn graphical_application_rejects_invalid_identity_dimensions_and_permissions() {
+        let root = temp("invalid-gui-manifest");
+        write(&root.join("src/主.yx"), "言「善哉」；\n");
+        let valid = gui_manifest_template("窗口应用", Some(Path::new("../yanxu-gui"))).unwrap();
+        let cases = [
+            (
+                valid.replace("dev.yanxu.app-", "没有反向域名-"),
+                "ASCII 反向域名",
+            ),
+            (
+                valid.replace("最小宽 = 480", "最小宽 = 900"),
+                "最小尺寸不得大于默认尺寸",
+            ),
+            (
+                valid.replace("图形界面 = true", "图形界面 = false"),
+                "图形界面 = true",
+            ),
+        ];
+        for (index, (text, expected)) in cases.into_iter().enumerate() {
+            let path = root.join(format!("无效-{index}.toml"));
+            write(&path, &text);
+            let error = load(path).unwrap_err();
+            assert!(
+                error.message.contains(expected),
+                "expected {expected:?} in {:?}",
+                error.message
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graphical_application_icon_must_be_a_regular_in_package_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("gui-icon-symlink");
+        write(&root.join("src/主.yx"), "言「善哉」；\n");
+        let outside = root.with_extension("outside.png");
+        write(&outside, "not an icon");
+        fs::create_dir_all(root.join("assets")).unwrap();
+        symlink(&outside, root.join("assets/icon.png")).unwrap();
+        let manifest = gui_manifest_template("窗口应用", Some(Path::new("../yanxu-gui")))
+            .unwrap()
+            .replace(
+                "版本 = \"0.1.0\"\n\n[应用.窗口]",
+                "版本 = \"0.1.0\"\n图标 = \"assets/icon.png\"\n\n[应用.窗口]",
+            );
+        write(&root.join(MANIFEST_NAME), &manifest);
+
+        let error = load(root.join(MANIFEST_NAME)).unwrap_err();
+        assert!(error.message.contains("不得为符号链接"));
+        fs::remove_dir_all(root).ok();
+        fs::remove_file(outside).ok();
     }
 
     #[test]

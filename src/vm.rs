@@ -10,15 +10,17 @@ use crate::bytecode::{
     Chunk, ClassPrototype, Constant, FieldPrototype, FunctionPrototype, Instruction,
 };
 use crate::source::Span;
+use crate::{host_events, host_handles, native_abi_v2};
 pub use native::VmNative;
 use native::{NativeKind, StandardNative};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicPtr, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type EnvRef = Rc<RefCell<Environment>>;
@@ -44,6 +46,8 @@ pub enum VmValue {
     Error(Rc<VmErrorValue>),
     Task(Rc<RefCell<VmTask>>),
     Socket(Rc<RefCell<crate::stdlib::SocketHandle>>),
+    NativeModuleV2(Rc<native_abi_v2::NativeExtensionV2>),
+    NativeResource(u64),
 }
 
 impl fmt::Debug for VmValue {
@@ -82,6 +86,8 @@ impl VmValue {
             Self::Error(_) => "误".into(),
             Self::Task(_) => "任务".into(),
             Self::Socket(_) => "套接字".into(),
+            Self::NativeModuleV2(_) => "原生模块".into(),
+            Self::NativeResource(_) => "原生资源".into(),
         }
     }
 
@@ -130,6 +136,8 @@ impl fmt::Display for VmValue {
             Self::Socket(socket) => {
                 write!(formatter, "<套接字 {}>", socket.borrow().kind_name())
             }
+            Self::NativeModuleV2(module) => write!(formatter, "<原生模块 {}>", module.name()),
+            Self::NativeResource(handle) => write!(formatter, "<原生资源 {handle}>"),
         }
     }
 }
@@ -411,6 +419,296 @@ struct CachedChunk {
     chunk: Rc<Chunk>,
 }
 
+struct VmHostShared {
+    event_loop: host_events::BoundedHostEventLoop,
+    callback_validity: host_handles::CallbackValidity,
+    owner: AtomicPtr<VmHostState>,
+    owner_thread: std::thread::ThreadId,
+    permissions: std::sync::RwLock<crate::permissions::PermissionSet>,
+}
+
+struct VmHostState {
+    shared: Box<VmHostShared>,
+    host: native_abi_v2::YanxuNativeHostV2,
+    callbacks: RefCell<host_handles::CallbackRegistry<VmValue>>,
+    resources: RefCell<host_handles::ResourceRegistry>,
+    vm: Cell<*mut Vm>,
+    pumping: Cell<bool>,
+    active_extension: RefCell<Option<String>>,
+    current_directory: RefCell<PathBuf>,
+    last_pump_error: RefCell<Option<VmError>>,
+}
+
+impl VmHostState {
+    fn new(permissions: crate::permissions::PermissionSet) -> Box<Self> {
+        let callbacks = host_handles::CallbackRegistry::new();
+        let callback_validity = callbacks.validity();
+        let event_loop = host_events::BoundedHostEventLoop::default();
+        let event_loop_id = event_loop.id();
+        let shared = Box::new(VmHostShared {
+            event_loop,
+            callback_validity,
+            owner: AtomicPtr::new(std::ptr::null_mut()),
+            owner_thread: std::thread::current().id(),
+            permissions: std::sync::RwLock::new(permissions),
+        });
+        let mut state = Box::new(Self {
+            shared,
+            host: native_abi_v2::YanxuNativeHostV2 {
+                abi_version: native_abi_v2::NATIVE_ABI_VERSION_V2,
+                struct_size: std::mem::size_of::<native_abi_v2::YanxuNativeHostV2>(),
+                context: std::ptr::null_mut(),
+                callback_retain: Some(native_host_callback_retain),
+                callback_release: Some(native_host_callback_release),
+                callback_post: Some(native_host_callback_post),
+                wake: Some(native_host_wake),
+                pump: Some(native_host_pump),
+                has_permission: Some(native_host_has_permission),
+                resource_get: Some(native_host_resource_get),
+                event_loop_id,
+                owner_thread_token: event_loop_id,
+            },
+            callbacks: RefCell::new(callbacks),
+            resources: RefCell::new(host_handles::ResourceRegistry::new(event_loop_id)),
+            vm: Cell::new(std::ptr::null_mut()),
+            pumping: Cell::new(false),
+            active_extension: RefCell::new(None),
+            current_directory: RefCell::new(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ),
+            last_pump_error: RefCell::new(None),
+        });
+        let state_pointer = (&mut *state) as *mut VmHostState;
+        state
+            .shared
+            .owner
+            .store(state_pointer, AtomicOrdering::Release);
+        state.host.context = (&*state.shared as *const VmHostShared).cast_mut().cast();
+        state
+    }
+
+    fn set_permissions(&self, permissions: crate::permissions::PermissionSet) {
+        *self
+            .shared
+            .permissions
+            .write()
+            .expect("native host permissions poisoned") = permissions;
+    }
+}
+
+impl Drop for VmHostState {
+    fn drop(&mut self) {
+        self.vm.set(std::ptr::null_mut());
+        self.shared
+            .owner
+            .store(std::ptr::null_mut(), AtomicOrdering::Release);
+        let _ = self.callbacks.get_mut().close();
+        let _ = self.resources.get_mut().close_all();
+        host_events::HostEventLoop::quit(&self.shared.event_loop);
+    }
+}
+
+static NATIVE_HOST_ERROR_CODE: &[u8] = b"GUI_HOST_ERROR";
+static NATIVE_HOST_ERROR_MESSAGE: &[u8] = b"host callback operation failed";
+
+fn write_native_host_error(error: *mut native_abi_v2::YanxuNativeErrorV2) {
+    if let Some(error) = unsafe { error.as_mut() } {
+        *error = native_abi_v2::YanxuNativeErrorV2 {
+            code: NATIVE_HOST_ERROR_CODE.as_ptr(),
+            code_length: NATIVE_HOST_ERROR_CODE.len(),
+            message: NATIVE_HOST_ERROR_MESSAGE.as_ptr(),
+            message_length: NATIVE_HOST_ERROR_MESSAGE.len(),
+        };
+    }
+}
+
+unsafe fn native_host_shared<'a>(context: *mut std::ffi::c_void) -> Option<&'a VmHostShared> {
+    unsafe { context.cast::<VmHostShared>().as_ref() }
+}
+
+unsafe fn native_host_state<'a>(context: *mut std::ffi::c_void) -> Option<&'a VmHostState> {
+    let shared = unsafe { native_host_shared(context) }?;
+    if std::thread::current().id() != shared.owner_thread {
+        return None;
+    }
+    let state = shared.owner.load(AtomicOrdering::Acquire);
+    unsafe { state.as_ref() }
+}
+
+unsafe extern "C" fn native_host_callback_retain(
+    context: *mut std::ffi::c_void,
+    callback: u64,
+) -> i32 {
+    let Some(state) = (unsafe { native_host_state(context) }) else {
+        return native_abi_v2::NATIVE_V2_ERROR;
+    };
+    match state.callbacks.borrow_mut().retain(callback) {
+        Ok(()) => native_abi_v2::NATIVE_V2_OK,
+        Err(_) => native_abi_v2::NATIVE_V2_ERROR,
+    }
+}
+
+unsafe extern "C" fn native_host_callback_release(
+    context: *mut std::ffi::c_void,
+    callback: u64,
+) -> i32 {
+    let Some(state) = (unsafe { native_host_state(context) }) else {
+        return native_abi_v2::NATIVE_V2_ERROR;
+    };
+    match state.callbacks.borrow_mut().release(callback) {
+        Ok(()) => native_abi_v2::NATIVE_V2_OK,
+        Err(_) => native_abi_v2::NATIVE_V2_ERROR,
+    }
+}
+
+unsafe extern "C" fn native_host_callback_post(
+    context: *mut std::ffi::c_void,
+    callback: u64,
+    arguments: *const native_abi_v2::YanxuValueV2,
+    argument_count: usize,
+    error: *mut native_abi_v2::YanxuNativeErrorV2,
+) -> i32 {
+    let Some(shared) = (unsafe { native_host_shared(context) }) else {
+        write_native_host_error(error);
+        return native_abi_v2::NATIVE_V2_ERROR;
+    };
+    if !shared.callback_validity.is_live(callback) {
+        write_native_host_error(error);
+        return native_abi_v2::NATIVE_V2_ERROR;
+    }
+    let arguments = match unsafe { native_abi_v2::copy_posted_arguments(arguments, argument_count) }
+    {
+        Ok(arguments) => arguments,
+        Err(_) => {
+            write_native_host_error(error);
+            return native_abi_v2::NATIVE_V2_ERROR;
+        }
+    };
+    match shared
+        .callback_validity
+        .post(&shared.event_loop, callback, arguments)
+    {
+        Ok(()) => native_abi_v2::NATIVE_V2_OK,
+        Err(_) => {
+            write_native_host_error(error);
+            native_abi_v2::NATIVE_V2_ERROR
+        }
+    }
+}
+
+unsafe extern "C" fn native_host_wake(context: *mut std::ffi::c_void) {
+    if let Some(shared) = unsafe { native_host_shared(context) } {
+        host_events::HostEventLoop::wake(&shared.event_loop);
+    }
+}
+
+unsafe extern "C" fn native_host_pump(
+    context: *mut std::ffi::c_void,
+    maximum_events: usize,
+    error: *mut native_abi_v2::YanxuNativeErrorV2,
+) -> i32 {
+    let Some(state) = (unsafe { native_host_state(context) }) else {
+        write_native_host_error(error);
+        return native_abi_v2::NATIVE_V2_ERROR;
+    };
+    if state.pumping.replace(true) {
+        write_native_host_error(error);
+        *state.last_pump_error.borrow_mut() = Some(VmError {
+            code: "GUI_REENTRANT_CALL",
+            message: "宿主事件泵不可嵌套进入".into(),
+            span: Span::synthetic(),
+            frames: Vec::new(),
+        });
+        return native_abi_v2::NATIVE_V2_ERROR;
+    }
+    let vm = state.vm.get();
+    if vm.is_null() {
+        state.pumping.set(false);
+        write_native_host_error(error);
+        return native_abi_v2::NATIVE_V2_ERROR;
+    }
+    let maximum_events = maximum_events.clamp(1, host_events::DEFAULT_HOST_EVENT_CAPACITY);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `vm` is installed only for the duration of an owner-thread native call.
+        unsafe { (&mut *vm).pump_host_events(maximum_events) }
+    }));
+    state.pumping.set(false);
+    match result {
+        Ok(Ok(_)) => native_abi_v2::NATIVE_V2_OK,
+        Ok(Err(runtime_error)) => {
+            *state.last_pump_error.borrow_mut() = Some(runtime_error);
+            write_native_host_error(error);
+            native_abi_v2::NATIVE_V2_ERROR
+        }
+        Err(_) => {
+            *state.last_pump_error.borrow_mut() = Some(VmError {
+                code: "NATIVE_PANIC",
+                message: "宿主事件泵 panic 已在 FFI 边界隔离".into(),
+                span: Span::synthetic(),
+                frames: Vec::new(),
+            });
+            write_native_host_error(error);
+            native_abi_v2::NATIVE_V2_ERROR
+        }
+    }
+}
+
+unsafe extern "C" fn native_host_has_permission(
+    context: *mut std::ffi::c_void,
+    capability: *const u8,
+    capability_length: usize,
+) -> i32 {
+    let Some(shared) = (unsafe { native_host_shared(context) }) else {
+        return 0;
+    };
+    if capability.is_null() || capability_length == 0 || capability_length > 1_024 {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(capability, capability_length) };
+    let Ok(capability) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    let permissions = shared
+        .permissions
+        .read()
+        .expect("native host permissions poisoned");
+    let granted = match capability {
+        "图形界面" | "gui" => permissions.graphical_interface_allowed(),
+        "剪贴板" | "clipboard" => permissions.clipboard_allowed(),
+        "文件对话框" | "file_dialog" => permissions.file_dialog_allowed(),
+        "系统通知" | "system_notifications" => permissions.system_notifications_allowed(),
+        "托盘" | "tray" => permissions.tray_allowed(),
+        "打开外部地址" | "open_external_url" => permissions.open_external_url_allowed(),
+        "全局快捷键" | "global_shortcuts" => permissions.global_shortcuts_allowed(),
+        "原生扩展" | "native_extensions" => permissions.native_extensions_allowed(),
+        _ => false,
+    };
+    i32::from(granted)
+}
+
+unsafe extern "C" fn native_host_resource_get(
+    context: *mut std::ffi::c_void,
+    resource: u64,
+    raw_resource: *mut *mut std::ffi::c_void,
+) -> i32 {
+    let Some(state) = (unsafe { native_host_state(context) }) else {
+        return native_abi_v2::NATIVE_V2_ERROR;
+    };
+    let Some(raw_resource) = (unsafe { raw_resource.as_mut() }) else {
+        return native_abi_v2::NATIVE_V2_ERROR;
+    };
+    let Some(extension) = state.active_extension.borrow().clone() else {
+        return native_abi_v2::NATIVE_V2_ERROR;
+    };
+    match state.resources.borrow().raw_pointer(resource, &extension) {
+        Ok(pointer) => {
+            *raw_resource = pointer;
+            native_abi_v2::NATIVE_V2_OK
+        }
+        Err(_) => native_abi_v2::NATIVE_V2_ERROR,
+    }
+}
+
 pub struct Vm {
     stack: Vec<VmValue>,
     globals: EnvRef,
@@ -428,12 +726,16 @@ pub struct Vm {
     application_module_cache: HashMap<String, Rc<VmModule>>,
     loading_application_modules: Vec<String>,
     application_resources: Option<Rc<std::collections::BTreeMap<String, Vec<u8>>>>,
+    application_native_modules:
+        Option<Rc<std::collections::BTreeMap<String, crate::application::DecodedNativeModule>>>,
     package_root: Option<PathBuf>,
     package_module_roots: Vec<PathBuf>,
     permissions: crate::permissions::PermissionSet,
     socket_quota: crate::stdlib::SocketQuota,
     arguments: Vec<String>,
     resources: crate::budget::ResourceMeter,
+    native_extensions_v2: HashMap<String, Rc<native_abi_v2::NativeExtensionV2>>,
+    host_state: Box<VmHostState>,
 }
 
 enum Step {
@@ -452,22 +754,25 @@ impl Vm {
 
     pub fn with_permissions(permissions: crate::permissions::PermissionSet) -> Self {
         let mut vm = Self::with_echo(true);
-        vm.permissions = permissions;
+        vm.set_permissions(permissions);
         vm
     }
 
     pub fn silent_with_permissions(permissions: crate::permissions::PermissionSet) -> Self {
         let mut vm = Self::with_echo(false);
-        vm.permissions = permissions;
+        vm.set_permissions(permissions);
         vm
     }
 
     pub fn set_permissions(&mut self, permissions: crate::permissions::PermissionSet) {
+        self.host_state.set_permissions(permissions.clone());
         self.permissions = permissions;
     }
 
     fn with_echo(echo: bool) -> Self {
         let globals = Rc::new(RefCell::new(Environment::default()));
+        let permissions = crate::permissions::PermissionSet::unrestricted();
+        let host_state = VmHostState::new(permissions.clone());
         let vm = Self {
             stack: Vec::new(),
             globals: globals.clone(),
@@ -489,12 +794,15 @@ impl Vm {
             application_module_cache: HashMap::new(),
             loading_application_modules: Vec::new(),
             application_resources: None,
+            application_native_modules: None,
             package_root: None,
             package_module_roots: Vec::new(),
-            permissions: crate::permissions::PermissionSet::unrestricted(),
+            permissions,
             socket_quota: crate::stdlib::SocketQuota::default(),
             arguments: Vec::new(),
             resources: crate::budget::ResourceMeter::new(crate::budget::ExecutionBudget::default()),
+            native_extensions_v2: HashMap::new(),
+            host_state,
         };
         for (name, arity, kind) in [
             ("时刻", 0, NativeKind::Clock),
@@ -604,10 +912,13 @@ impl Vm {
             .ok_or_else(|| error(&Span::synthetic(), "YXB 应用缺少入口模块"))?;
         let resources = crate::application::decode_resources(archive)
             .map_err(|runtime_error| error(&Span::synthetic(), runtime_error.to_string()))?;
+        let native_modules = crate::application::decode_native_modules(archive)
+            .map_err(|runtime_error| error(&Span::synthetic(), runtime_error.to_string()))?;
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let application_permissions = archive.permissions.to_permissions(&directory);
         let effective_permissions = self.permissions.intersect(&application_permissions);
         let previous_permissions = std::mem::replace(&mut self.permissions, effective_permissions);
+        self.host_state.set_permissions(self.permissions.clone());
         let previous_modules = std::mem::replace(
             &mut self.application_modules,
             archive
@@ -619,6 +930,8 @@ impl Vm {
         let previous_cache = std::mem::take(&mut self.application_module_cache);
         let previous_loading = std::mem::take(&mut self.loading_application_modules);
         let previous_resources = self.application_resources.replace(resources);
+        let previous_native_modules = self.application_native_modules.replace(native_modules);
+        let previous_native_extensions = std::mem::take(&mut self.native_extensions_v2);
         self.resources.reset();
         let result = self.run_chunk(
             Rc::new(entry.chunk.clone()),
@@ -629,10 +942,13 @@ impl Vm {
             None,
         );
         self.permissions = previous_permissions;
+        self.host_state.set_permissions(self.permissions.clone());
         self.application_modules = previous_modules;
         self.application_module_cache = previous_cache;
         self.loading_application_modules = previous_loading;
         self.application_resources = previous_resources;
+        self.application_native_modules = previous_native_modules;
+        self.native_extensions_v2 = previous_native_extensions;
         result
     }
 
@@ -1870,7 +2186,9 @@ impl Vm {
                 Ok(VmValue::String(task.borrow().status().into()))
             }
             NativeKind::JoinTasks => self.join_tasks(&arguments[0], span),
-            NativeKind::Standard(function) => self.call_standard_native(function, arguments, span),
+            NativeKind::Standard(function) => {
+                self.call_standard_native(function, arguments, span, directory)
+            }
         }
     }
 
@@ -1961,6 +2279,7 @@ impl Vm {
         function: StandardNative,
         arguments: &[VmValue],
         span: &Span,
+        directory: &Path,
     ) -> Result<VmValue, VmError> {
         use StandardNative as Std;
         match function {
@@ -2727,6 +3046,67 @@ impl Vm {
                     names.into_iter().map(VmValue::String).collect(),
                 ))))
             }
+            Std::NativeLoad => {
+                let package = vm_string(&arguments[0], "原生.加载", span)?;
+                self.load_native_v2(package, directory, span)
+                    .map(VmValue::NativeModuleV2)
+            }
+            Std::NativeCall => {
+                let VmValue::NativeModuleV2(extension) = &arguments[0] else {
+                    return Err(error(span, "“原生.调用”第一参数须为 ABI v2 原生模块"));
+                };
+                let function = vm_string(&arguments[1], "原生.调用", span)?;
+                let call_arguments = match &arguments[2] {
+                    VmValue::List(values) => values.borrow().clone(),
+                    VmValue::Tuple(values) => values.as_ref().clone(),
+                    value => {
+                        return Err(error(
+                            span,
+                            format!("“原生.调用”第三参数须为列或元，不可为{}", value.type_name()),
+                        ));
+                    }
+                };
+                self.call_native_v2(
+                    extension.clone(),
+                    function,
+                    &call_arguments,
+                    span,
+                    directory,
+                )
+            }
+            Std::NativeCloseResource => {
+                let VmValue::NativeResource(handle) = arguments[0] else {
+                    return Err(error(span, "“原生.关闭资源”须收原生资源"));
+                };
+                self.host_state
+                    .resources
+                    .borrow_mut()
+                    .close(handle)
+                    .map_err(|runtime_error| host_event_error(span, runtime_error))?;
+                Ok(VmValue::Nil)
+            }
+            Std::NativeResourceType => {
+                let VmValue::NativeResource(handle) = arguments[0] else {
+                    return Err(error(span, "“原生.资源类型”须收原生资源"));
+                };
+                let type_name = self
+                    .host_state
+                    .resources
+                    .borrow()
+                    .info(handle)
+                    .map_err(|runtime_error| host_event_error(span, runtime_error))?
+                    .type_name;
+                Ok(VmValue::String(type_name))
+            }
+            Std::NativeLeakStatistics => {
+                let statistics = self.host_state.resources.borrow().leak_statistics();
+                Ok(VmValue::Map(Rc::new(RefCell::new(VmMap {
+                    entries: statistics
+                        .into_iter()
+                        .map(|(name, count)| (VmValue::String(name), VmValue::Number(count as f64)))
+                        .collect(),
+                }))))
+            }
             Std::Sha256 => Ok(VmValue::String(crate::stdlib::sha256(vm_string(
                 &arguments[0],
                 "SHA256",
@@ -2983,6 +3363,345 @@ impl Vm {
             )?)
             .map_or(VmValue::Nil, |millis| VmValue::Number(millis as f64))),
         }
+    }
+
+    fn load_native_v2(
+        &mut self,
+        package_name: &str,
+        directory: &Path,
+        span: &Span,
+    ) -> Result<Rc<native_abi_v2::NativeExtensionV2>, VmError> {
+        if let Some(extension) = self.native_extensions_v2.get(package_name) {
+            return Ok(extension.clone());
+        }
+        if let Some(native_modules) = &self.application_native_modules {
+            let module = native_modules.get(package_name).ok_or_else(|| {
+                error(span, format!("YXB 没有名为“{package_name}”的锁定原生模块"))
+            })?;
+            if module.metadata.abi != native_abi_v2::NATIVE_ABI_VERSION_V2 {
+                return Err(error(
+                    span,
+                    format!(
+                        "YXB 原生模块“{package_name}”使用 ABI {}，标准:原生只支持 ABI v2",
+                        module.metadata.abi
+                    ),
+                ));
+            }
+            let artifact = crate::package::NativeArtifact {
+                abi: module.metadata.abi,
+                target: module.metadata.target.clone(),
+                path: module.metadata.file.clone(),
+                checksum: module.metadata.checksum.clone(),
+                size: module.metadata.size,
+            };
+            let authority = if matches!(package_name, "yanxu-gui" | "言窗")
+                && self.permissions.graphical_interface_allowed()
+            {
+                native_abi_v2::NativeLoadAuthority::OfficialGui
+            } else {
+                native_abi_v2::NativeLoadAuthority::NativeExtension
+            };
+            let extension = native_abi_v2::NativeExtensionV2::load_verified_bytes(
+                &module.bytes,
+                &artifact,
+                &self.permissions,
+                package_name,
+                authority,
+            )
+            .map_err(|runtime_error| native_v2_error(span, runtime_error))?;
+            let extension = Rc::new(extension);
+            self.native_extensions_v2
+                .insert(package_name.to_owned(), extension.clone());
+            return Ok(extension);
+        }
+        let root = self.package_root.as_deref().unwrap_or(directory);
+        let manifest = crate::package::discover(root)
+            .map_err(|runtime_error| error(span, runtime_error.to_string()))?
+            .ok_or_else(|| error(span, "当前程序不属于包，不能装载锁定原生扩展"))?;
+        let offline = std::env::var_os("YANXU_OFFLINE").is_some();
+        let graph = crate::package::resolve_graph(&manifest, offline)
+            .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+        let mut matches = graph
+            .packages
+            .values()
+            .filter(|dependency| {
+                dependency.locked.name == package_name && dependency.locked.native.is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(error(
+                span,
+                if matches.is_empty() {
+                    format!("锁定依赖图没有名为“{package_name}”的原生制品")
+                } else {
+                    format!("锁定依赖图含多个名为“{package_name}”的原生制品，不能消歧")
+                },
+            ));
+        }
+        let dependency = matches.pop().expect("one native dependency");
+        let artifact = dependency.locked.native.as_ref().expect("filtered native");
+        let authority = if artifact.abi == native_abi_v2::NATIVE_ABI_VERSION_V2
+            && matches!(package_name, "yanxu-gui" | "言窗")
+            && self.permissions.graphical_interface_allowed()
+        {
+            native_abi_v2::NativeLoadAuthority::OfficialGui
+        } else {
+            native_abi_v2::NativeLoadAuthority::NativeExtension
+        };
+        let extension = native_abi_v2::NativeExtensionV2::load_verified(
+            dependency.root.join(&artifact.path),
+            artifact,
+            &self.permissions,
+            package_name,
+            authority,
+        )
+        .map_err(|runtime_error| native_v2_error(span, runtime_error))?;
+        let extension = Rc::new(extension);
+        self.native_extensions_v2
+            .insert(package_name.to_owned(), extension.clone());
+        Ok(extension)
+    }
+
+    fn call_native_v2(
+        &mut self,
+        extension: Rc<native_abi_v2::NativeExtensionV2>,
+        function: &str,
+        arguments: &[VmValue],
+        span: &Span,
+        directory: &Path,
+    ) -> Result<VmValue, VmError> {
+        let mut temporary_callbacks = Vec::new();
+        let host_arguments = arguments
+            .iter()
+            .map(|argument| self.vm_to_host_value(argument, span, &mut temporary_callbacks))
+            .collect::<Result<Vec<_>, _>>()?;
+        let run_guard = if matches!(function, "run" | "运行" | "应用运行") {
+            Some(
+                self.host_state
+                    .shared
+                    .event_loop
+                    .begin_run()
+                    .map_err(|runtime_error| host_event_error(span, runtime_error))?,
+            )
+        } else {
+            None
+        };
+        let vm_pointer: *mut Vm = self;
+        let previous_vm = self.host_state.vm.replace(vm_pointer);
+        let previous_directory = std::mem::replace(
+            &mut *self.host_state.current_directory.borrow_mut(),
+            directory.to_path_buf(),
+        );
+        let previous_extension = self
+            .host_state
+            .active_extension
+            .borrow_mut()
+            .replace(extension.name().to_owned());
+        let previous_pump_error = self.host_state.last_pump_error.borrow_mut().take();
+        let native_result = extension.call(function, &host_arguments, Some(&self.host_state.host));
+        let call_pump_error = self.host_state.last_pump_error.borrow_mut().take();
+        self.host_state.vm.set(previous_vm);
+        *self.host_state.current_directory.borrow_mut() = previous_directory;
+        *self.host_state.active_extension.borrow_mut() = previous_extension;
+        *self.host_state.last_pump_error.borrow_mut() = previous_pump_error;
+        drop(run_guard);
+        let callback_release_error = {
+            let mut callbacks = self.host_state.callbacks.borrow_mut();
+            temporary_callbacks
+                .into_iter()
+                .find_map(|callback| callbacks.release(callback).err())
+        };
+        if let Some(runtime_error) = call_pump_error {
+            return Err(runtime_error);
+        }
+        if let Some(runtime_error) = callback_release_error {
+            return Err(host_event_error(span, runtime_error));
+        }
+        match native_result.map_err(|runtime_error| native_v2_error(span, runtime_error))? {
+            native_abi_v2::NativeV2CallResult::Value(value) => self.host_to_vm_value(value, span),
+            native_abi_v2::NativeV2CallResult::Resource(resource) => {
+                let type_name = resource.type_name().to_owned();
+                let parent = resource.parent();
+                let raw_pointer = resource.as_raw() as usize;
+                let extension_name = extension.name().to_owned();
+                let handle = self
+                    .host_state
+                    .resources
+                    .borrow_mut()
+                    .create_native(type_name, extension_name, parent, raw_pointer, move || {
+                        drop(resource)
+                    })
+                    .map_err(|runtime_error| host_event_error(span, runtime_error))?;
+                Ok(VmValue::NativeResource(handle))
+            }
+        }
+    }
+
+    fn vm_to_host_value(
+        &self,
+        value: &VmValue,
+        span: &Span,
+        temporary_callbacks: &mut Vec<u64>,
+    ) -> Result<host_events::HostValue, VmError> {
+        Ok(match value {
+            VmValue::Nil => host_events::HostValue::Nil,
+            VmValue::Bool(value) => host_events::HostValue::Bool(*value),
+            VmValue::Number(value) if !value.is_finite() => {
+                return Err(error(span, "非有限数不可传给 ABI v2"));
+            }
+            VmValue::Number(value)
+                if value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0 =>
+            {
+                host_events::HostValue::Integer(*value as i64)
+            }
+            VmValue::Number(value) => host_events::HostValue::Number(*value),
+            VmValue::String(value) => host_events::HostValue::String(value.clone()),
+            VmValue::Bytes(value) => host_events::HostValue::Bytes(value.as_ref().clone()),
+            VmValue::List(values) => host_events::HostValue::Array(
+                values
+                    .borrow()
+                    .iter()
+                    .map(|value| self.vm_to_host_value(value, span, temporary_callbacks))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            VmValue::Tuple(values) => host_events::HostValue::Array(
+                values
+                    .iter()
+                    .map(|value| self.vm_to_host_value(value, span, temporary_callbacks))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            VmValue::Map(map) => host_events::HostValue::Map(
+                map.borrow()
+                    .entries
+                    .iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            self.vm_to_host_value(key, span, temporary_callbacks)?,
+                            self.vm_to_host_value(value, span, temporary_callbacks)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, VmError>>()?,
+            ),
+            VmValue::Closure(_) | VmValue::BoundMethod(_, _) | VmValue::Native(_) => {
+                let callback = self
+                    .host_state
+                    .callbacks
+                    .borrow_mut()
+                    .create(value.clone())
+                    .map_err(|runtime_error| host_event_error(span, runtime_error))?;
+                temporary_callbacks.push(callback);
+                host_events::HostValue::Callback(callback)
+            }
+            VmValue::NativeResource(handle) => host_events::HostValue::Resource(*handle),
+            value => {
+                return Err(error(span, format!("{}不可传给 ABI v2", value.type_name())));
+            }
+        })
+    }
+
+    fn host_to_vm_value(
+        &self,
+        value: host_events::HostValue,
+        span: &Span,
+    ) -> Result<VmValue, VmError> {
+        Ok(match value {
+            host_events::HostValue::Nil => VmValue::Nil,
+            host_events::HostValue::Bool(value) => VmValue::Bool(value),
+            host_events::HostValue::Integer(value) => VmValue::Number(value as f64),
+            host_events::HostValue::Number(value) => VmValue::Number(value),
+            host_events::HostValue::String(value) => VmValue::String(value),
+            host_events::HostValue::Bytes(value) => VmValue::Bytes(Rc::new(value)),
+            host_events::HostValue::Array(values) => VmValue::List(Rc::new(RefCell::new(
+                values
+                    .into_iter()
+                    .map(|value| self.host_to_vm_value(value, span))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))),
+            host_events::HostValue::Map(entries) => VmValue::Map(Rc::new(RefCell::new(VmMap {
+                entries: entries
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            self.host_to_vm_value(key, span)?,
+                            self.host_to_vm_value(value, span)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, VmError>>()?,
+            }))),
+            host_events::HostValue::Resource(handle) => VmValue::NativeResource(handle),
+            host_events::HostValue::Callback(_) => {
+                return Err(error(span, "原生扩展不可向言序返回外部回调句柄"));
+            }
+            host_events::HostValue::Error {
+                code,
+                message,
+                details,
+            } => VmValue::Error(Rc::new(VmErrorValue {
+                code: "NATIVE_ERROR",
+                category: "原生".into(),
+                message: if let Some(details) = details {
+                    format!("[{code}] {message}（详情：{details:?}）")
+                } else {
+                    format!("[{code}] {message}")
+                },
+                frames: Vec::new(),
+                span: span.clone(),
+            })),
+        })
+    }
+
+    fn pump_host_events(&mut self, maximum_events: usize) -> Result<usize, VmError> {
+        let mut processed = 0;
+        while processed < maximum_events {
+            let event = match self.host_state.shared.event_loop.try_next() {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(runtime_error) => {
+                    return Err(host_event_error(&Span::synthetic(), runtime_error));
+                }
+            };
+            processed += 1;
+            match event {
+                host_events::HostEvent::Callback {
+                    callback,
+                    arguments,
+                } => {
+                    let callable = self.host_state.callbacks.borrow().get(callback).map_err(
+                        |runtime_error| host_event_error(&Span::synthetic(), runtime_error),
+                    )?;
+                    let arguments = arguments
+                        .into_iter()
+                        .map(|argument| self.host_to_vm_value(argument, &Span::synthetic()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let directory = self.host_state.current_directory.borrow().clone();
+                    self.call_value(callable, arguments, &Span::synthetic(), &directory)?;
+                }
+                host_events::HostEvent::Timer { timer, callback } => {
+                    if let Some(callback) = callback {
+                        let callable = self.host_state.callbacks.borrow().get(callback).map_err(
+                            |runtime_error| host_event_error(&Span::synthetic(), runtime_error),
+                        )?;
+                        let directory = self.host_state.current_directory.borrow().clone();
+                        self.call_value(
+                            callable,
+                            vec![VmValue::Number(timer as f64)],
+                            &Span::synthetic(),
+                            &directory,
+                        )?;
+                    }
+                }
+                host_events::HostEvent::Quit => {
+                    host_events::HostEventLoop::quit(&self.host_state.shared.event_loop);
+                    break;
+                }
+                host_events::HostEvent::MouseMove { .. }
+                | host_events::HostEvent::WindowResize { .. }
+                | host_events::HostEvent::Custom { .. }
+                | host_events::HostEvent::Wake => {}
+            }
+        }
+        Ok(processed)
     }
 
     fn load_module(
@@ -3421,6 +4140,25 @@ impl Vm {
                     NativeKind::Standard(StandardNative::ResourceList),
                 ),
             ],
+            "原生" => &[
+                ("加载", 1, NativeKind::Standard(StandardNative::NativeLoad)),
+                ("调用", 3, NativeKind::Standard(StandardNative::NativeCall)),
+                (
+                    "关闭资源",
+                    1,
+                    NativeKind::Standard(StandardNative::NativeCloseResource),
+                ),
+                (
+                    "资源类型",
+                    1,
+                    NativeKind::Standard(StandardNative::NativeResourceType),
+                ),
+                (
+                    "泄漏统计",
+                    0,
+                    NativeKind::Standard(StandardNative::NativeLeakStatistics),
+                ),
+            ],
             "哈希" => &[
                 ("SHA256", 1, NativeKind::Standard(StandardNative::Sha256)),
                 (
@@ -3845,6 +4583,8 @@ fn values_equal(left: &VmValue, right: &VmValue) -> bool {
         (VmValue::Iterator(left), VmValue::Iterator(right)) => Rc::ptr_eq(left, right),
         (VmValue::Task(left), VmValue::Task(right)) => Rc::ptr_eq(left, right),
         (VmValue::Socket(left), VmValue::Socket(right)) => Rc::ptr_eq(left, right),
+        (VmValue::NativeModuleV2(left), VmValue::NativeModuleV2(right)) => Rc::ptr_eq(left, right),
+        (VmValue::NativeResource(left), VmValue::NativeResource(right)) => left == right,
         _ => false,
     }
 }
@@ -4061,6 +4801,8 @@ fn vm_value_matches_type(value: &VmValue, expected: &str) -> bool {
         "误" => matches!(value, VmValue::Error(_)),
         "任务" => matches!(value, VmValue::Task(_)),
         "套接字" => matches!(value, VmValue::Socket(_)),
+        "原生模块" => matches!(value, VmValue::NativeModuleV2(_)),
+        "原生资源" => matches!(value, VmValue::NativeResource(_)),
         class_name => matches!(value, VmValue::Instance(instance)
             if instance.borrow().class.is_a(class_name)),
     }
@@ -4549,6 +5291,24 @@ fn bytes_error(span: &Span, code: &'static str, message: impl Into<String>) -> V
     VmError {
         code,
         message: message.into(),
+        span: span.clone(),
+        frames: Vec::new(),
+    }
+}
+
+fn host_event_error(span: &Span, source: host_events::HostEventError) -> VmError {
+    VmError {
+        code: source.code,
+        message: source.message,
+        span: span.clone(),
+        frames: Vec::new(),
+    }
+}
+
+fn native_v2_error(span: &Span, source: crate::native_abi::NativeError) -> VmError {
+    VmError {
+        code: "NATIVE_V2",
+        message: format!("[{}] {}", source.code, source.message),
         span: span.clone(),
         frames: Vec::new(),
     }
