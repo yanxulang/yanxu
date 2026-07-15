@@ -1698,11 +1698,16 @@ mod tests {
         );
 
         let mut wrong_target = archive.clone();
+        let mismatched_target = if archive.target == "x86_64-pc-windows-msvc" {
+            "aarch64-pc-windows-msvc"
+        } else {
+            "x86_64-pc-windows-msvc"
+        };
         wrong_target
             .native_modules
             .get_mut("yanxu-gui")
             .unwrap()
-            .target = "x86_64-pc-windows-msvc".into();
+            .target = mismatched_target.into();
         wrong_target.content_checksum = archive_checksum(&wrong_target).unwrap();
         assert!(
             validate_archive(&wrong_target)
