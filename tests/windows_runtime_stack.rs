@@ -9,7 +9,7 @@ fn yanxu_runtime_reserves_stack_for_owner_thread_callbacks() {
     let executable = Path::new(env!("CARGO_BIN_EXE_yanxu"));
     let bytes = std::fs::read(executable).expect("read yanxu executable");
     let pe_offset = read_u32(&bytes, 0x3c) as usize;
-    assert_eq!(bytes.get(pe_offset..pe_offset + 4), Some(b"PE\0\0"));
+    assert_eq!(bytes.get(pe_offset..pe_offset + 4), Some(&b"PE\0\0"[..]));
 
     let optional_header = pe_offset + 24;
     assert_eq!(read_u16(&bytes, optional_header), 0x20b, "expected PE32+");
