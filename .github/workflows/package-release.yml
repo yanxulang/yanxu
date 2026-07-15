@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 已存在的共享包标签（如 yanxu-package-v1.1.7）
+        description: 已存在的共享包标签（如 yanxu-package-v1.1.8）
         required: true
         type: string
 
@@ -87,8 +87,11 @@ jobs:
         run: |
           set -euo pipefail
           crate="target/package/yanxu-package-$VERSION.crate"
+          notes="crates/yanxu-package/RELEASE_NOTES_$VERSION.md"
+          test -f "$notes"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --title "yanxu-package $VERSION" --notes "言序共享包解析核心 $VERSION；此 Release 不包含 yanxu 运行时。"
+            gh release create "$TAG" --draft --title "yanxu-package $VERSION" \
+              --notes-file "$notes"
           fi
           gh release upload "$TAG" "$crate" "$crate.sha256" --clobber
           gh release edit "$TAG" --draft=false --title "yanxu-package $VERSION"

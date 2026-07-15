@@ -160,6 +160,21 @@ jobs:
           test -f "$binary"
           if [[ "$RUNNER_OS" != "Windows" ]]; then test -x "$binary"; fi
           test "$("$binary" --version | tr -d '\r')" = "言序 $VERSION"
+      - name: 核对 Windows 发行运行时栈保留量
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $bytes = [IO.File]::ReadAllBytes("target/$env:TARGET/release/yanxu.exe")
+          $peOffset = [int][BitConverter]::ToUInt32($bytes, 0x3c)
+          $optionalHeader = $peOffset + 24
+          $magic = [BitConverter]::ToUInt16($bytes, $optionalHeader)
+          if ($magic -ne 0x20b) { throw "发行运行时不是 PE32+" }
+          $stackReserve = [BitConverter]::ToUInt64($bytes, $optionalHeader + 0x48)
+          if ($stackReserve -lt 8MB) {
+            throw "Windows 发行运行时栈只保留 $stackReserve 字节"
+          }
 
   publish-release:
     name: 发布完整 Release

@@ -13,9 +13,19 @@ fn main() {
         .unwrap_or_else(|| "unknown".into());
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".into());
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
+    emit_windows_runtime_stack(&target);
     println!("cargo:rustc-env=YANXU_BUILD_SHA={commit}");
     println!("cargo:rustc-env=YANXU_BUILD_TARGET={target}");
     println!("cargo:rustc-env=YANXU_BUILD_PROFILE={profile}");
+}
+
+fn emit_windows_runtime_stack(target: &str) {
+    if target.ends_with("-pc-windows-msvc") {
+        // The VM owner thread also pumps native GUI callbacks. Reserve enough
+        // stack for ordinary Yanxu method nesting inside that callback path;
+        // Windows executables otherwise receive the 1 MiB linker default.
+        println!("cargo:rustc-link-arg-bin=yanxu=/STACK:8388608");
+    }
 }
 
 fn emit_git_rerun_paths() {

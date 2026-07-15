@@ -1,5 +1,44 @@
 # 变更记录
 
+## 1.1.8
+
+### 新功能
+
+- 把 Windows VM 所有者线程的 8 MiB 栈保留量纳入可检查的运行时构建契约；本补丁不新增语言语法、标准库或原生 ABI 接口。
+
+### 修复内容
+
+- 修复 Windows 可执行文件使用链接器默认 1 MiB 主线程栈时，VM 所有者线程在原生事件循环回调中执行正常言序方法嵌套可能触发栈溢出的问题。
+- x86_64 与 ARM64 MSVC 目标的`yanxu.exe`统一保留 8 MiB 栈；桌面 Bundle 携带同一运行时，因此无需应用或 GUI 包使用线程绕行或裁剪控件树。
+- 新增 Windows PE32+ 回归，直接校验发行运行时的`SizeOfStackReserve`，防止链接参数或构建流程退化。
+
+### 兼容与迁移
+
+- 不改变语言规范 1、标准库 API、原生 ABI v1/v2、清单/锁文件、YXB 或 Bundle 格式；命令行、嵌入和非 Windows 目标保持兼容。
+- 新建 GUI 清单及官方 GUI 示例的最低运行时更新为 1.1.8；已有 GUI 项目只需升级运行时并重新构建 Windows Bundle，不必修改源码或原生包制品。
+
+### 安装与升级
+
+macOS 与 Linux 可固定安装本版本：
+
+```sh
+curl -fsSL https://get.yanxu.dev | YANXU_VERSION=1.1.8 sh
+```
+
+Windows PowerShell 可先设置`$env:YANXU_VERSION = "1.1.8"`，再运行
+`irm https://get.yanxu.dev/windows | iex`。GUI 项目把最低运行时改为`>=1.1.8`、重新锁定，
+并在对应 Windows 原生目标重新构建 Bundle。
+
+### 平台、制品与校验
+
+- 正式支持 Windows、macOS、Linux 的 x86_64 与 ARM64 六个目标；每个目标提供运行时归档和独立 SHA-256 文件。
+- 发布流程在六种原生 runner 构建、运行并通过安装脚本复验；两个 Windows Release 二进制还会直接核对 PE32+ 栈保留量。
+
+### 第三方依赖与已知限制
+
+- 本补丁不新增或升级第三方运行时依赖，继续沿用 1.1.7 已审计的许可证与安全边界。
+- 修复覆盖官方`yanxu.exe`及由它生成的 GUI Bundle；把言序嵌入自定义宿主线程的应用仍须由宿主设置足够的线程栈。由 1.1.7 打包的旧 Windows Bundle 必须重新构建，不能只替换 YXB。
+
 ## 1.1.7
 
 ### 原生 ABI v2 与宿主事件循环
