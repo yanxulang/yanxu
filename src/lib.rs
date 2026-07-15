@@ -2,6 +2,7 @@ pub mod application;
 pub mod ast;
 pub mod benchmark;
 pub mod budget;
+pub mod build_info;
 pub mod bytecode;
 pub mod compatibility;
 pub mod debugger;

@@ -12,7 +12,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt;
+#[cfg(not(target_family = "wasm"))]
+use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(not(target_family = "wasm"))]
+use std::path::PathBuf;
 use std::ptr;
 #[cfg(not(target_family = "wasm"))]
 use std::rc::Rc;
@@ -23,6 +27,10 @@ pub const NATIVE_OUTPUT_JSON: u32 = 1;
 pub const NATIVE_OUTPUT_RESOURCE: u32 = 2;
 const NATIVE_MAX_DESCRIPTORS: usize = 1_024;
 const NATIVE_MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
+const NATIVE_MAX_LIBRARY_BYTES: u64 = 256 * 1024 * 1024;
+const NATIVE_MAX_NAME_BYTES: usize = 1_024;
+const NATIVE_MAX_ERROR_CODE_BYTES: usize = 256;
+const NATIVE_MAX_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
 
 pub type NativeFreeBytes = unsafe extern "C" fn(*mut u8, usize);
 pub type NativeDropResource = unsafe extern "C" fn(*mut c_void);
@@ -155,13 +163,123 @@ impl std::error::Error for NativeError {}
 
 #[cfg(not(target_family = "wasm"))]
 struct NativeInner {
-    _library: libloading::Library,
+    library: Option<libloading::Library>,
+    _staged: StagedLibrary,
     name: String,
     capabilities: u64,
     functions: BTreeMap<String, YanxuNativeFunctionV1>,
     constants: BTreeMap<String, Value>,
     resource_types: Vec<String>,
     free_bytes: NativeFreeBytes,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for NativeInner {
+    fn drop(&mut self) {
+        // Windows 不允许删除仍被装载的 DLL；须先显式卸载，再由 StagedLibrary 清理。
+        drop(self.library.take());
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct StagedLibrary {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for StagedLibrary {
+    fn drop(&mut self) {
+        make_staged_tree_writable(&self.root);
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn stage_verified_library(bytes: &[u8], checksum: &str) -> Result<StagedLibrary, NativeError> {
+    let mut nonce = [0_u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| native_error("NATIVE_IO", format!("不能创建安全随机暂存名：{error}")))?;
+    let nonce = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let root = std::env::temp_dir().join(format!("yanxu-native-v1-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&root)
+        .map_err(|error| native_error("NATIVE_IO", format!("不能创建原生暂存目录：{error}")))?;
+    let content_directory = root.join(checksum);
+    let path = content_directory.join(format!("extension{}", std::env::consts::DLL_SUFFIX));
+    let staged = StagedLibrary { root, path };
+    let result = (|| {
+        std::fs::create_dir(&content_directory)
+            .map_err(|error| native_error("NATIVE_IO", format!("不能创建内容寻址目录：{error}")))?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged.path)
+            .map_err(|error| native_error("NATIVE_IO", format!("不能暂存原生制品：{error}")))?;
+        output
+            .write_all(bytes)
+            .and_then(|_| output.sync_all())
+            .map_err(|error| native_error("NATIVE_IO", format!("不能写入原生暂存制品：{error}")))?;
+        set_staged_read_only(&staged.path, false)?;
+        let staged_bytes = std::fs::read(&staged.path)
+            .map_err(|error| native_error("NATIVE_IO", format!("不能复核原生暂存制品：{error}")))?;
+        let staged_checksum = format!("{:x}", Sha256::digest(staged_bytes));
+        if staged_checksum != checksum {
+            return Err(native_error(
+                "NATIVE_CHECKSUM",
+                format!("原生暂存制品摘要改变：预期 {checksum}，实际 {staged_checksum}"),
+            ));
+        }
+        set_staged_read_only(&content_directory, true)?;
+        set_staged_read_only(&staged.root, true)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(staged),
+        Err(error) => {
+            drop(staged);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn set_staged_read_only(path: &Path, directory: bool) -> Result<(), NativeError> {
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|error| native_error("NATIVE_IO", error.to_string()))?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(if directory { 0o500 } else { 0o400 });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|error| native_error("NATIVE_IO", format!("不能锁定原生暂存制品：{error}")))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn make_staged_tree_writable(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(if metadata.is_dir() { 0o700 } else { 0o600 });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    let _ = std::fs::set_permissions(path, permissions);
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            make_staged_tree_writable(&entry.path());
+        }
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -185,6 +303,57 @@ pub struct NativeResource {
     raw: *mut c_void,
     drop_resource: NativeDropResource,
     type_name: String,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct NativeOutputGuard {
+    output: YanxuNativeOutputV1,
+    free_bytes: NativeFreeBytes,
+    owns_json: bool,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl NativeOutputGuard {
+    fn new(output: YanxuNativeOutputV1, free_bytes: NativeFreeBytes) -> Self {
+        let owns_json =
+            output.kind == NATIVE_OUTPUT_JSON || !output.json.is_null() || output.json_length != 0;
+        Self {
+            output,
+            free_bytes,
+            owns_json,
+        }
+    }
+
+    fn take_resource(&mut self) -> Option<(*mut c_void, NativeDropResource)> {
+        let drop_resource = self.output.drop_resource?;
+        if self.output.resource.is_null() {
+            return None;
+        }
+        let raw = std::mem::replace(&mut self.output.resource, ptr::null_mut());
+        self.output.drop_resource = None;
+        Some((raw, drop_resource))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for NativeOutputGuard {
+    fn drop(&mut self) {
+        if !self.output.resource.is_null()
+            && let Some(drop_resource) = self.output.drop_resource
+        {
+            // SAFETY: The extension paired this owned resource with its destructor.
+            unsafe { drop_resource(self.output.resource) };
+            self.output.resource = ptr::null_mut();
+        }
+        if self.owns_json {
+            // SAFETY: ABI v1 transfers JSON output ownership to the host even for malformed
+            // pointer/length pairs; the module-provided release function must accept them.
+            unsafe { (self.free_bytes)(self.output.json, self.output.json_length) };
+            self.owns_json = false;
+            self.output.json = ptr::null_mut();
+            self.output.json_length = 0;
+        }
+    }
 }
 
 impl NativeResource {
@@ -230,19 +399,55 @@ impl NativeExtension {
                 ),
             ));
         }
-        let bytes = std::fs::read(path).map_err(|error| {
+        if artifact.checksum.len() != 64
+            || !artifact
+                .checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(native_error(
+                "NATIVE_CHECKSUM",
+                "原生制品须声明 64 位十六进制 SHA-256",
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            native_error("NATIVE_IO", format!("不能检查 {}：{error}", path.display()))
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(native_error(
+                "NATIVE_IO",
+                "原生制品须为普通文件而非符号链接",
+            ));
+        }
+        if metadata.len() > NATIVE_MAX_LIBRARY_BYTES {
+            return Err(native_error("NATIVE_LIMIT", "原生制品不得超过 256 MiB"));
+        }
+        let mut source = std::fs::File::open(path).map_err(|error| {
             native_error("NATIVE_IO", format!("不能读取 {}：{error}", path.display()))
         })?;
-        let checksum = format!("{:x}", Sha256::digest(bytes));
-        if checksum != artifact.checksum.to_ascii_lowercase() {
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        Read::by_ref(&mut source)
+            .take(NATIVE_MAX_LIBRARY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| native_error("NATIVE_IO", format!("不能读取原生制品：{error}")))?;
+        if bytes.len() as u64 > NATIVE_MAX_LIBRARY_BYTES {
+            return Err(native_error(
+                "NATIVE_LIMIT",
+                "原生制品读取过程中超过 256 MiB",
+            ));
+        }
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let expected_checksum = artifact.checksum.to_ascii_lowercase();
+        if checksum != expected_checksum {
             return Err(native_error(
                 "NATIVE_CHECKSUM",
                 format!("制品校验不符：声明 {}，实际 {checksum}", artifact.checksum),
             ));
         }
-        // SAFETY: The path has passed the caller's explicit permission, target and digest gates.
-        // All symbols and descriptor fields are validated before becoming safe wrappers.
-        unsafe { Self::load(path, expected_name) }
+        let staged = stage_verified_library(&bytes, &checksum)?;
+        // SAFETY: The private staged path contains the already-verified bytes, is read-only, and
+        // remains owned until after the library is unloaded. Descriptor fields are validated.
+        unsafe { Self::load(staged, expected_name) }
     }
 
     #[cfg(target_family = "wasm")]
@@ -259,7 +464,8 @@ impl NativeExtension {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    unsafe fn load(path: &Path, expected_name: &str) -> Result<Self, NativeError> {
+    unsafe fn load(staged: StagedLibrary, expected_name: &str) -> Result<Self, NativeError> {
+        let path = staged.path.as_path();
         // SAFETY: The caller has completed security gates; Library remains owned by NativeInner.
         let library = unsafe { libloading::Library::new(path) }.map_err(|error| {
             native_error(
@@ -280,7 +486,8 @@ impl NativeExtension {
         let validated = unsafe { validate_descriptor(descriptor, expected_name) }?;
         Ok(Self {
             inner: Rc::new(NativeInner {
-                _library: library,
+                library: Some(library),
+                _staged: staged,
                 name: validated.name,
                 capabilities: validated.capabilities,
                 functions: validated.functions,
@@ -365,17 +572,19 @@ impl NativeExtension {
                 &mut native_failure,
             )
         };
+        let mut output = NativeOutputGuard::new(output, self.inner.free_bytes);
         if status != NATIVE_OK {
             return Err(unsafe { copy_native_error(native_failure) });
         }
-        match output.kind {
+        match output.output.kind {
             NATIVE_OUTPUT_JSON => {
                 let bytes = unsafe {
-                    copy_required_bytes(output.json, output.json_length, "原生 JSON 输出")
+                    copy_required_bytes(
+                        output.output.json,
+                        output.output.json_length,
+                        "原生 JSON 输出",
+                    )
                 }?;
-                // SAFETY: The extension transferred this output buffer and its module-wide
-                // release function is retained by NativeInner.
-                unsafe { (self.inner.free_bytes)(output.json, output.json_length) };
                 if bytes.len() > NATIVE_MAX_JSON_BYTES {
                     return Err(native_error("NATIVE_LIMIT", "原生调用结果超过 16 MiB"));
                 }
@@ -384,7 +593,7 @@ impl NativeExtension {
                     .map_err(|error| native_error("NATIVE_JSON", error.to_string()))
             }
             NATIVE_OUTPUT_RESOURCE => {
-                if output.resource.is_null() || output.drop_resource.is_none() {
+                if output.output.resource.is_null() || output.output.drop_resource.is_none() {
                     return Err(native_error(
                         "NATIVE_RESOURCE",
                         "不透明资源缺少指针或析构函数",
@@ -392,8 +601,8 @@ impl NativeExtension {
                 }
                 let type_name = unsafe {
                     copy_utf8(
-                        output.resource_type,
-                        output.resource_type_length,
+                        output.output.resource_type,
+                        output.output.resource_type_length,
                         "资源类型",
                     )
                 }?;
@@ -403,10 +612,13 @@ impl NativeExtension {
                         format!("未注册资源类型“{type_name}”"),
                     ));
                 }
+                let (raw, drop_resource) = output
+                    .take_resource()
+                    .ok_or_else(|| native_error("NATIVE_RESOURCE", "不透明资源所有权无效"))?;
                 Ok(NativeCallResult::Resource(NativeResource {
                     _owner: self.inner.clone(),
-                    raw: output.resource,
-                    drop_resource: output.drop_resource.expect("checked"),
+                    raw,
+                    drop_resource,
                     type_name,
                 }))
             }
@@ -587,6 +799,22 @@ unsafe fn copy_required_bytes(
 
 #[cfg(not(target_family = "wasm"))]
 unsafe fn copy_utf8(pointer: *const u8, length: usize, kind: &str) -> Result<String, NativeError> {
+    unsafe { copy_utf8_bounded(pointer, length, kind, NATIVE_MAX_NAME_BYTES) }
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn copy_utf8_bounded(
+    pointer: *const u8,
+    length: usize,
+    kind: &str,
+    limit: usize,
+) -> Result<String, NativeError> {
+    if length > limit {
+        return Err(native_error(
+            "NATIVE_LIMIT",
+            format!("{kind}不得超过 {limit} 字节"),
+        ));
+    }
     let bytes = unsafe { copy_required_bytes(pointer, length, kind) }?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|error| native_error("NATIVE_UTF8", format!("{kind}不是 UTF-8：{error}")))?;
@@ -598,10 +826,24 @@ unsafe fn copy_utf8(pointer: *const u8, length: usize, kind: &str) -> Result<Str
 
 #[cfg(not(target_family = "wasm"))]
 unsafe fn copy_native_error(error: YanxuNativeErrorV1) -> NativeError {
-    let code = unsafe { copy_utf8(error.code, error.code_length, "错误码") }
-        .unwrap_or_else(|_| "NATIVE_FAILURE".into());
-    let message = unsafe { copy_utf8(error.message, error.message_length, "错误消息") }
-        .unwrap_or_else(|_| "原生函数返回失败但未提供有效错误".into());
+    let code = unsafe {
+        copy_utf8_bounded(
+            error.code,
+            error.code_length,
+            "错误码",
+            NATIVE_MAX_ERROR_CODE_BYTES,
+        )
+    }
+    .unwrap_or_else(|_| "NATIVE_FAILURE".into());
+    let message = unsafe {
+        copy_utf8_bounded(
+            error.message,
+            error.message_length,
+            "错误消息",
+            NATIVE_MAX_ERROR_MESSAGE_BYTES,
+        )
+    }
+    .unwrap_or_else(|_| "原生函数返回失败但未提供有效错误".into());
     native_error(code, message)
 }
 
@@ -624,6 +866,10 @@ pub fn capabilities() -> Value {
         "wasi_dynamic_loading": false,
         "max_descriptors": NATIVE_MAX_DESCRIPTORS,
         "max_json_bytes": NATIVE_MAX_JSON_BYTES,
+        "max_library_bytes": NATIVE_MAX_LIBRARY_BYTES,
+        "max_name_bytes": NATIVE_MAX_NAME_BYTES,
+        "max_error_code_bytes": NATIVE_MAX_ERROR_CODE_BYTES,
+        "max_error_message_bytes": NATIVE_MAX_ERROR_MESSAGE_BYTES,
     })
 }
 
@@ -632,9 +878,30 @@ mod tests {
     use super::*;
 
     #[cfg(not(target_family = "wasm"))]
+    static FREE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(not(target_family = "wasm"))]
+    static DROP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(not(target_family = "wasm"))]
     unsafe extern "C" fn release(bytes: *mut u8, length: usize) {
         if !bytes.is_null() {
             drop(unsafe { Vec::from_raw_parts(bytes, length, length) });
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    unsafe extern "C" fn counted_release(bytes: *mut u8, _length: usize) {
+        FREE_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !bytes.is_null() {
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(bytes, 3)) });
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    unsafe extern "C" fn counted_drop(resource: *mut c_void) {
+        DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !resource.is_null() {
+            drop(unsafe { Box::from_raw(resource.cast::<u8>()) });
         }
     }
 
@@ -674,6 +941,160 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, "NATIVE_ABI");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn descriptor_validation_rejects_duplicate_and_oversized_names() {
+        static NAME: &[u8] = b"example";
+        static CONSTANT_NAME: &[u8] = b"duplicate";
+        static CONSTANT_VALUE: &[u8] = b"42";
+        let constants = [
+            YanxuNativeConstantV1 {
+                name: CONSTANT_NAME.as_ptr(),
+                name_length: CONSTANT_NAME.len(),
+                value_json: CONSTANT_VALUE.as_ptr(),
+                value_json_length: CONSTANT_VALUE.len(),
+            },
+            YanxuNativeConstantV1 {
+                name: CONSTANT_NAME.as_ptr(),
+                name_length: CONSTANT_NAME.len(),
+                value_json: CONSTANT_VALUE.as_ptr(),
+                value_json_length: CONSTANT_VALUE.len(),
+            },
+        ];
+        let mut descriptor = YanxuNativeModuleV1 {
+            abi_version: NATIVE_ABI_VERSION,
+            struct_size: std::mem::size_of::<YanxuNativeModuleV1>(),
+            name: NAME.as_ptr(),
+            name_length: NAME.len(),
+            functions: ptr::null(),
+            function_count: 0,
+            constants: constants.as_ptr(),
+            constant_count: constants.len(),
+            resource_types: ptr::null(),
+            resource_type_lengths: ptr::null(),
+            resource_type_count: 0,
+            free_bytes: Some(release),
+            capabilities: 0,
+        };
+        let duplicate = match unsafe { validate_descriptor(&descriptor, "example") } {
+            Ok(_) => panic!("duplicate constants should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(duplicate.code, "NATIVE_DESCRIPTOR");
+        descriptor.name_length = NATIVE_MAX_NAME_BYTES + 1;
+        let oversized = match unsafe { validate_descriptor(&descriptor, "example") } {
+            Ok(_) => panic!("oversized module name should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(oversized.code, "NATIVE_LIMIT");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn malformed_outputs_are_released_on_every_error_path() {
+        FREE_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        DROP_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let bytes = vec![b'{', b'x', b'}'].into_boxed_slice();
+        let pointer = Box::into_raw(bytes).cast::<u8>();
+        {
+            let guard = NativeOutputGuard::new(
+                YanxuNativeOutputV1 {
+                    kind: NATIVE_OUTPUT_JSON,
+                    json: pointer,
+                    json_length: 3,
+                    ..YanxuNativeOutputV1::default()
+                },
+                counted_release,
+            );
+            let copied = unsafe {
+                copy_required_bytes(guard.output.json, guard.output.json_length, "测试 JSON")
+            }
+            .unwrap();
+            assert!(serde_json::from_slice::<Value>(&copied).is_err());
+        }
+        assert_eq!(FREE_COUNT.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        {
+            let guard = NativeOutputGuard::new(
+                YanxuNativeOutputV1 {
+                    kind: NATIVE_OUTPUT_JSON,
+                    json: ptr::null_mut(),
+                    json_length: 1,
+                    ..YanxuNativeOutputV1::default()
+                },
+                counted_release,
+            );
+            assert!(
+                unsafe {
+                    copy_required_bytes(guard.output.json, guard.output.json_length, "测试 JSON")
+                }
+                .is_err()
+            );
+        }
+        assert_eq!(FREE_COUNT.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let resource = Box::into_raw(Box::new(7_u8)).cast();
+        {
+            let _guard = NativeOutputGuard::new(
+                YanxuNativeOutputV1 {
+                    kind: 999,
+                    resource,
+                    drop_resource: Some(counted_drop),
+                    ..YanxuNativeOutputV1::default()
+                },
+                counted_release,
+            );
+        }
+        assert_eq!(DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        DROP_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let resource = Box::into_raw(Box::new(9_u8)).cast();
+        let (transferred, destructor) = {
+            let mut guard = NativeOutputGuard::new(
+                YanxuNativeOutputV1 {
+                    kind: NATIVE_OUTPUT_RESOURCE,
+                    resource,
+                    drop_resource: Some(counted_drop),
+                    ..YanxuNativeOutputV1::default()
+                },
+                counted_release,
+            );
+            guard.take_resource().unwrap()
+        };
+        assert_eq!(DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst), 0);
+        unsafe { destructor(transferred) };
+        assert_eq!(DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn verified_bytes_are_loaded_from_a_private_content_addressed_copy() {
+        let bytes = b"verified-library-bytes";
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let staged = stage_verified_library(bytes, &checksum).unwrap();
+        let root = staged.root.clone();
+        assert_eq!(std::fs::read(&staged.path).unwrap(), bytes);
+        assert_eq!(
+            staged
+                .path
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            checksum
+        );
+        assert!(
+            std::fs::metadata(&staged.path)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        drop(staged);
+        assert!(!root.exists());
     }
 
     #[test]

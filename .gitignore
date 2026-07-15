@@ -2,6 +2,7 @@
 /fuzz/target/
 /examples/embedding/rust-host/target/
 /examples/embedding/wasi-host/target/
+.yanxu/
 *.yx~
 .DS_Store
 .idea/

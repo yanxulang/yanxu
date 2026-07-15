@@ -31,6 +31,7 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -45,14 +46,21 @@ jobs:
           set -euo pipefail
           tag="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu") | .version')"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu-package") | .version')"
+          tree_sitter_version="$(jq -r '.version' tree-sitter-yanxu/package.json)"
           if [[ "$tag" != "v$version" ]]; then
             echo "标签 $tag 与 Cargo 版本 $version 不一致" >&2
             exit 1
           fi
+          if [[ "$package_version" != "$version" || "$tree_sitter_version" != "$version" ]]; then
+            echo "核心 $version、共享包 $package_version、Tree-sitter $tree_sitter_version 版本不一致" >&2
+            exit 1
+          fi
           git fetch origin main --tags
           tag_commit="$(git rev-list -n 1 "$tag")"
-          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
-            echo "标签 $tag 不属于 origin/main" >&2
+          main_commit="$(git rev-parse origin/main)"
+          if [[ "$tag_commit" != "$main_commit" ]]; then
+            echo "标签 $tag 的提交 $tag_commit 不是 origin/main 验收提交 $main_commit" >&2
             exit 1
           fi
           if ! grep -Fqx "## $version" CHANGELOG.md; then
@@ -61,10 +69,18 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: 标签提交完整质量门禁
+    needs: validate
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: refs/tags/${{ needs.validate.outputs.tag }}
 
   create-release:
     name: 创建 Release
-    needs: validate
+    needs: [validate, quality]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -96,24 +112,24 @@ jobs:
 
   binaries:
     name: ${{ matrix.target }}
-    needs: [validate, create-release]
+    needs: [validate, quality, create-release]
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            runner: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
-            os: macos-latest
+            runner: macos-15-intel
           - target: aarch64-apple-darwin
-            os: macos-latest
+            runner: macos-latest
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            runner: windows-latest
           - target: aarch64-pc-windows-msvc
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
     steps:
@@ -131,6 +147,19 @@ jobs:
           locked: true
           ref: refs/tags/${{ needs.validate.outputs.tag }}
           token: ${{ secrets.GITHUB_TOKEN }}
+      - name: 在目标架构运行发行二进制
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          binary="target/$TARGET/release/yanxu$suffix"
+          test -f "$binary"
+          if [[ "$RUNNER_OS" != "Windows" ]]; then test -x "$binary"; fi
+          test "$("$binary" --version | tr -d '\r')" = "言序 $VERSION"
 
   publish-release:
     name: 发布完整 Release
@@ -146,4 +175,100 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
-        run: gh release edit "$TAG" --repo "$REPOSITORY" --draft=false --title "言序 $VERSION"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" --repo "$REPOSITORY" --dir dist
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 12
+          targets=(
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+            x86_64-apple-darwin aarch64-apple-darwin
+            x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+          )
+          for target in "${targets[@]}"; do
+            case "$target" in *windows*) archive="yanxu-$target.zip" ;; *) archive="yanxu-$target.tar.gz" ;; esac
+            test -f "dist/$archive"
+            test -f "dist/yanxu-$target.sha256"
+            (cd dist && sha256sum --check "yanxu-$target.sha256")
+          done
+          gh release edit "$TAG" --repo "$REPOSITORY" --draft=false --title "言序 $VERSION"
+
+  verify-published:
+    name: 发布后安装 · ${{ matrix.target }}
+    needs: [validate, publish-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+      - name: 通过安装脚本安装并核对版本
+        if: runner.os != 'Windows'
+        shell: sh
+        env:
+          YANXU_VERSION: ${{ needs.validate.outputs.version }}
+          YANXU_INSTALL_DIR: ${{ runner.temp }}/言序 发布验证/bin
+          YANXU_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          sh scripts/install.sh
+          test "$("$YANXU_INSTALL_DIR/yanxu" --version)" = "言序 $YANXU_VERSION"
+      - name: 通过 PowerShell 安装并核对版本
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          YANXU_VERSION: ${{ needs.validate.outputs.version }}
+          YANXU_INSTALL_DIR: ${{ runner.temp }}\言序 发布验证\bin
+          YANXU_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          & scripts/install.ps1
+          $actual = & (Join-Path $env:YANXU_INSTALL_DIR "yanxu.exe") --version
+          if ($actual -ne "言序 $env:YANXU_VERSION") { throw "版本不符：$actual" }
+
+  quarantine-release:
+    name: 安装失败时撤销稳定版本资格
+    if: ${{ always() && needs.verify-published.result != 'success' }}
+    needs: [validate, publish-release, verify-published]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 标记为预发布并使工作流失败
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh release edit "$TAG" --repo "$REPOSITORY" --prerelease --latest=false
+          echo "至少一个目标架构的发布后安装失败，Release 已撤销稳定最新版资格。" >&2
+          exit 1
+
+  finalize-release:
+    name: 确认稳定 Release
+    needs: [validate, verify-published]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 设置唯一稳定最新版
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh release edit "$TAG" --repo "$REPOSITORY" --prerelease=false --latest

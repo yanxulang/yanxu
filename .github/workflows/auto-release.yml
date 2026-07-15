@@ -1,10 +1,6 @@
 name: Auto Release
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - Cargo.toml
   workflow_dispatch:
 
 permissions:
@@ -15,8 +11,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  quality:
+    name: 发布前完整质量门禁
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: ${{ github.sha }}
+
   prepare:
     name: 检测版本并创建标签
+    needs: quality
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.release.outputs.tag }}
@@ -56,7 +59,8 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git tag -a "$tag" -m "言序 $version"
             git push origin "$tag"
-            should_release=true
+            # 标签推送会由 release.yml 的 push 触发器启动唯一一次发布。
+            should_release=false
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"

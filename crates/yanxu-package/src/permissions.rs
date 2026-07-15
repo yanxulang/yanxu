@@ -58,20 +58,17 @@ impl PermissionSet {
     }
 
     pub fn allow_network(mut self, host: impl Into<String>) -> Self {
-        self.network_hosts
-            .insert(normalize_host(&host.into()).to_owned());
+        self.network_hosts.insert(normalize_grant(&host.into()));
         self
     }
 
     pub fn allow_tcp_listen(mut self, host: impl Into<String>) -> Self {
-        self.tcp_listen_hosts
-            .insert(normalize_host(&host.into()).to_owned());
+        self.tcp_listen_hosts.insert(normalize_grant(&host.into()));
         self
     }
 
     pub fn allow_udp_bind(mut self, host: impl Into<String>) -> Self {
-        self.udp_bind_hosts
-            .insert(normalize_host(&host.into()).to_owned());
+        self.udp_bind_hosts.insert(normalize_grant(&host.into()));
         self
     }
 
@@ -88,6 +85,56 @@ impl PermissionSet {
     pub fn allow_native_extensions(mut self) -> Self {
         self.native_extensions = true;
         self
+    }
+
+    /// 将应用申请权限收敛到宿主授权上限内。
+    ///
+    /// `self`表示宿主最终允许的能力，`requested`表示应用清单申请的能力。
+    /// 返回值绝不会比任一侧更宽；不受限的一侧等同于只采用另一侧。
+    pub fn intersect(&self, requested: &Self) -> Self {
+        if self.allow_all {
+            return requested.clone();
+        }
+        if requested.allow_all {
+            return self.clone();
+        }
+        let mut file_roots = Vec::new();
+        for host_root in &self.file_roots {
+            for requested_root in &requested.file_roots {
+                let narrower = if host_root.starts_with(requested_root) {
+                    Some(host_root)
+                } else if requested_root.starts_with(host_root) {
+                    Some(requested_root)
+                } else {
+                    None
+                };
+                if let Some(root) = narrower
+                    && !file_roots.contains(root)
+                {
+                    file_roots.push(root.clone());
+                }
+            }
+        }
+        file_roots.sort();
+        Self {
+            allow_all: false,
+            file_roots,
+            network_hosts: intersect_network_grants(&self.network_hosts, &requested.network_hosts),
+            tcp_listen_hosts: intersect_network_grants(
+                &self.tcp_listen_hosts,
+                &requested.tcp_listen_hosts,
+            ),
+            udp_bind_hosts: intersect_network_grants(
+                &self.udp_bind_hosts,
+                &requested.udp_bind_hosts,
+            ),
+            environment_variables: intersect_exact_grants(
+                &self.environment_variables,
+                &requested.environment_variables,
+            ),
+            process: self.process && requested.process,
+            native_extensions: self.native_extensions && requested.native_extensions,
+        }
     }
 
     pub fn check_file(&self, path: impl AsRef<Path>) -> Result<(), PermissionError> {
@@ -113,14 +160,10 @@ impl PermissionSet {
         if self.allow_all {
             return Ok(());
         }
-        let authority = url
-            .strip_prefix("http://")
-            .or_else(|| url.strip_prefix("https://"))
-            .and_then(|target| target.split('/').next())
-            .unwrap_or(url);
-        let host = normalize_host(authority);
+        let authority = normalize_grant(url);
+        let host = normalize_host(&authority);
         if self.network_hosts.contains("*")
-            || self.network_hosts.contains(authority)
+            || self.network_hosts.contains(&authority)
             || self.network_hosts.contains(host)
         {
             Ok(())
@@ -139,7 +182,12 @@ impl PermissionSet {
             return Ok(());
         }
         let ip = address.ip().to_string();
-        if self.network_hosts.contains(&ip) {
+        let endpoint = if address.is_ipv6() {
+            format!("[{ip}]:{}", address.port())
+        } else {
+            format!("{ip}:{}", address.port())
+        };
+        if self.network_hosts.contains(&ip) || self.network_hosts.contains(&endpoint) {
             Ok(())
         } else {
             Err(PermissionError::new(
@@ -184,9 +232,9 @@ impl PermissionSet {
         if self.allow_all {
             return Ok(());
         }
-        let authority = network_authority(address);
-        let host = normalize_host(authority);
-        if grants.contains("*") || grants.contains(authority) || grants.contains(host) {
+        let authority = normalize_grant(address);
+        let host = normalize_host(&authority);
+        if grants.contains("*") || grants.contains(&authority) || grants.contains(host) {
             Ok(())
         } else {
             Err(PermissionError::new(capability, authority))
@@ -203,9 +251,14 @@ impl PermissionSet {
         if self.allow_all {
             return Ok(());
         }
-        let requested_host = normalize_host(network_authority(requested));
+        let requested_authority = normalize_grant(requested);
+        let requested_host = normalize_host(&requested_authority);
         let ip = address.ip().to_string();
-        if grants.contains("*") || grants.contains(requested_host) || grants.contains(&ip) {
+        if grants.contains("*")
+            || grants.contains(&requested_authority)
+            || grants.contains(requested_host)
+            || grants.contains(&ip)
+        {
             Ok(())
         } else {
             Err(PermissionError::new(
@@ -382,6 +435,73 @@ fn network_authority(resource: &str) -> &str {
         .unwrap_or(resource)
 }
 
+fn normalize_grant(resource: &str) -> String {
+    network_authority(resource).trim().to_ascii_lowercase()
+}
+
+fn intersect_exact_grants(
+    host: &BTreeSet<String>,
+    requested: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    if host.contains("*") {
+        return requested.clone();
+    }
+    if requested.contains("*") {
+        return host.clone();
+    }
+    host.intersection(requested).cloned().collect()
+}
+
+fn intersect_network_grants(
+    host: &BTreeSet<String>,
+    requested: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    if host.contains("*") {
+        return requested.clone();
+    }
+    if requested.contains("*") {
+        return host.clone();
+    }
+    let mut effective = BTreeSet::new();
+    for host_grant in host {
+        for requested_grant in requested {
+            if host_grant == requested_grant {
+                effective.insert(host_grant.clone());
+                continue;
+            }
+            if normalize_host(host_grant) != normalize_host(requested_grant) {
+                continue;
+            }
+            match (explicit_port(host_grant), explicit_port(requested_grant)) {
+                (Some(host_port), Some(requested_port)) if host_port != requested_port => {}
+                (Some(_), _) => {
+                    effective.insert(host_grant.clone());
+                }
+                (_, Some(_)) => {
+                    effective.insert(requested_grant.clone());
+                }
+                _ => {
+                    effective.insert(host_grant.clone());
+                }
+            }
+        }
+    }
+    effective
+}
+
+fn explicit_port(authority: &str) -> Option<u16> {
+    if authority.starts_with('[') {
+        return authority
+            .split_once(']')
+            .and_then(|(_, suffix)| suffix.strip_prefix(':'))
+            .and_then(|port| port.parse().ok());
+    }
+    authority
+        .rsplit_once(':')
+        .filter(|(host, _)| !host.contains(':'))
+        .and_then(|(_, port)| port.parse().ok())
+}
+
 pub fn is_sensitive_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -418,6 +538,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn intersection_never_exceeds_host_or_application_permissions() {
+        let root = std::env::temp_dir().join("yanxu-permission-intersection");
+        let host = PermissionSet::sandboxed()
+            .allow_file(&root)
+            .allow_network("example.com:443")
+            .allow_tcp_listen("127.0.0.1")
+            .allow_environment("LANG")
+            .allow_process();
+        let application = PermissionSet::sandboxed()
+            .allow_file(root.join("data"))
+            .allow_network("example.com")
+            .allow_tcp_listen("*")
+            .allow_udp_bind("127.0.0.1")
+            .allow_environment("*")
+            .allow_native_extensions();
+        let effective = host.intersect(&application);
+        assert!(effective.check_file(root.join("data/file.txt")).is_ok());
+        assert!(effective.check_file(root.join("other.txt")).is_err());
+        assert!(effective.check_network("https://example.com:443/").is_ok());
+        assert!(effective.check_network("https://example.com:80/").is_err());
+        assert!(effective.check_tcp_listen("127.0.0.1:9000").is_ok());
+        assert!(effective.check_udp_bind("127.0.0.1:9000").is_err());
+        assert!(effective.check_environment("LANG").is_ok());
+        assert!(effective.check_environment("PATH").is_err());
+        assert!(effective.check_process().is_err());
+        assert!(effective.check_native_extension("extension.so").is_err());
+    }
+
+    #[test]
     fn sandbox_denies_by_default_and_allows_scoped_capabilities() {
         let root = std::env::temp_dir().join("yanxu-permission-test");
         let permissions = PermissionSet::sandboxed()
@@ -437,6 +586,12 @@ mod tests {
         );
         assert!(permissions.check_tcp_listen("127.0.0.1:0").is_ok());
         assert!(permissions.check_udp_bind("127.0.0.1:0").is_ok());
+        assert!(
+            PermissionSet::sandboxed()
+                .allow_tcp_listen("localhost:8080")
+                .check_tcp_listen_resolved("localhost:8080", "127.0.0.1:8080".parse().unwrap())
+                .is_ok()
+        );
         assert!(permissions.check_network("http://example.com").is_err());
         assert!(permissions.check_environment("YANXU_TEST").is_ok());
         assert!(permissions.check_environment("HOME").is_err());
@@ -457,6 +612,18 @@ mod tests {
                 .allow_network("127.0.0.1")
                 .check_resolved_network("127.0.0.1:80", "127.0.0.1:80".parse().unwrap())
                 .is_ok()
+        );
+        assert!(
+            PermissionSet::sandboxed()
+                .allow_network("127.0.0.1:80")
+                .check_resolved_network("127.0.0.1:80", "127.0.0.1:80".parse().unwrap())
+                .is_ok()
+        );
+        assert!(
+            PermissionSet::sandboxed()
+                .allow_network("127.0.0.1:80")
+                .check_resolved_network("127.0.0.1:81", "127.0.0.1:81".parse().unwrap())
+                .is_err()
         );
         assert!(
             PermissionSet::sandboxed()

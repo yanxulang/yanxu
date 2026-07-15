@@ -1,0 +1,272 @@
+name: Reusable Quality Gate
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 要验收的提交或标签
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 准备 Rust 工具链
+        run: rustup component add rustfmt clippy
+      - name: 检查格式
+        run: cargo fmt --all -- --check
+      - name: 运行测试
+        run: cargo test --workspace --all-targets --locked
+      - name: 运行 Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  security-negative:
+    name: 安全与异常路径
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: YXB 权限、结构与资源预算
+        run: "cargo test -p yanxu --locked --lib application::tests::"
+      - name: 原生 ABI 异常释放与真实动态库
+        run: |
+          cargo test -p yanxu --locked --lib native_abi::tests::
+          cargo test -p yanxu --locked --test native_extension -- --test-threads=1
+      - name: 包管理并发、离线与归档安全
+        run: cargo test -p yanxu-package --locked
+
+  wasi:
+    name: WASI 嵌入构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 准备 WASI 目标
+        run: rustup target add wasm32-wasip1
+      - name: 检查 WASI 库
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --target wasm32-wasip1 --lib --locked
+
+  embedding:
+    name: 宿主嵌入验收
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 准备 WASI 目标
+        run: rustup target add wasm32-wasip1
+      - name: 运行 Rust 宿主示例
+        run: cargo run --manifest-path examples/embedding/rust-host/Cargo.toml --locked
+      - name: 检查 WASI 宿主示例
+        run: cargo check --manifest-path examples/embedding/wasi-host/Cargo.toml --target wasm32-wasip1 --locked
+      - name: 构建动态库
+        run: cargo build --release --locked
+      - name: 编译并运行 C ABI 宿主示例
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc examples/embedding/c-host/main.c -Iinclude -Ltarget/release -lyanxu -o "$RUNNER_TEMP/yanxu-c-host"
+          LD_LIBRARY_PATH="$GITHUB_WORKSPACE/target/release" "$RUNNER_TEMP/yanxu-c-host"
+
+  acceptance:
+    name: 机器可读验收与工具链
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tree-sitter-yanxu/package-lock.json
+      - name: 构建命令行
+        run: cargo build --locked
+      - name: 从仓库外运行兼容语料
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/target/debug/yanxu" 兼容 "$GITHUB_WORKSPACE/compat" --json > compatibility.json
+          jq -e '.schema_version == 1 and (.cases | length) >= 12 and ([.cases[].passed] | all)' compatibility.json >/dev/null
+      - name: 校验标准库机器清单
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/debug/yanxu 标准库 --json > "$RUNNER_TEMP/stdlib.json"
+          jq -e '.schema_version == 1 and (.modules | length) == 25' "$RUNNER_TEMP/stdlib.json" >/dev/null
+          cmp stdlib/api-v1.json stdlib/snapshots/1.1.6-api-v1.json
+      - name: 校验版本与工程能力握手
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu") | .version')"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu-package") | .version')"
+          expected_sha="$(git rev-parse HEAD)"
+          target/debug/yanxu version --json > "$RUNNER_TEMP/version.json"
+          jq -e --arg version "$version" --arg sha "$expected_sha" '.schema_version == 2 and .version == $version and .commit_sha == $sha and (.build_target | length) > 0 and (.build_mode == "debug") and (.manifest_formats | index(2)) and (.lock_formats | index(2)) and (.yxb_formats | index(1)) and (.native_abi | index(1))' "$RUNNER_TEMP/version.json" >/dev/null
+          test "$version" = "$package_version"
+          target/debug/yanxu package protocol '{"protocol_version":1,"operation":"handshake"}' > "$RUNNER_TEMP/engineering.json"
+          jq -e --arg version "$version" --arg sha "$expected_sha" '.ok and .result.yanxu_version == $version and .result.build.commit_sha == $sha and (.result.operations | index("vendor"))' "$RUNNER_TEMP/engineering.json" >/dev/null
+          jq -n --arg sha "$expected_sha" --arg version "$version" --slurpfile version_info "$RUNNER_TEMP/version.json" --slurpfile compatibility "$RUNNER_TEMP/compatibility.json" --slurpfile stdlib "$RUNNER_TEMP/stdlib.json" '{schema_version:1, accepted:true, commit_sha:$sha, version:$version, version_info:$version_info[0], compatibility:$compatibility[0], stdlib:$stdlib[0]}' > "$RUNNER_TEMP/acceptance.json"
+      - name: 编译模糊测试目标
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+      - name: 验证共享包发布制品与核心 release 构建
+        run: |
+          cargo package -p yanxu-package --locked
+          cargo build -p yanxu --release --locked
+      - name: 安装 Tree-sitter 工具
+        run: npm --prefix tree-sitter-yanxu ci
+      - name: 生成并测试 Tree-sitter
+        run: |
+          npm --prefix tree-sitter-yanxu run generate
+          npm --prefix tree-sitter-yanxu test
+          git diff --exit-code -- tree-sitter-yanxu/src tree-sitter-yanxu/grammar.js
+      - name: 保存机器可读验收制品
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: yanxu-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/acceptance.json
+            ${{ runner.temp }}/compatibility.json
+            ${{ runner.temp }}/stdlib.json
+            ${{ runner.temp }}/version.json
+            ${{ runner.temp }}/engineering.json
+          if-no-files-found: error
+
+  installer:
+    name: 安装器 · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 构建当前候选版本
+        run: cargo build -p yanxu --release --locked
+      - name: 验证 macOS / Linux 安装器
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          YANXU_INSTALL_DIR: ${{ runner.temp }}/言序 安装/bin
+        run: |
+          set -euo pipefail
+          sh -n scripts/install.sh
+          hash_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu") | .version')"
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          asset_dir="$RUNNER_TEMP/言序 本地制品"
+          mkdir -p "$asset_dir"
+          tar -czf "$asset_dir/yanxu-$target.tar.gz" -C target/release yanxu
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset_dir/yanxu-$target.tar.gz" | awk '{print $1}' > "$asset_dir/yanxu-$target.sha256"
+          else
+            shasum -a 256 "$asset_dir/yanxu-$target.tar.gz" | awk '{print $1}' > "$asset_dir/yanxu-$target.sha256"
+          fi
+          export YANXU_VERSION="$version"
+          export YANXU_ASSET_DIR="$asset_dir"
+          sh scripts/install.sh
+          test "$("$YANXU_INSTALL_DIR/yanxu" --version)" = "言序 $version"
+
+          before="$(hash_file "$YANXU_INSTALL_DIR/yanxu")"
+          printf '%064d\n' 0 > "$asset_dir/yanxu-$target.sha256"
+          if sh scripts/install.sh; then
+            echo "损坏校验和不应安装成功" >&2
+            exit 1
+          fi
+          after="$(hash_file "$YANXU_INSTALL_DIR/yanxu")"
+          test "$before" = "$after"
+
+          fake_dir="$RUNNER_TEMP/fake-yanxu"
+          mkdir -p "$fake_dir"
+          printf '#!/bin/sh\necho 不可运行候选 >&2\nexit 17\n' > "$fake_dir/yanxu"
+          chmod +x "$fake_dir/yanxu"
+          tar -czf "$asset_dir/yanxu-$target.tar.gz" -C "$fake_dir" yanxu
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset_dir/yanxu-$target.tar.gz" | awk '{print $1}' > "$asset_dir/yanxu-$target.sha256"
+          else
+            shasum -a 256 "$asset_dir/yanxu-$target.tar.gz" | awk '{print $1}' > "$asset_dir/yanxu-$target.sha256"
+          fi
+          if sh scripts/install.sh; then
+            echo "不可运行制品不应安装成功" >&2
+            exit 1
+          fi
+          final="$(hash_file "$YANXU_INSTALL_DIR/yanxu")"
+          test "$before" = "$final"
+      - name: 验证 Windows 安装器
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          YANXU_INSTALL_DIR: ${{ runner.temp }}\言序 安装\bin
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install.ps1), [ref]$null, [ref]$errors
+          )
+          if ($errors.Count) { $errors | Format-List; exit 1 }
+
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq "yanxu").version
+          $target = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq "Arm64") {
+            "aarch64-pc-windows-msvc"
+          } else {
+            "x86_64-pc-windows-msvc"
+          }
+          $assetDir = Join-Path $env:RUNNER_TEMP "言序 本地制品"
+          New-Item -ItemType Directory -Force $assetDir | Out-Null
+          $archive = Join-Path $assetDir "yanxu-$target.zip"
+          $checksum = Join-Path $assetDir "yanxu-$target.sha256"
+          Compress-Archive -Path target/release/yanxu.exe -DestinationPath $archive
+          (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant() | Set-Content -NoNewline $checksum
+          $env:YANXU_VERSION = $version
+          $env:YANXU_ASSET_DIR = $assetDir
+          & scripts/install.ps1
+          $installed = Join-Path $env:YANXU_INSTALL_DIR "yanxu.exe"
+          $actual = & $installed --version
+          if ($actual -ne "言序 $version") { throw "安装版本不符：$actual" }
+          $before = (Get-FileHash -Algorithm SHA256 $installed).Hash
+
+          ("0" * 64) | Set-Content -NoNewline $checksum
+          $failure = Start-Process -FilePath pwsh -ArgumentList @(
+            "-NoProfile", "-File", (Resolve-Path scripts/install.ps1)
+          ) -NoNewWindow -Wait -PassThru
+          if ($failure.ExitCode -eq 0) { throw "损坏校验和不应安装成功" }
+          if ((Get-FileHash -Algorithm SHA256 $installed).Hash -ne $before) { throw "校验失败覆盖了旧版本" }
+
+          $fakeDir = Join-Path $env:RUNNER_TEMP "fake-yanxu"
+          New-Item -ItemType Directory -Force $fakeDir | Out-Null
+          Set-Content -NoNewline -Path (Join-Path $fakeDir "yanxu.exe") -Value "not an executable"
+          Remove-Item $archive
+          Compress-Archive -Path (Join-Path $fakeDir "yanxu.exe") -DestinationPath $archive
+          (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant() | Set-Content -NoNewline $checksum
+          $failure = Start-Process -FilePath pwsh -ArgumentList @(
+            "-NoProfile", "-File", (Resolve-Path scripts/install.ps1)
+          ) -NoNewWindow -Wait -PassThru
+          if ($failure.ExitCode -eq 0) { throw "不可运行制品不应安装成功" }
+          if ((Get-FileHash -Algorithm SHA256 $installed).Hash -ne $before) { throw "运行失败覆盖了旧版本" }

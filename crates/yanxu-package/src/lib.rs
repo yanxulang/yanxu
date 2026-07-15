@@ -2,6 +2,7 @@
 
 mod package;
 mod permissions;
+mod storage;
 
 pub use package::*;
 pub use permissions::*;

@@ -21,9 +21,17 @@ pub const YXB_FORMAT_VERSION: u32 = 1;
 const YXB_MAGIC: &[u8] = b"YANXU-YXB-1\n";
 const YXB_COMPRESSED_MAGIC: &[u8] = b"YANXU-YXB-1Z\n";
 const STANDALONE_MAGIC: &[u8; 16] = b"YANXU-APP-v1\0\0\0\0";
-const RESOURCE_MAX_BYTES: u64 = 128 * 1024 * 1024;
-const RESOURCE_MAX_ENTRIES: usize = 4_096;
-const YXB_MAX_DECODED_BYTES: u64 = RESOURCE_MAX_BYTES * 4;
+pub const YXB_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const YXB_MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+pub const YXB_MAX_MODULES: usize = 4_096;
+pub const YXB_MAX_MODULE_BYTES: u64 = 32 * 1024 * 1024;
+pub const YXB_MAX_INSTRUCTIONS: usize = 1_000_000;
+pub const YXB_MAX_FUNCTIONS: usize = 100_000;
+pub const YXB_MAX_CLASSES: usize = 16_384;
+pub const YXB_MAX_DEBUG_SPANS: usize = 1_000_000;
+pub const RESOURCE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+pub const RESOURCE_MAX_SINGLE_BYTES: u64 = 16 * 1024 * 1024;
+pub const RESOURCE_MAX_ENTRIES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationArchive {
@@ -32,6 +40,10 @@ pub struct ApplicationArchive {
     pub package: ApplicationPackage,
     pub target: String,
     pub profile: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub runtime_version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build_commit: String,
     pub entry_module: String,
     pub modules: BTreeMap<String, ApplicationModule>,
     pub resources: BTreeMap<String, ApplicationResource>,
@@ -141,6 +153,12 @@ impl fmt::Display for ApplicationError {
 
 impl std::error::Error for ApplicationError {}
 
+impl From<package::ManifestError> for ApplicationError {
+    fn from(error: package::ManifestError) -> Self {
+        package_error(error)
+    }
+}
+
 pub fn compile_application(
     input: impl AsRef<Path>,
     profile: &str,
@@ -150,10 +168,9 @@ pub fn compile_application(
     }
     let input = input.as_ref();
     let manifest = package::discover(input).map_err(package_error)?;
-    let (entry, root, package_root, package_info, permissions, graph, resources, lock_checksum) =
-        if let Some(manifest) = manifest {
-            validate_runtime_version(&manifest)?;
-            let graph = package::ensure_lock_with_dev(&manifest, false).map_err(package_error)?;
+    if let Some(manifest) = manifest {
+        validate_runtime_version(&manifest)?;
+        return package::with_locked_resolution(&manifest, false, |graph| {
             let entry = fs::canonicalize(manifest.root.join(&manifest.entry)).map_err(|error| {
                 application_error(format!(
                     "不能定位入口 {}：{error}",
@@ -164,7 +181,7 @@ pub fn compile_application(
             let lock_checksum = checksum_file(&manifest.root.join(package::LOCK_NAME)).ok();
             let summary =
                 PermissionSummary::from_permissions(&manifest.permissions, &manifest.root);
-            (
+            compile_resolved_application(
                 entry,
                 fs::canonicalize(&manifest.root).map_err(io_error)?,
                 Some(manifest.root.clone()),
@@ -176,33 +193,49 @@ pub fn compile_application(
                 Some(graph),
                 resources,
                 lock_checksum,
+                profile,
             )
-        } else {
-            let entry = fs::canonicalize(input).map_err(|error| {
-                application_error(format!("不能定位文卷 {}：{error}", input.display()))
-            })?;
-            let root = entry
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
-            (
-                entry.clone(),
-                root,
-                None,
-                ApplicationPackage {
-                    name: entry
-                        .file_stem()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("应用")
-                        .to_owned(),
-                    version: "0.0.0".into(),
-                },
-                PermissionSummary::from_permissions(&PermissionSet::unrestricted(), Path::new(".")),
-                None,
-                BTreeMap::new(),
-                None,
-            )
-        };
+        });
+    }
+    let entry = fs::canonicalize(input)
+        .map_err(|error| application_error(format!("不能定位文卷 {}：{error}", input.display())))?;
+    let root = entry
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let package_info = ApplicationPackage {
+        name: entry
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("应用")
+            .to_owned(),
+        version: "0.0.0".into(),
+    };
+    compile_resolved_application(
+        entry,
+        root,
+        None,
+        package_info,
+        PermissionSummary::from_permissions(&PermissionSet::unrestricted(), Path::new(".")),
+        None,
+        BTreeMap::new(),
+        None,
+        profile,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_resolved_application(
+    entry: PathBuf,
+    root: PathBuf,
+    package_root: Option<PathBuf>,
+    package_info: ApplicationPackage,
+    permissions: PermissionSummary,
+    graph: Option<ResolutionGraph>,
+    resources: BTreeMap<String, ApplicationResource>,
+    lock_checksum: Option<String>,
+    profile: &str,
+) -> Result<ApplicationArchive, ApplicationError> {
     let mut compiler = ApplicationCompiler {
         root,
         package_root,
@@ -218,6 +251,8 @@ pub fn compile_application(
         package: package_info,
         target: package::current_target(),
         profile: profile.into(),
+        runtime_version: env!("CARGO_PKG_VERSION").into(),
+        build_commit: crate::build_info::COMMIT_SHA.into(),
         entry_module,
         modules: compiler.modules,
         resources,
@@ -521,37 +556,141 @@ pub fn serialize(archive: &ApplicationArchive) -> Result<Vec<u8>, ApplicationErr
             .finish()
             .map_err(|error| application_error(format!("不能压缩归档：{error}")))?,
     );
+    if bytes.len() as u64 > YXB_MAX_FILE_BYTES {
+        return Err(application_error(format!(
+            "YXB 压缩制品不得超过 {} MiB",
+            YXB_MAX_FILE_BYTES / 1024 / 1024
+        )));
+    }
     Ok(bytes)
 }
 
 pub fn deserialize(bytes: &[u8]) -> Result<ApplicationArchive, ApplicationError> {
+    deserialize_with_limits(bytes, YXB_MAX_FILE_BYTES, YXB_MAX_DECODED_BYTES)
+}
+
+fn deserialize_with_limits(
+    bytes: &[u8],
+    file_limit: u64,
+    decoded_limit: u64,
+) -> Result<ApplicationArchive, ApplicationError> {
+    if bytes.len() as u64 > file_limit {
+        return Err(application_error(format!(
+            "YXB 文件不得超过 {} MiB",
+            file_limit / 1024 / 1024
+        )));
+    }
     let payload = if let Some(compressed) = bytes.strip_prefix(YXB_COMPRESSED_MAGIC) {
         let mut decoder = ZlibDecoder::new(compressed);
         let mut payload = Vec::new();
         decoder
             .by_ref()
-            .take(YXB_MAX_DECODED_BYTES + 1)
+            .take(decoded_limit + 1)
             .read_to_end(&mut payload)
             .map_err(|error| application_error(format!("归档压缩载荷无效：{error}")))?;
-        if payload.len() as u64 > YXB_MAX_DECODED_BYTES {
+        if payload.len() as u64 > decoded_limit {
             return Err(application_error("YXB 解压后超过大小限制"));
         }
         payload
     } else if let Some(payload) = bytes.strip_prefix(YXB_MAGIC) {
-        if payload.len() as u64 > YXB_MAX_DECODED_BYTES {
+        if payload.len() as u64 > decoded_limit {
             return Err(application_error("YXB JSON 超过大小限制"));
         }
         payload.to_vec()
     } else {
         return Err(application_error("缺少 YXB 文件头"));
     };
+    reject_duplicate_json_keys(&payload)?;
     let archive: ApplicationArchive = serde_json::from_slice(&payload)
         .map_err(|error| application_error(format!("归档 JSON 无效：{error}")))?;
     validate_archive(&archive)?;
     Ok(archive)
 }
 
-fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationError> {
+fn reject_duplicate_json_keys(payload: &[u8]) -> Result<(), ApplicationError> {
+    use serde::de::{MapAccess, SeqAccess, Visitor};
+
+    struct UniqueJson;
+    struct UniqueVisitor;
+
+    impl<'de> Deserialize<'de> for UniqueJson {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(UniqueVisitor)
+        }
+    }
+
+    impl<'de> Visitor<'de> for UniqueVisitor {
+        type Value = UniqueJson;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("无重复对象键的 JSON")
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while sequence.next_element::<UniqueJson>()?.is_some() {}
+            Ok(UniqueJson)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut keys = BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !keys.insert(key.clone()) {
+                    return Err(serde::de::Error::custom(format!("JSON 对象键重复：{key}")));
+                }
+                map.next_value::<UniqueJson>()?;
+            }
+            Ok(UniqueJson)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(payload);
+    UniqueJson::deserialize(&mut deserializer)
+        .and_then(|_| deserializer.end())
+        .map_err(|error| application_error(format!("归档 JSON 无效：{error}")))
+}
+
+pub fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationError> {
     if archive.format_version != YXB_FORMAT_VERSION {
         return Err(application_error(format!(
             "不支持 YXB 格式 {}，当前仅支持 {YXB_FORMAT_VERSION}",
@@ -565,9 +704,66 @@ fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationError
             bytecode::BYTECODE_FORMAT_VERSION
         )));
     }
+    if archive.target.is_empty() || archive.target.len() > 256 {
+        return Err(application_error("YXB 目标平台为空或过长"));
+    }
+    if !matches!(archive.profile.as_str(), "debug" | "release") {
+        return Err(application_error("YXB 构建模式只可为 debug 或 release"));
+    }
+    if archive.runtime_version.len() > 64 || archive.build_commit.len() > 128 {
+        return Err(application_error("YXB 构建身份字段过长"));
+    }
+    if archive.modules.len() > YXB_MAX_MODULES {
+        return Err(application_error(format!(
+            "YXB 模块不得超过 {YXB_MAX_MODULES} 个"
+        )));
+    }
+    if !valid_module_id(&archive.entry_module) {
+        return Err(application_error("YXB 入口模块 ID 非法"));
+    }
     if !archive.modules.contains_key(&archive.entry_module) {
         return Err(application_error("YXB 缺少入口模块"));
     }
+    let mut module_ids = BTreeSet::new();
+    let mut stats = ArchiveStats::default();
+    for (id, module) in &archive.modules {
+        if id != &module.id || !valid_module_id(id) || !module_ids.insert(module.id.clone()) {
+            return Err(application_error(format!(
+                "YXB 模块 ID 非法、重复或与索引不一致：{id}"
+            )));
+        }
+        let mut counter = CountingWriter::default();
+        serde_json::to_writer(&mut counter, module)
+            .map_err(|error| application_error(format!("不能检查模块大小：{error}")))?;
+        if counter.bytes > YXB_MAX_MODULE_BYTES {
+            return Err(application_error(format!(
+                "YXB 模块 {id} 超过 {} MiB",
+                YXB_MAX_MODULE_BYTES / 1024 / 1024
+            )));
+        }
+        validate_chunk(&module.chunk, archive, &mut stats)?;
+    }
+    if stats.instructions > YXB_MAX_INSTRUCTIONS {
+        return Err(application_error(format!(
+            "YXB 指令总量不得超过 {YXB_MAX_INSTRUCTIONS}"
+        )));
+    }
+    if stats.functions > YXB_MAX_FUNCTIONS {
+        return Err(application_error(format!(
+            "YXB 函数总量不得超过 {YXB_MAX_FUNCTIONS}"
+        )));
+    }
+    if stats.classes > YXB_MAX_CLASSES {
+        return Err(application_error(format!(
+            "YXB 类总量不得超过 {YXB_MAX_CLASSES}"
+        )));
+    }
+    if stats.debug_spans > YXB_MAX_DEBUG_SPANS {
+        return Err(application_error(format!(
+            "YXB 调试位置总量不得超过 {YXB_MAX_DEBUG_SPANS}"
+        )));
+    }
+    validate_resources(archive)?;
     let actual = archive_checksum(archive)?;
     if archive.content_checksum != actual {
         return Err(application_error(format!(
@@ -576,6 +772,104 @@ fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationError
         )));
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct ArchiveStats {
+    instructions: usize,
+    functions: usize,
+    classes: usize,
+    debug_spans: usize,
+}
+
+fn validate_chunk(
+    chunk: &Chunk,
+    archive: &ApplicationArchive,
+    stats: &mut ArchiveStats,
+) -> Result<(), ApplicationError> {
+    if chunk.format_version != bytecode::BYTECODE_FORMAT_VERSION {
+        return Err(application_error(format!(
+            "模块内字节码格式 {} 与运行时 {} 不兼容",
+            chunk.format_version,
+            bytecode::BYTECODE_FORMAT_VERSION
+        )));
+    }
+    stats.instructions = stats
+        .instructions
+        .checked_add(chunk.code.len())
+        .ok_or_else(|| application_error("YXB 指令总量溢出"))?;
+    stats.debug_spans = stats
+        .debug_spans
+        .checked_add(chunk.spans.len())
+        .ok_or_else(|| application_error("YXB 调试位置总量溢出"))?;
+    if chunk.code.len() != chunk.spans.len() {
+        return Err(application_error("YXB 指令与调试位置数量不一致"));
+    }
+    for instruction in &chunk.code {
+        if let Instruction::Import { path, .. } = instruction {
+            if let Some(id) = path.strip_prefix("归档:") {
+                if !valid_module_id(id) || !archive.modules.contains_key(id) {
+                    return Err(application_error(format!(
+                        "YXB 归档导入指向不存在或非法模块：{id}"
+                    )));
+                }
+            } else if !path.starts_with("标准:") {
+                return Err(application_error(format!(
+                    "YXB 归档只可导入内部模块或标准库：{path}"
+                )));
+            }
+        }
+    }
+    stats.functions = stats
+        .functions
+        .checked_add(chunk.functions.len())
+        .ok_or_else(|| application_error("YXB 函数总量溢出"))?;
+    stats.classes = stats
+        .classes
+        .checked_add(chunk.classes.len())
+        .ok_or_else(|| application_error("YXB 类总量溢出"))?;
+    stats.debug_spans = stats
+        .debug_spans
+        .checked_add(chunk.functions.len())
+        .and_then(|count| {
+            count.checked_add(
+                chunk
+                    .classes
+                    .iter()
+                    .map(|class| class.methods.len())
+                    .sum::<usize>(),
+            )
+        })
+        .ok_or_else(|| application_error("YXB 调试位置总量溢出"))?;
+    for function in &chunk.functions {
+        validate_chunk(&function.chunk, archive, stats)?;
+    }
+    for class in &chunk.classes {
+        stats.functions = stats
+            .functions
+            .checked_add(class.methods.len())
+            .ok_or_else(|| application_error("YXB 函数总量溢出"))?;
+        for method in &class.methods {
+            validate_chunk(&method.chunk, archive, stats)?;
+        }
+    }
+    Ok(())
+}
+
+fn valid_module_id(id: &str) -> bool {
+    if id.is_empty()
+        || id.len() > 1_024
+        || id.contains(['\\', '\0'])
+        || !(id.starts_with("app:") || id.starts_with("pkg:"))
+    {
+        return false;
+    }
+    let path = id.rsplit_once(':').map_or(id, |(_, path)| path);
+    !path.is_empty()
+        && !Path::new(path).is_absolute()
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn archive_checksum(archive: &ApplicationArchive) -> Result<String, ApplicationError> {
@@ -600,6 +894,25 @@ impl Write for DigestWriter {
     }
 }
 
+#[derive(Default)]
+struct CountingWriter {
+    bytes: u64,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("serialized size overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn write_archive(
     archive: &ApplicationArchive,
     output: impl AsRef<Path>,
@@ -613,7 +926,7 @@ pub fn write_archive(
 }
 
 pub fn read_archive(path: impl AsRef<Path>) -> Result<ApplicationArchive, ApplicationError> {
-    let bytes = fs::read(path.as_ref()).map_err(io_error)?;
+    let bytes = read_limited_file(path.as_ref(), YXB_MAX_FILE_BYTES, "YXB 文件")?;
     deserialize(&bytes)
 }
 
@@ -665,7 +978,7 @@ pub fn read_embedded(
     }
     let length = u64::from_le_bytes(length_bytes);
     let payload_end = file_length - footer as u64;
-    if length > payload_end || length > RESOURCE_MAX_BYTES * 4 {
+    if length > payload_end || length > YXB_MAX_FILE_BYTES {
         return Err(application_error("独立制品中的 YXB 长度越界"));
     }
     file.seek(SeekFrom::Start(payload_end - length))
@@ -678,21 +991,87 @@ pub fn read_embedded(
 pub fn decode_resources(
     archive: &ApplicationArchive,
 ) -> Result<Rc<BTreeMap<String, Vec<u8>>>, ApplicationError> {
-    archive
-        .resources
-        .iter()
-        .map(|(path, resource)| {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(&resource.bytes_base64)
-                .map_err(|error| application_error(format!("资源 {path} 编码无效：{error}")))?;
-            let checksum = format!("{:x}", Sha256::digest(&bytes));
-            if checksum != resource.checksum {
-                return Err(application_error(format!("资源 {path} 校验不符")));
-            }
-            Ok((path.clone(), bytes))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()
-        .map(Rc::new)
+    validate_resources(archive).map(Rc::new)
+}
+
+fn validate_resources(
+    archive: &ApplicationArchive,
+) -> Result<BTreeMap<String, Vec<u8>>, ApplicationError> {
+    if archive.resources.len() > RESOURCE_MAX_ENTRIES {
+        return Err(application_error(format!(
+            "YXB 资源不得超过 {RESOURCE_MAX_ENTRIES} 项"
+        )));
+    }
+    let max_encoded = RESOURCE_MAX_SINGLE_BYTES.div_ceil(3) * 4 + 4;
+    let mut total = 0_u64;
+    let mut paths = BTreeSet::new();
+    let mut decoded = BTreeMap::new();
+    for (path, resource) in &archive.resources {
+        let normalized = normalize_resource_key(path)?;
+        if normalized != *path || resource.path != *path || !paths.insert(resource.path.clone()) {
+            return Err(application_error(format!(
+                "资源路径非法、重复或与索引不一致：{path}"
+            )));
+        }
+        if resource.bytes_base64.len() as u64 > max_encoded {
+            return Err(application_error(format!(
+                "资源 {path} 的编码体积超过单项限制"
+            )));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&resource.bytes_base64)
+            .map_err(|error| application_error(format!("资源 {path} 编码无效：{error}")))?;
+        if bytes.len() as u64 > RESOURCE_MAX_SINGLE_BYTES {
+            return Err(application_error(format!(
+                "资源 {path} 解码后超过 {} MiB",
+                RESOURCE_MAX_SINGLE_BYTES / 1024 / 1024
+            )));
+        }
+        total = total
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| application_error("资源总大小溢出"))?;
+        if total > RESOURCE_MAX_BYTES {
+            return Err(application_error(format!(
+                "资源总大小不得超过 {} MiB",
+                RESOURCE_MAX_BYTES / 1024 / 1024
+            )));
+        }
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        if resource.checksum.len() != 64
+            || !resource
+                .checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || checksum != resource.checksum.to_ascii_lowercase()
+        {
+            return Err(application_error(format!("资源 {path} 校验不符")));
+        }
+        decoded.insert(path.clone(), bytes);
+    }
+    Ok(decoded)
+}
+
+fn read_limited_file(path: &Path, limit: u64, kind: &str) -> Result<Vec<u8>, ApplicationError> {
+    let metadata = fs::metadata(path).map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(application_error(format!("{kind}不是普通文件")));
+    }
+    if metadata.len() > limit {
+        return Err(application_error(format!(
+            "{kind}不得超过 {} MiB",
+            limit / 1024 / 1024
+        )));
+    }
+    let mut file = fs::File::open(path).map_err(io_error)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() as u64 > limit {
+        return Err(application_error(format!("{kind}读取过程中超过大小限制")));
+    }
+    Ok(bytes)
 }
 
 pub fn resolve_declared_resource(
@@ -733,13 +1112,19 @@ pub fn resolve_declared_resource(
 }
 
 pub fn normalize_resource_key(requested: &str) -> Result<String, ApplicationError> {
+    if requested.contains(['\\', '\0']) {
+        return Err(application_error("资源路径须使用正斜杠且不得包含空字符"));
+    }
     let path = Path::new(requested);
     if path.as_os_str().is_empty()
         || path.is_absolute()
         || path.components().any(|component| {
             matches!(
                 component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                Component::CurDir
+                    | Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
             )
         })
     {
@@ -782,15 +1167,37 @@ fn application_error(message: impl Into<String>) -> ApplicationError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn yxb_is_deterministic_and_rejects_tampering() {
-        let root = std::env::temp_dir().join(format!(
-            "yanxu-yxb-{}",
+    fn temporary_root(label: &str) -> PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "yanxu-{label}-{}-{sequence}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    fn compile_test_application(source: &str, permissions: &str) -> (PathBuf, ApplicationArchive) {
+        let root = temporary_root("application-security");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            format!(
+                "[包]\n格式=2\n名称='安全应用'\n版本='0.1.0'\n言序='>=1.1.5'\n入口='src/主.yx'\n[权限]\n{permissions}\n[导出]\n默认='src/主.yx'\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("src/主.yx"), source).unwrap();
+        let archive = compile_application(&root, "release").unwrap();
+        (root, archive)
+    }
+
+    #[test]
+    fn yxb_is_deterministic_and_rejects_tampering() {
+        let root = temporary_root("yxb");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("assets")).unwrap();
         fs::write(
@@ -828,5 +1235,195 @@ mod tests {
         let mut tampered = decoded;
         tampered.package.name = "篡改".into();
         assert!(serialize(&tampered).is_err());
+    }
+
+    #[test]
+    fn yxb_permissions_are_bounded_by_the_host_even_after_rechecksumming() {
+        let (root, archive) = compile_test_application(
+            "引「标准:环境」为 环境；言 环境.读取（「PATH」）；\n",
+            "环境=['PATH']",
+        );
+
+        let mut denied = crate::vm::Vm::silent_with_permissions(PermissionSet::sandboxed());
+        let error = denied.execute_application(&archive).unwrap_err();
+        assert!(error.to_string().contains("未获环境权限"));
+
+        let mut allowed = crate::vm::Vm::silent_with_permissions(
+            PermissionSet::sandboxed().allow_environment("PATH"),
+        );
+        allowed.execute_application(&archive).unwrap();
+
+        let mut tampered = archive;
+        tampered.permissions.unrestricted = true;
+        tampered.content_checksum = archive_checksum(&tampered).unwrap();
+        let mut still_denied = crate::vm::Vm::silent_with_permissions(PermissionSet::sandboxed());
+        let error = still_denied.execute_application(&tampered).unwrap_err();
+        assert!(error.to_string().contains("未获环境权限"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn yxb_rejects_invalid_structure_resources_and_imports() {
+        let (root, archive) =
+            compile_test_application("引「标准:环境」为 环境；言 1；\n", "环境=[]");
+
+        let mut missing_entry = archive.clone();
+        missing_entry.entry_module = "app:缺失.yx".into();
+        missing_entry.content_checksum = archive_checksum(&missing_entry).unwrap();
+        assert!(
+            validate_archive(&missing_entry)
+                .unwrap_err()
+                .message
+                .contains("缺少入口模块")
+        );
+
+        let mut invalid_id = archive.clone();
+        let module = invalid_id.modules.values().next().unwrap().clone();
+        invalid_id.modules.insert("app:../越界.yx".into(), module);
+        assert!(
+            validate_archive(&invalid_id)
+                .unwrap_err()
+                .message
+                .contains("模块 ID 非法")
+        );
+
+        let mut external_import = archive.clone();
+        let import = external_import
+            .modules
+            .values_mut()
+            .flat_map(|module| module.chunk.code.iter_mut())
+            .find(|instruction| matches!(instruction, Instruction::Import { .. }))
+            .unwrap();
+        if let Instruction::Import { path, .. } = import {
+            *path = "相对模块.yx".into();
+        }
+        external_import.content_checksum = archive_checksum(&external_import).unwrap();
+        assert!(
+            validate_archive(&external_import)
+                .unwrap_err()
+                .message
+                .contains("只可导入内部模块或标准库")
+        );
+
+        let mut invalid_resource = archive;
+        invalid_resource.resources.insert(
+            "../越界.bin".into(),
+            ApplicationResource {
+                path: "../越界.bin".into(),
+                bytes_base64: String::new(),
+                checksum: format!("{:x}", Sha256::digest([])),
+            },
+        );
+        invalid_resource.content_checksum = archive_checksum(&invalid_resource).unwrap();
+        assert!(
+            validate_archive(&invalid_resource)
+                .unwrap_err()
+                .message
+                .contains("资源路径")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn yxb_rejects_malformed_duplicate_truncated_and_oversized_inputs() {
+        let mut malformed = YXB_MAGIC.to_vec();
+        malformed.extend_from_slice(b"{");
+        assert!(deserialize(&malformed).is_err());
+
+        let mut duplicate = YXB_MAGIC.to_vec();
+        duplicate.extend_from_slice(b"{\"format_version\":1,\"format_version\":1}");
+        assert!(
+            deserialize(&duplicate)
+                .unwrap_err()
+                .message
+                .contains("重复")
+        );
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&vec![b'x'; 4_096]).unwrap();
+        let mut bomb = YXB_COMPRESSED_MAGIC.to_vec();
+        bomb.extend(encoder.finish().unwrap());
+        assert!(
+            deserialize_with_limits(&bomb, 1024 * 1024, 1024)
+                .unwrap_err()
+                .message
+                .contains("解压后超过")
+        );
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(b"{}").unwrap();
+        let mut truncated = YXB_COMPRESSED_MAGIC.to_vec();
+        let mut compressed = encoder.finish().unwrap();
+        compressed.truncate(compressed.len().saturating_sub(3));
+        truncated.extend(compressed);
+        assert!(deserialize(&truncated).is_err());
+
+        let mut invalid_stream = YXB_COMPRESSED_MAGIC.to_vec();
+        invalid_stream.extend_from_slice(b"not-a-zlib-stream");
+        assert!(deserialize(&invalid_stream).is_err());
+
+        let path = temporary_root("oversized.yxb");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(YXB_MAX_FILE_BYTES + 1).unwrap();
+        assert!(
+            read_archive(&path)
+                .unwrap_err()
+                .message
+                .contains("不得超过")
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn yxb_rejects_excessive_module_and_resource_counts() {
+        let (root, archive) = compile_test_application("言 1；\n", "环境=[]");
+        let template = archive.modules.values().next().unwrap().clone();
+        let mut modules = archive.clone();
+        for index in 0..=YXB_MAX_MODULES {
+            let id = format!("app:generated/{index}.yx");
+            let mut module = template.clone();
+            module.id.clone_from(&id);
+            modules.modules.insert(id, module);
+        }
+        assert!(
+            validate_archive(&modules)
+                .unwrap_err()
+                .message
+                .contains("模块不得超过")
+        );
+
+        let mut resources = archive;
+        for index in 0..=RESOURCE_MAX_ENTRIES {
+            let path = format!("generated/{index}.bin");
+            resources.resources.insert(
+                path.clone(),
+                ApplicationResource {
+                    path,
+                    bytes_base64: String::new(),
+                    checksum: format!("{:x}", Sha256::digest([])),
+                },
+            );
+        }
+        assert!(
+            validate_archive(&resources)
+                .unwrap_err()
+                .message
+                .contains("资源不得超过")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_uncompressed_yxb_without_build_identity_remains_compatible() {
+        let (root, mut archive) = compile_test_application("言 1；\n", "环境=[]");
+        archive.runtime_version.clear();
+        archive.build_commit.clear();
+        archive.content_checksum = archive_checksum(&archive).unwrap();
+        let mut legacy = YXB_MAGIC.to_vec();
+        legacy.extend(serde_json::to_vec(&archive).unwrap());
+        let decoded = deserialize(&legacy).unwrap();
+        assert!(decoded.runtime_version.is_empty());
+        assert!(decoded.build_commit.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 }

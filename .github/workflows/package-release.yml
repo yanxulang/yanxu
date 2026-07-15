@@ -1,0 +1,94 @@
+name: yanxu-package Release
+
+on:
+  push:
+    tags:
+      - "yanxu-package-v[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已存在的共享包标签（如 yanxu-package-v1.1.6）
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yanxu-package-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: 校验共享包版本与提交
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref_name }}
+      - id: version
+        name: 核对标签、Cargo、主分支与变更记录
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu-package") | .version')"
+          if [[ "$tag" != "yanxu-package-v$version" ]]; then
+            echo "标签 $tag 与 yanxu-package $version 不一致" >&2
+            exit 1
+          fi
+          git fetch origin main --tags
+          tag_commit="$(git rev-list -n 1 "$tag")"
+          main_commit="$(git rev-parse origin/main)"
+          if [[ "$tag_commit" != "$main_commit" ]]; then
+            echo "共享包标签必须精确指向 origin/main 验收提交" >&2
+            exit 1
+          fi
+          grep -Fqx "## $version" CHANGELOG.md
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: 共享包独立质量门禁
+    needs: validate
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: refs/tags/${{ needs.validate.outputs.tag }}
+
+  package:
+    name: 构建并发布共享包制品
+    needs: [validate, quality]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+      - name: 生成 crate 与 SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package -p yanxu-package --locked
+          crate="target/package/yanxu-package-${{ needs.validate.outputs.version }}.crate"
+          (cd target/package && sha256sum "$(basename "$crate")" > "$(basename "$crate").sha256")
+      - name: 创建独立 Release 草稿并上传
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          crate="target/package/yanxu-package-$VERSION.crate"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "yanxu-package $VERSION" --notes "言序共享包解析核心 $VERSION；此 Release 不包含 yanxu 运行时。"
+          fi
+          gh release upload "$TAG" "$crate" "$crate.sha256" --clobber
+          gh release edit "$TAG" --draft=false --title "yanxu-package $VERSION"

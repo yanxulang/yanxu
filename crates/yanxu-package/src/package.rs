@@ -4,6 +4,12 @@
 //! 版本、Git 修订和内容 SHA-256。解析器在使用锁文件时仍会校验缓存内容，
 //! 因而损坏或被悄悄改写的依赖不会进入模块执行。
 
+mod archive;
+
+#[cfg(test)]
+use archive::{ARCHIVE_LIMITS, extract_archive_with_limits, validate_archive_relative_path};
+use archive::{extract_archive_safely, find_manifest_root};
+
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,6 +19,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub const MANIFEST_NAME: &str = "言序.toml";
@@ -27,23 +34,7 @@ pub const ARCHIVE_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 pub const ARCHIVE_MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
 pub const ARCHIVE_MAX_ENTRIES: usize = 4_096;
 pub const ARCHIVE_MAX_PATH_BYTES: usize = 512;
-
-#[derive(Debug, Clone, Copy)]
-struct ArchiveLimits {
-    compressed_bytes: u64,
-    file_bytes: u64,
-    expanded_bytes: u64,
-    entries: usize,
-    path_bytes: usize,
-}
-
-const ARCHIVE_LIMITS: ArchiveLimits = ArchiveLimits {
-    compressed_bytes: ARCHIVE_MAX_COMPRESSED_BYTES,
-    file_bytes: ARCHIVE_MAX_FILE_BYTES,
-    expanded_bytes: ARCHIVE_MAX_EXPANDED_BYTES,
-    entries: ARCHIVE_MAX_ENTRIES,
-    path_bytes: ARCHIVE_MAX_PATH_BYTES,
-};
+static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -260,6 +251,16 @@ impl fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
+fn atomic_write(path: &Path, bytes: &[u8], kind: &str) -> Result<(), ManifestError> {
+    crate::storage::atomic_write(path, bytes)
+        .map_err(|error| manifest_error(path, None, format!("不能原子写入{kind}：{error}")))
+}
+
+fn acquire_project_lock(root: &Path) -> Result<crate::storage::ProjectLock, ManifestError> {
+    crate::storage::ProjectLock::acquire(root)
+        .map_err(|error| manifest_error(root, None, format!("不能取得包项目锁：{error}")))
+}
+
 pub fn discover(start: impl AsRef<Path>) -> Result<Option<Manifest>, ManifestError> {
     let start = start.as_ref();
     let mut directory = if start.is_dir() {
@@ -424,6 +425,18 @@ fn resolve_graph_mode(
     use_existing: bool,
     write: bool,
 ) -> Result<ResolutionGraph, ManifestError> {
+    let _project_lock = write
+        .then(|| acquire_project_lock(&manifest.root))
+        .transpose()?;
+    resolve_graph_mode_locked(manifest, offline, use_existing, write)
+}
+
+fn resolve_graph_mode_locked(
+    manifest: &Manifest,
+    offline: bool,
+    use_existing: bool,
+    write: bool,
+) -> Result<ResolutionGraph, ManifestError> {
     let manifest_checksum = file_checksum(&manifest.path)?;
     let lock_path = manifest.root.join(LOCK_NAME);
     let existing = use_existing
@@ -479,20 +492,35 @@ fn resolve_graph_mode(
     Ok(graph)
 }
 
+/// 在项目跨进程锁的整个生命周期内解析依赖并执行构建操作。
+///
+/// 调用方应把所有清单、锁文件、源码和资源读取放在闭包中，避免依赖解析
+/// 完成后被并发的安装、更新或清单编辑替换输入。闭包不得再次调用会取得同一
+/// 项目锁的包写操作。
+pub fn with_locked_resolution<T, E>(
+    manifest: &Manifest,
+    offline: bool,
+    operation: impl FnOnce(ResolutionGraph) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<ManifestError>,
+{
+    let _project_lock = acquire_project_lock(&manifest.root).map_err(E::from)?;
+    let graph = resolve_graph_mode_locked(manifest, offline, true, true).map_err(E::from)?;
+    cache_graph(manifest, graph.clone());
+    operation(graph)
+}
+
 pub fn update_lock(
     manifest: &Manifest,
     offline: bool,
 ) -> Result<BTreeMap<String, ResolvedDependency>, ManifestError> {
-    let path = manifest.root.join(LOCK_NAME);
-    if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|error| manifest_error(&path, None, format!("不能移除旧锁文件：{error}")))?;
-    }
+    let graph = resolve_graph_mode(manifest, offline, false, true)?;
     graph_cache()
         .lock()
         .expect("graph cache poisoned")
-        .remove(&manifest.root);
-    ensure_lock(manifest, offline)
+        .insert(graph_cache_key(&manifest.root), graph.clone());
+    direct_dependencies(&graph, &graph.root_dependencies, &manifest.path)
 }
 
 pub fn read_lock(path: impl AsRef<Path>) -> Result<LockFile, ManifestError> {
@@ -554,7 +582,7 @@ pub fn validate_lock(manifest: &Manifest) -> Result<LockFile, ManifestError> {
 pub fn manifest_template(name: &str) -> Result<String, String> {
     validate_package_name(name)?;
     Ok(format!(
-        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.5\"\n入口 = \"src/主.yx\"\n\n[依赖]\n\n[权限]\n文件 = []\n网络 = []\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
+        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.6\"\n入口 = \"src/主.yx\"\n\n[依赖]\n\n[权限]\n文件 = []\n网络 = []\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
     ))
 }
 
@@ -569,6 +597,8 @@ pub fn edit_dependency(
     validate_package_name(alias)
         .map_err(|message| manifest_error(manifest_path.as_ref(), None, message))?;
     let manifest_path = manifest_path.as_ref();
+    let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let _project_lock = acquire_project_lock(root)?;
     let original = fs::read_to_string(manifest_path)
         .map_err(|error| manifest_error(manifest_path, None, format!("不能读取以修改：{error}")))?;
     load(manifest_path)?;
@@ -617,18 +647,17 @@ pub fn edit_dependency(
     }
     let updated = toml::to_string_pretty(&document)
         .map_err(|error| manifest_error(manifest_path, None, format!("不能生成清单：{error}")))?;
-    fs::write(manifest_path, updated)
-        .map_err(|error| manifest_error(manifest_path, None, format!("不能写入清单：{error}")))?;
+    atomic_write(manifest_path, updated.as_bytes(), "清单")?;
     match load(manifest_path) {
         Ok(manifest) => {
             graph_cache()
                 .lock()
                 .expect("graph cache poisoned")
-                .remove(&manifest.root);
+                .remove(&graph_cache_key(&manifest.root));
             Ok(manifest)
         }
         Err(error) => {
-            let _ = fs::write(manifest_path, original);
+            let _ = atomic_write(manifest_path, original.as_bytes(), "清单回滚");
             Err(error)
         }
     }
@@ -703,11 +732,15 @@ fn graph_cache() -> &'static Mutex<HashMap<PathBuf, ResolutionGraph>> {
     GRAPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn graph_cache_key(root: &Path) -> PathBuf {
+    fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
 fn cache_graph(manifest: &Manifest, graph: ResolutionGraph) {
     graph_cache()
         .lock()
         .expect("graph cache poisoned")
-        .insert(manifest.root.clone(), graph);
+        .insert(graph_cache_key(&manifest.root), graph);
 }
 
 fn cached_or_resolve_graph(
@@ -717,7 +750,7 @@ fn cached_or_resolve_graph(
     if let Some(graph) = graph_cache()
         .lock()
         .expect("graph cache poisoned")
-        .get(&manifest.root)
+        .get(&graph_cache_key(&manifest.root))
         .cloned()
     {
         return Ok(graph);
@@ -843,7 +876,7 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         return Err(manifest_error(
             &path,
             None,
-            format!("1.1.5 仅支持“字节码”构建目标，不支持“{}”", build.target),
+            format!("1.1.6 仅支持“字节码”构建目标，不支持“{}”", build.target),
         ));
     }
 
@@ -1037,7 +1070,7 @@ fn parse_native_package(
         return Err(manifest_error(
             manifest_path,
             None,
-            format!("不支持原生扩展 ABI {abi_version}，1.1.5 仅支持 ABI 1"),
+            format!("不支持原生扩展 ABI {abi_version}，1.1.6 仅支持 ABI 1"),
         ));
     }
     let mut artifacts = BTreeMap::new();
@@ -1402,8 +1435,14 @@ fn resolve_one(
                 .map_err(|error| {
                     manifest_error(&manifest.path, None, format!("锁定版本无效：{error}"))
                 })?;
-            let (root, version) =
-                resolve_registry(package_name, requirement, registry, exact, offline)?;
+            let (root, version) = resolve_registry(
+                package_name,
+                requirement,
+                registry,
+                exact,
+                locked.map(|locked| locked.checksum.as_str()),
+                offline,
+            )?;
             let resolved = lock_local(
                 package_name,
                 &root,
@@ -1596,6 +1635,7 @@ fn resolve_registry(
     requirement: &VersionReq,
     registry: &str,
     locked: Option<Version>,
+    locked_checksum: Option<&str>,
     offline: bool,
 ) -> Result<(PathBuf, Version), ManifestError> {
     let registry_path = registry
@@ -1620,7 +1660,7 @@ fn resolve_registry(
     let registry_cache = cache_root().join("registry").join(short_hash(registry));
     if let Some(version) = &locked {
         let cached = registry_cache.join(name).join(version.to_string());
-        if cached.join(MANIFEST_NAME).is_file() {
+        if reusable_registry_cache(&cached, locked_checksum, offline)? {
             return Ok((cached, version.clone()));
         }
     }
@@ -1704,6 +1744,33 @@ fn resolve_registry(
     Ok((destination, version))
 }
 
+fn reusable_registry_cache(
+    cached: &Path,
+    expected_checksum: Option<&str>,
+    offline: bool,
+) -> Result<bool, ManifestError> {
+    if !cached.exists() {
+        return Ok(false);
+    }
+    let valid = cached.join(MANIFEST_NAME).is_file()
+        && load(cached.join(MANIFEST_NAME)).is_ok()
+        && expected_checksum
+            .is_none_or(|expected| tree_checksum(cached).is_ok_and(|actual| actual == expected));
+    if valid {
+        return Ok(true);
+    }
+    if offline {
+        return Err(manifest_error(
+            cached,
+            None,
+            "离线索引缓存损坏或与锁文件校验和不一致；请联网重新安装",
+        ));
+    }
+    fs::remove_dir_all(cached)
+        .map_err(|error| manifest_error(cached, None, format!("不能清理损坏索引缓存：{error}")))?;
+    Ok(false)
+}
+
 fn select_registry_version(
     package_root: &Path,
     requirement: &VersionReq,
@@ -1739,8 +1806,7 @@ fn select_registry_version(
 fn write_lock(path: &Path, lock: &LockFile) -> Result<(), ManifestError> {
     let text = toml::to_string_pretty(lock)
         .map_err(|error| manifest_error(path, None, format!("不能生成锁文件：{error}")))?;
-    fs::write(path, text)
-        .map_err(|error| manifest_error(path, None, format!("不能写入锁文件：{error}")))
+    atomic_write(path, text.as_bytes(), "锁文件")
 }
 
 fn canonical_dependency_root(path: &Path) -> Result<PathBuf, ManifestError> {
@@ -1761,7 +1827,9 @@ pub fn pack_package(
     manifest: &Manifest,
     output: impl AsRef<Path>,
 ) -> Result<PackageArtifact, ManifestError> {
-    ensure_lock_with_dev(manifest, false)?;
+    let _project_lock = acquire_project_lock(&manifest.root)?;
+    let graph = resolve_graph_mode_locked(manifest, false, true, true)?;
+    cache_graph(manifest, graph);
     let output = output.as_ref();
     let mut files = Vec::new();
     collect_pack_files(&manifest.root, &manifest.root, &mut files)?;
@@ -1799,8 +1867,9 @@ pub fn pack_package(
         fs::create_dir_all(parent)
             .map_err(|error| manifest_error(parent, None, format!("不能创建输出目录：{error}")))?;
     }
+    let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = output.with_extension(format!(
-        "{}.tmp-{}",
+        "{}.tmp-{}-{sequence}",
         output
             .extension()
             .and_then(|value| value.to_str())
@@ -1908,9 +1977,7 @@ pub fn vendor_dependencies(
     let document = serde_json::to_vec_pretty(&vendor).map_err(|error| {
         manifest_error(&manifest_path, None, format!("不能生成辖制清单：{error}"))
     })?;
-    fs::write(&manifest_path, document).map_err(|error| {
-        manifest_error(&manifest_path, None, format!("不能写入辖制清单：{error}"))
-    })?;
+    atomic_write(&manifest_path, &document, "辖制清单")?;
     Ok(vendor)
 }
 
@@ -2139,193 +2206,6 @@ fn download(url: &str, destination: &Path) -> Result<(), ManifestError> {
         destination,
         "下载索引资源",
     )
-}
-
-fn extract_archive_safely(archive: &Path, destination: &Path) -> Result<(), ManifestError> {
-    extract_archive_with_limits(archive, destination, ARCHIVE_LIMITS)
-}
-
-fn extract_archive_with_limits(
-    archive: &Path,
-    destination: &Path,
-    limits: ArchiveLimits,
-) -> Result<(), ManifestError> {
-    let compressed_bytes = fs::metadata(archive)
-        .map_err(|error| manifest_error(archive, None, format!("不能检查制品大小：{error}")))?
-        .len();
-    if compressed_bytes > limits.compressed_bytes {
-        return Err(manifest_error(
-            archive,
-            None,
-            format!(
-                "索引制品压缩后为 {compressed_bytes} 字节，超过 {} 字节上限",
-                limits.compressed_bytes
-            ),
-        ));
-    }
-    let file = fs::File::open(archive)
-        .map_err(|error| manifest_error(archive, None, format!("不能打开索引制品：{error}")))?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut tar = tar::Archive::new(decoder);
-    let entries = tar.entries().map_err(|error| {
-        manifest_error(archive, None, format!("索引制品不是有效 tar.gz：{error}"))
-    })?;
-    let mut entry_count = 0_usize;
-    let mut expanded_bytes = 0_u64;
-    for entry in entries {
-        entry_count = entry_count.saturating_add(1);
-        if entry_count > limits.entries {
-            return Err(manifest_error(
-                archive,
-                None,
-                format!("索引制品条目超过 {} 项上限", limits.entries),
-            ));
-        }
-        let mut entry = entry.map_err(|error| {
-            manifest_error(archive, None, format!("不能读取索引制品条目：{error}"))
-        })?;
-        let relative = entry
-            .path()
-            .map_err(|error| manifest_error(archive, None, format!("索引制品路径无效：{error}")))?
-            .into_owned();
-        validate_archive_relative_path(&relative, limits.path_bytes)
-            .map_err(|message| manifest_error(archive, None, message))?;
-        let destination_path = destination.join(&relative);
-        let entry_type = entry.header().entry_type();
-        if entry_type.is_dir() {
-            fs::create_dir_all(&destination_path).map_err(|error| {
-                manifest_error(
-                    &destination_path,
-                    None,
-                    format!("不能创建制品目录：{error}"),
-                )
-            })?;
-            continue;
-        }
-        if !entry_type.is_file() {
-            return Err(manifest_error(
-                archive,
-                None,
-                format!(
-                    "索引制品含不允许的特殊条目“{}”（符号链接、硬链接、设备文件与管道均被拒绝）",
-                    relative.display()
-                ),
-            ));
-        }
-        let file_bytes = entry.size();
-        if file_bytes > limits.file_bytes {
-            return Err(manifest_error(
-                archive,
-                None,
-                format!(
-                    "索引制品文件“{}”为 {file_bytes} 字节，超过 {} 字节上限",
-                    relative.display(),
-                    limits.file_bytes
-                ),
-            ));
-        }
-        expanded_bytes = expanded_bytes
-            .checked_add(file_bytes)
-            .ok_or_else(|| manifest_error(archive, None, "索引制品展开大小溢出"))?;
-        if expanded_bytes > limits.expanded_bytes {
-            return Err(manifest_error(
-                archive,
-                None,
-                format!("索引制品展开后超过 {} 字节上限", limits.expanded_bytes),
-            ));
-        }
-        if let Some(parent) = destination_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                manifest_error(parent, None, format!("不能创建制品目录：{error}"))
-            })?;
-        }
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination_path)
-            .map_err(|error| {
-                manifest_error(
-                    &destination_path,
-                    None,
-                    format!("不能安全创建制品文件：{error}"),
-                )
-            })?;
-        let copied = io::copy(&mut entry, &mut output).map_err(|error| {
-            manifest_error(
-                &destination_path,
-                None,
-                format!("不能展开制品文件：{error}"),
-            )
-        })?;
-        if copied != file_bytes {
-            return Err(manifest_error(
-                archive,
-                None,
-                format!(
-                    "索引制品文件“{}”声明 {file_bytes} 字节，实际展开 {copied} 字节",
-                    relative.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_archive_relative_path(path: &Path, max_bytes: usize) -> Result<(), String> {
-    if path.as_os_str().is_empty()
-        || path.as_os_str().as_encoded_bytes().len() > max_bytes
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        Err(format!("索引制品含越界或过长路径“{}”", path.display()))
-    } else {
-        Ok(())
-    }
-}
-
-fn find_manifest_root(directory: &Path) -> Result<PathBuf, ManifestError> {
-    let mut manifests = Vec::new();
-    find_manifests(directory, &mut manifests)?;
-    if manifests.len() != 1 {
-        return Err(manifest_error(
-            directory,
-            None,
-            format!(
-                "索引制品应恰含一个 {MANIFEST_NAME}，实有 {} 个",
-                manifests.len()
-            ),
-        ));
-    }
-    Ok(manifests
-        .pop()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-        .expect("manifest has parent"))
-}
-
-fn find_manifests(directory: &Path, manifests: &mut Vec<PathBuf>) -> Result<(), ManifestError> {
-    for entry in fs::read_dir(directory)
-        .map_err(|error| manifest_error(directory, None, format!("不能检查展开制品：{error}")))?
-    {
-        let entry = entry
-            .map_err(|error| manifest_error(directory, None, format!("不能读取展开项：{error}")))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| manifest_error(&path, None, format!("不能检查展开项类型：{error}")))?;
-        if file_type.is_dir() {
-            find_manifests(&path, manifests)?;
-        } else if file_type.is_file() && entry.file_name() == MANIFEST_NAME {
-            manifests.push(path);
-        } else if !file_type.is_file() {
-            return Err(manifest_error(&path, None, "展开制品含特殊文件"));
-        }
-    }
-    Ok(())
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), ManifestError> {
@@ -2572,6 +2452,197 @@ mod tests {
         ));
         let manifest = edit_dependency(root.join(MANIFEST_NAME), "别名", None, None, true).unwrap();
         assert!(manifest.dev_dependencies.is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn concurrent_manifest_edits_are_serialized_and_leave_no_partial_files() {
+        let root = temp("concurrent-edit");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/主.yx"), "言「善哉」；\n").unwrap();
+        let manifest_path = root.join(MANIFEST_NAME);
+        fs::write(&manifest_path, manifest_template("并发工程").unwrap()).unwrap();
+        let threads = (0..8)
+            .map(|index| {
+                let manifest_path = manifest_path.clone();
+                std::thread::spawn(move || {
+                    edit_dependency(
+                        manifest_path,
+                        &format!("依赖{index}"),
+                        None,
+                        Some(&Dependency::Path {
+                            path: PathBuf::from(format!("../dependency-{index}")),
+                            requirement: None,
+                        }),
+                        false,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let manifest = load(&manifest_path).unwrap();
+        assert_eq!(manifest.dependencies.len(), 8);
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn concurrent_install_update_and_build_leave_complete_artifacts() {
+        let root = temp("concurrent-package-operations");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='并发应用'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言 1；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let output = root.join("build/application.yxp");
+        let threads = (0..6)
+            .map(|index| {
+                let manifest = manifest.clone();
+                let output = output.clone();
+                std::thread::spawn(move || match index % 3 {
+                    0 => ensure_lock_with_dev(&manifest, false).map(|_| ()),
+                    1 => update_lock(&manifest, false).map(|_| ()),
+                    _ => pack_package(&manifest, output).map(|_| ()),
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let lock = read_lock(root.join(LOCK_NAME)).unwrap();
+        assert_eq!(lock.generator, env!("CARGO_PKG_VERSION"));
+        assert!(output.is_file());
+        let unpacked = root.join("unpacked");
+        extract_archive_safely(&output, &unpacked).unwrap();
+        assert!(unpacked.join("package/主.yx").is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn locked_build_cache_uses_one_key_for_relative_and_canonical_roots() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let relative = PathBuf::from(format!(".yanxu-relative-cache-{unique}"));
+        write(
+            &relative.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='相对缓存'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&relative.join("主.yx"), "言 1；\n");
+        let manifest = load(relative.join(MANIFEST_NAME)).unwrap();
+        let canonical = fs::canonicalize(&relative).unwrap();
+        with_locked_resolution(&manifest, false, |graph| {
+            let cached = graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .get(&canonical)
+                .cloned();
+            assert_eq!(cached, Some(graph));
+            Ok::<_, ManifestError>(())
+        })
+        .unwrap();
+        fs::remove_dir_all(relative).ok();
+    }
+
+    #[test]
+    fn failed_lock_update_preserves_the_last_complete_lockfile() {
+        let root = temp("atomic-lock-update");
+        let dependency = root.join("dependency");
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&dependency.join("主.yx"), "公 定 值 为 1；\n");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具='dependency'\n",
+        );
+        write(&root.join("主.yx"), "言 1；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        let lock_path = root.join(LOCK_NAME);
+        let complete = fs::read(&lock_path).unwrap();
+        fs::remove_dir_all(dependency).unwrap();
+        assert!(update_lock(&manifest, true).is_err());
+        assert_eq!(fs::read(lock_path).unwrap(), complete);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn offline_registry_resolution_never_attempts_an_uncached_download() {
+        let root = temp("offline-registry");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='离线应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n远程={版='^1',源='https://127.0.0.1:1/never'}\n",
+        );
+        write(&root.join("主.yx"), "言 1；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let error = ensure_lock(&manifest, true).unwrap_err();
+        assert!(error.message.contains("离线模式"));
+        assert!(!root.join(LOCK_NAME).exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn corrupted_registry_cache_is_rejected_offline_and_removed_online() {
+        let cached = temp("corrupted-registry-cache");
+        write(
+            &cached.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='缓存包'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&cached.join("主.yx"), "公 定 值 为 1；\n");
+        let checksum = tree_checksum(&cached).unwrap();
+        assert!(reusable_registry_cache(&cached, Some(&checksum), true).unwrap());
+
+        write(&cached.join("主.yx"), "公 定 值 为 2；\n");
+        let error = reusable_registry_cache(&cached, Some(&checksum), true).unwrap_err();
+        assert!(error.message.contains("缓存损坏"));
+        assert!(cached.exists());
+        assert!(!reusable_registry_cache(&cached, Some(&checksum), false).unwrap());
+        assert!(!cached.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_paths_accept_drive_letter_case_and_backslashes() {
+        let root = temp("windows-paths");
+        let dependency = root.join("Dependency");
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&dependency.join("主.yx"), "公 定 值 为 1；\n");
+        let mut dependency_path = fs::canonicalize(&dependency)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if let Some(first) = dependency_path.get_mut(..1) {
+            first.make_ascii_lowercase();
+        }
+        let application = root.join("Application");
+        write(
+            &application.join(MANIFEST_NAME),
+            &format!(
+                "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具={{路径='{dependency_path}',版='^1'}}\n"
+            ),
+        );
+        write(&application.join("主.yx"), "言 1；\n");
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        let dependencies = ensure_lock(&manifest, false).unwrap();
+        assert_eq!(
+            dependencies["工具"].root,
+            fs::canonicalize(dependency).unwrap()
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -2899,6 +2970,18 @@ mod tests {
         let url = root.to_string_lossy();
         let (cache, first_revision) = resolve_git(&url, "HEAD", false).unwrap();
         assert_eq!(first_revision.len(), 40);
+        for arguments in [vec!["branch", "channel"], vec!["tag", "v1"]] {
+            let status = Command::new("git")
+                .args(arguments)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let (_, branch_first) = resolve_git(&url, "channel", false).unwrap();
+        let (_, tag_revision) = resolve_git(&url, "v1", false).unwrap();
+        assert_eq!(branch_first, first_revision);
+        assert_eq!(tag_revision, first_revision);
 
         write(&root.join("主.yx"), "公 定 答：数 为 2；\n");
         for arguments in [vec!["add", "."], vec!["commit", "--quiet", "-m", "second"]] {
@@ -2912,6 +2995,16 @@ mod tests {
 
         let (_, second_revision) = resolve_git(&url, "HEAD", false).unwrap();
         assert_ne!(first_revision, second_revision);
+        let status = Command::new("git")
+            .args(["branch", "--force", "channel", "HEAD"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (_, branch_second) = resolve_git(&url, "channel", false).unwrap();
+        let (_, stable_tag_revision) = resolve_git(&url, "v1", false).unwrap();
+        assert_eq!(branch_second, second_revision);
+        assert_eq!(stable_tag_revision, first_revision);
         let (_, offline_revision) = resolve_git(&url, &second_revision, true).unwrap();
         assert_eq!(second_revision, offline_revision);
         fs::remove_dir_all(cache).ok();

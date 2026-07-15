@@ -88,6 +88,7 @@ pub fn response(request: &Value) -> Value {
 fn handshake() -> Value {
     json!({
         "yanxu_version": env!("CARGO_PKG_VERSION"),
+        "build": crate::build_info::identity(),
         "manifest_formats": package::SUPPORTED_MANIFEST_FORMATS,
         "lock_formats": package::SUPPORTED_LOCK_FORMATS,
         "bytecode_formats": [crate::bytecode::BYTECODE_FORMAT_VERSION],

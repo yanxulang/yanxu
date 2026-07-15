@@ -3,11 +3,15 @@
 //! VM 只消费字节码和原型，不调用树解释器。词法环境、闭包、对象与模块
 //! 都有独立的运行时表示。
 
+mod native;
+
 use crate::ast::Visibility;
 use crate::bytecode::{
     Chunk, ClassPrototype, Constant, FieldPrototype, FunctionPrototype, Instruction,
 };
 use crate::source::Span;
+pub use native::VmNative;
+use native::{NativeKind, StandardNative};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -343,38 +347,6 @@ pub enum VmIterator {
     },
 }
 
-#[derive(Clone, Copy)]
-enum NativeKind {
-    Clock,
-    Length,
-    Type,
-    Append,
-    Pop,
-    HasKey,
-    Insert,
-    Remove,
-    Keys,
-    Values,
-    Iterator,
-    Next,
-    Range,
-    SteppedRange,
-    Map,
-    Filter,
-    Fold,
-    Sort,
-    Reverse,
-    Contains,
-    Find,
-    Abs,
-    Sqrt,
-    Pow,
-    CancelTask,
-    TaskStatus,
-    JoinTasks,
-    Standard(StandardNative),
-}
-
 pub struct VmTask {
     state: VmTaskState,
 }
@@ -402,145 +374,6 @@ impl VmTask {
             VmTaskState::Cancelled => "取消",
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum StandardNative {
-    Floor,
-    Ceil,
-    Round,
-    Sin,
-    Cos,
-    Min,
-    Max,
-    Trim,
-    Split,
-    Replace,
-    StartsWith,
-    EndsWith,
-    Uppercase,
-    Lowercase,
-    Characters,
-    Join,
-    BytesFromText,
-    BytesToText,
-    BytesLength,
-    BytesSlice,
-    BytesConcat,
-    BytesFind,
-    BytesFromNumbers,
-    BytesToNumbers,
-    Millis,
-    Sleep,
-    ReadFile,
-    ReadBytes,
-    WriteFile,
-    WriteBytes,
-    AppendFile,
-    AppendBytes,
-    FileStatus,
-    PathExists,
-    ReadDirectory,
-    CreateDirectory,
-    RemovePath,
-    JsonParse,
-    JsonStringify,
-    HttpGet,
-    HttpPost,
-    HttpRequest,
-    HttpBytesRequest,
-    SocketTcpConnect,
-    SocketTcpListen,
-    SocketAccept,
-    SocketSend,
-    SocketReceive,
-    SocketSendBytes,
-    SocketReceiveBytes,
-    SocketReadExact,
-    SocketUdpBind,
-    SocketUdpSendTo,
-    SocketUdpReceiveFrom,
-    SocketUdpSendBytesTo,
-    SocketUdpReceiveBytesFrom,
-    SocketLocalAddress,
-    SocketPeerAddress,
-    SocketClose,
-    SocketShutdownWrite,
-    SocketSetNodelay,
-    Assert,
-    AssertEqual,
-    AssertNotNil,
-    PathJoin,
-    PathParent,
-    PathFileName,
-    PathExtension,
-    PathIsAbsolute,
-    PathNormalize,
-    EnvRead,
-    EnvExists,
-    CurrentDir,
-    Os,
-    Arch,
-    Arguments,
-    ProcessRun,
-    ResourceReadBytes,
-    ResourceReadText,
-    ResourceList,
-    Sha256,
-    HmacSha256,
-    ConstantTimeEqual,
-    HexEncode,
-    HexDecode,
-    PercentEncode,
-    PercentDecode,
-    StatsSum,
-    StatsMean,
-    StatsMedian,
-    StatsVariance,
-    StatsStddev,
-    CsvParse,
-    CsvStringify,
-    RandomUnit,
-    RandomInteger,
-    RandomBool,
-    SecureRandomBytes,
-    StableUuid,
-    IsUuid,
-    StableShortId,
-    TemplateInterpolate,
-    HtmlEscape,
-    HtmlUnescape,
-    IsEmail,
-    IsIpv4,
-    IsHexColor,
-    IsIdentifier,
-    Base64Encode,
-    Base64Decode,
-    Base64UrlEncode,
-    Base64UrlDecode,
-    RegexIsMatch,
-    RegexFirst,
-    RegexReplaceAll,
-    RegexSplit,
-    UrlIsValid,
-    UrlScheme,
-    UrlHost,
-    UrlPort,
-    UrlPath,
-    UrlQueryValue,
-    UrlJoin,
-    DateIsValid,
-    DateIsLeapYear,
-    DateAddDays,
-    DateDaysBetween,
-    HttpDate,
-    ParseHttpDate,
-}
-
-pub struct VmNative {
-    name: &'static str,
-    arity: usize,
-    kind: NativeKind,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -763,7 +596,7 @@ impl Vm {
         &mut self,
         archive: &crate::application::ApplicationArchive,
     ) -> Result<VmValue, VmError> {
-        crate::application::serialize(archive)
+        crate::application::validate_archive(archive)
             .map_err(|runtime_error| error(&Span::synthetic(), runtime_error.to_string()))?;
         let entry = archive
             .modules
@@ -772,10 +605,9 @@ impl Vm {
         let resources = crate::application::decode_resources(archive)
             .map_err(|runtime_error| error(&Span::synthetic(), runtime_error.to_string()))?;
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let previous_permissions = std::mem::replace(
-            &mut self.permissions,
-            archive.permissions.to_permissions(&directory),
-        );
+        let application_permissions = archive.permissions.to_permissions(&directory);
+        let effective_permissions = self.permissions.intersect(&application_permissions);
+        let previous_permissions = std::mem::replace(&mut self.permissions, effective_permissions);
         let previous_modules = std::mem::replace(
             &mut self.application_modules,
             archive
