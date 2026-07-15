@@ -29,13 +29,13 @@
 macOS / Linux：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/YanXuLang/yanxu/main/scripts/install.sh | sh
+curl -fsSL https://get.yanxu.dev | sh
 ```
 
 Windows PowerShell：
 
 ```powershell
-irm https://raw.githubusercontent.com/YanXuLang/yanxu/main/scripts/install.ps1 | iex
+irm https://get.yanxu.dev/windows | iex
 ```
 
 也可从[发行页](https://github.com/YanXuLang/yanxu/releases)下载 Windows、macOS 与 Linux 的 x86-64 / ARM64 构建。
