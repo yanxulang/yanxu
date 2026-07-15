@@ -1,6 +1,20 @@
 ﻿# Keep the UTF-8 BOM: Windows PowerShell 5.1 otherwise reads this file using the legacy system code page.
 $ErrorActionPreference = "Stop"
 
+function Get-Sha256([string]$Path) {
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace("-", "").ToLowerInvariant()
+        } finally {
+            $Hasher.Dispose()
+        }
+    } finally {
+        $Stream.Dispose()
+    }
+}
+
 $Repository = if ($env:YANXU_REPOSITORY) { $env:YANXU_REPOSITORY } else { "YanXuLang/yanxu" }
 $Version = if ($env:YANXU_VERSION) { $env:YANXU_VERSION } else { "latest" }
 $InstallDir = if ($env:YANXU_INSTALL_DIR) { $env:YANXU_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\Yanxu\bin" }
@@ -68,7 +82,7 @@ try {
     $Expected = ((Get-Content $ChecksumPath -Raw).Trim() -split "\s+")[0]
     if ($Expected -notmatch "^[0-9A-Fa-f]{64}$") { throw "SHA-256 校验文件格式无效" }
     $Expected = $Expected.ToLowerInvariant()
-    $Actual = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
+    $Actual = Get-Sha256 $ArchivePath
     if ($Expected -ne $Actual) { throw "SHA-256 校验不一致" }
 
     $Expanded = Join-Path $TempDir "expanded"
