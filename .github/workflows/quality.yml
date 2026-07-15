@@ -45,7 +45,11 @@ jobs:
       - name: 原生 ABI 异常释放与真实动态库
         run: |
           cargo test -p yanxu --locked --lib native_abi::tests::
+          cargo test -p yanxu --locked --lib native_abi_v2::tests::
           cargo test -p yanxu --locked --test native_extension -- --test-threads=1
+          cargo test -p yanxu --locked --test native_extension_v2 -- --test-threads=1
+      - name: Bundle 摘要、越界路径与源码删除回归
+        run: "cargo test -p yanxu --locked --lib gui_bundle::tests::"
       - name: 包管理并发、离线与归档安全
         run: cargo test -p yanxu-package --locked
 
@@ -112,7 +116,7 @@ jobs:
           set -euo pipefail
           target/debug/yanxu 标准库 --json > "$RUNNER_TEMP/stdlib.json"
           jq -e '.schema_version == 1 and (.modules | length) == 25' "$RUNNER_TEMP/stdlib.json" >/dev/null
-          cmp stdlib/api-v1.json stdlib/snapshots/1.1.6-api-v1.json
+          cmp stdlib/api-v1.json stdlib/snapshots/1.1.7-api-v1.json
       - name: 校验版本与工程能力握手
         shell: bash
         run: |
@@ -121,10 +125,10 @@ jobs:
           package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu-package") | .version')"
           expected_sha="$(git rev-parse HEAD)"
           target/debug/yanxu version --json > "$RUNNER_TEMP/version.json"
-          jq -e --arg version "$version" --arg sha "$expected_sha" '.schema_version == 2 and .version == $version and .commit_sha == $sha and (.build_target | length) > 0 and (.build_mode == "debug") and (.manifest_formats | index(2)) and (.lock_formats | index(2)) and (.yxb_formats | index(1)) and (.native_abi | index(1))' "$RUNNER_TEMP/version.json" >/dev/null
+          jq -e --arg version "$version" --arg sha "$expected_sha" '.schema_version == 2 and .version == $version and .commit_sha == $sha and (.build_target | length) > 0 and (.build_mode == "debug") and (.manifest_formats | index(2)) and (.lock_formats | index(2)) and (.yxb_formats | index(1)) and (.native_abi | index(1)) and (.native_abi | index(2))' "$RUNNER_TEMP/version.json" >/dev/null
           test "$version" = "$package_version"
           target/debug/yanxu package protocol '{"protocol_version":1,"operation":"handshake"}' > "$RUNNER_TEMP/engineering.json"
-          jq -e --arg version "$version" --arg sha "$expected_sha" '.ok and .result.yanxu_version == $version and .result.build.commit_sha == $sha and (.result.operations | index("vendor"))' "$RUNNER_TEMP/engineering.json" >/dev/null
+          jq -e --arg version "$version" --arg sha "$expected_sha" '.ok and .result.yanxu_version == $version and .result.build.commit_sha == $sha and (.result.operations | index("vendor")) and (.result.operations | index("bundle")) and (.result.native_abi | index(2))' "$RUNNER_TEMP/engineering.json" >/dev/null
           jq -n --arg sha "$expected_sha" --arg version "$version" --slurpfile version_info "$RUNNER_TEMP/version.json" --slurpfile compatibility "$RUNNER_TEMP/compatibility.json" --slurpfile stdlib "$RUNNER_TEMP/stdlib.json" '{schema_version:1, accepted:true, commit_sha:$sha, version:$version, version_info:$version_info[0], compatibility:$compatibility[0], stdlib:$stdlib[0]}' > "$RUNNER_TEMP/acceptance.json"
       - name: 编译模糊测试目标
         run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked

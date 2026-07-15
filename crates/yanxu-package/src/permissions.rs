@@ -9,6 +9,24 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+/// Stable capability names exposed by version and engineering handshakes.
+pub const PERMISSION_CAPABILITIES: &[&str] = &[
+    "文件",
+    "网络",
+    "TCP监听",
+    "UDP绑定",
+    "环境",
+    "进程",
+    "原生扩展",
+    "图形界面",
+    "剪贴板",
+    "文件对话框",
+    "系统通知",
+    "托盘",
+    "打开外部地址",
+    "全局快捷键",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionSet {
     allow_all: bool,
@@ -19,6 +37,13 @@ pub struct PermissionSet {
     environment_variables: BTreeSet<String>,
     process: bool,
     native_extensions: bool,
+    graphical_interface: bool,
+    clipboard: bool,
+    file_dialog: bool,
+    system_notifications: bool,
+    tray: bool,
+    open_external_url: bool,
+    global_shortcuts: bool,
 }
 
 impl PermissionSet {
@@ -32,6 +57,13 @@ impl PermissionSet {
             environment_variables: BTreeSet::new(),
             process: true,
             native_extensions: true,
+            graphical_interface: true,
+            clipboard: true,
+            file_dialog: true,
+            system_notifications: true,
+            tray: true,
+            open_external_url: true,
+            global_shortcuts: true,
         }
     }
 
@@ -45,6 +77,13 @@ impl PermissionSet {
             environment_variables: BTreeSet::new(),
             process: false,
             native_extensions: false,
+            graphical_interface: false,
+            clipboard: false,
+            file_dialog: false,
+            system_notifications: false,
+            tray: false,
+            open_external_url: false,
+            global_shortcuts: false,
         }
     }
 
@@ -84,6 +123,41 @@ impl PermissionSet {
 
     pub fn allow_native_extensions(mut self) -> Self {
         self.native_extensions = true;
+        self
+    }
+
+    pub fn allow_graphical_interface(mut self) -> Self {
+        self.graphical_interface = true;
+        self
+    }
+
+    pub fn allow_clipboard(mut self) -> Self {
+        self.clipboard = true;
+        self
+    }
+
+    pub fn allow_file_dialog(mut self) -> Self {
+        self.file_dialog = true;
+        self
+    }
+
+    pub fn allow_system_notifications(mut self) -> Self {
+        self.system_notifications = true;
+        self
+    }
+
+    pub fn allow_tray(mut self) -> Self {
+        self.tray = true;
+        self
+    }
+
+    pub fn allow_open_external_url(mut self) -> Self {
+        self.open_external_url = true;
+        self
+    }
+
+    pub fn allow_global_shortcuts(mut self) -> Self {
+        self.global_shortcuts = true;
         self
     }
 
@@ -134,6 +208,13 @@ impl PermissionSet {
             ),
             process: self.process && requested.process,
             native_extensions: self.native_extensions && requested.native_extensions,
+            graphical_interface: self.graphical_interface && requested.graphical_interface,
+            clipboard: self.clipboard && requested.clipboard,
+            file_dialog: self.file_dialog && requested.file_dialog,
+            system_notifications: self.system_notifications && requested.system_notifications,
+            tray: self.tray && requested.tray,
+            open_external_url: self.open_external_url && requested.open_external_url,
+            global_shortcuts: self.global_shortcuts && requested.global_shortcuts,
         }
     }
 
@@ -298,6 +379,51 @@ impl PermissionSet {
         }
     }
 
+    pub fn check_graphical_interface(&self) -> Result<(), PermissionError> {
+        self.check_boolean_capability(self.graphical_interface, "图形界面", "创建桌面界面")
+    }
+
+    pub fn check_clipboard(&self) -> Result<(), PermissionError> {
+        self.check_boolean_capability(self.clipboard, "剪贴板", "系统剪贴板")
+    }
+
+    pub fn check_file_dialog(&self) -> Result<(), PermissionError> {
+        self.check_boolean_capability(self.file_dialog, "文件对话框", "用户选择文件或目录")
+    }
+
+    pub fn check_system_notifications(&self) -> Result<(), PermissionError> {
+        self.check_boolean_capability(self.system_notifications, "系统通知", "发送系统通知")
+    }
+
+    pub fn check_tray(&self) -> Result<(), PermissionError> {
+        self.check_boolean_capability(self.tray, "托盘", "系统托盘")
+    }
+
+    pub fn check_open_external_url(&self) -> Result<(), PermissionError> {
+        self.check_boolean_capability(
+            self.open_external_url,
+            "打开外部地址",
+            "交给外部应用打开地址",
+        )
+    }
+
+    pub fn check_global_shortcuts(&self) -> Result<(), PermissionError> {
+        self.check_boolean_capability(self.global_shortcuts, "全局快捷键", "注册系统级快捷键")
+    }
+
+    fn check_boolean_capability(
+        &self,
+        granted: bool,
+        capability: &str,
+        resource: &str,
+    ) -> Result<(), PermissionError> {
+        if self.allow_all || granted {
+            Ok(())
+        } else {
+            Err(PermissionError::new(capability, resource))
+        }
+    }
+
     pub fn is_unrestricted(&self) -> bool {
         self.allow_all
     }
@@ -328,6 +454,34 @@ impl PermissionSet {
 
     pub fn native_extensions_allowed(&self) -> bool {
         self.allow_all || self.native_extensions
+    }
+
+    pub fn graphical_interface_allowed(&self) -> bool {
+        self.allow_all || self.graphical_interface
+    }
+
+    pub fn clipboard_allowed(&self) -> bool {
+        self.allow_all || self.clipboard
+    }
+
+    pub fn file_dialog_allowed(&self) -> bool {
+        self.allow_all || self.file_dialog
+    }
+
+    pub fn system_notifications_allowed(&self) -> bool {
+        self.allow_all || self.system_notifications
+    }
+
+    pub fn tray_allowed(&self) -> bool {
+        self.allow_all || self.tray
+    }
+
+    pub fn open_external_url_allowed(&self) -> bool {
+        self.allow_all || self.open_external_url
+    }
+
+    pub fn global_shortcuts_allowed(&self) -> bool {
+        self.allow_all || self.global_shortcuts
     }
 }
 
@@ -631,5 +785,36 @@ mod tests {
                 .check_tcp_listen("127.0.0.1:0")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn gui_capabilities_are_independent_and_intersect_with_host_limits() {
+        let requested = PermissionSet::sandboxed()
+            .allow_graphical_interface()
+            .allow_clipboard()
+            .allow_file_dialog()
+            .allow_system_notifications()
+            .allow_tray()
+            .allow_open_external_url()
+            .allow_global_shortcuts();
+        assert!(requested.check_graphical_interface().is_ok());
+        assert!(requested.check_clipboard().is_ok());
+        assert!(requested.check_file_dialog().is_ok());
+        assert!(requested.check_system_notifications().is_ok());
+        assert!(requested.check_tray().is_ok());
+        assert!(requested.check_open_external_url().is_ok());
+        assert!(requested.check_global_shortcuts().is_ok());
+        assert!(requested.check_file("unrelated").is_err());
+        assert!(requested.check_network("https://example.com").is_err());
+        assert!(requested.check_native_extension("extension.so").is_err());
+
+        let host = PermissionSet::sandboxed()
+            .allow_graphical_interface()
+            .allow_file_dialog();
+        let effective = host.intersect(&requested);
+        assert!(effective.check_graphical_interface().is_ok());
+        assert!(effective.check_file_dialog().is_ok());
+        assert!(effective.check_clipboard().is_err());
+        assert!(effective.check_system_notifications().is_err());
     }
 }

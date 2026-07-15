@@ -1,6 +1,7 @@
 //! 从公开声明生成稳定 Markdown API 文档。
 
 use crate::ast::{Parameter, Stmt, StmtKind, TypeKind, TypeRef, Visibility};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,155 @@ pub fn markdown(module_name: &str, statements: &[Stmt]) -> String {
     }
     render_builtin_types(&mut output);
     output
+}
+
+/// Stable machine-readable API surface used by package tooling and LSP clients.
+pub fn api_manifest(module_name: &str, statements: &[Stmt]) -> Value {
+    let declarations = statements
+        .iter()
+        .filter(|statement| statement.public)
+        .filter_map(api_declaration)
+        .collect::<Vec<_>>();
+    json!({
+        "format_version": 1,
+        "language": "yanxu",
+        "module": module_name,
+        "declarations": declarations,
+    })
+}
+
+fn api_declaration(statement: &Stmt) -> Option<Value> {
+    let documentation = comment_before(&statement.span).unwrap_or_default();
+    match &statement.kind {
+        StmtKind::Let {
+            name,
+            type_ref,
+            mutable,
+            ..
+        } => Some(json!({
+            "kind": if *mutable { "variable" } else { "constant" },
+            "name": name,
+            "type": api_optional_type(type_ref.as_ref()),
+            "documentation": documentation,
+        })),
+        StmtKind::Function {
+            name,
+            params,
+            return_type,
+            is_async,
+            ..
+        } => Some(api_function(
+            "function",
+            name,
+            params,
+            return_type.as_ref(),
+            *is_async,
+            false,
+            documentation,
+        )),
+        StmtKind::Class {
+            name,
+            superclass,
+            protocols,
+            fields,
+            methods,
+        } => Some(json!({
+            "kind": "class",
+            "name": name,
+            "superclass": superclass,
+            "protocols": protocols,
+            "documentation": documentation,
+            "fields": fields.iter()
+                .filter(|field| field.visibility == Visibility::Public)
+                .map(|field| json!({
+                    "name": field.name,
+                    "type": field.type_ref.name,
+                    "readonly": field.readonly,
+                    "static": field.is_static,
+                    "documentation": comment_before(&field.span).unwrap_or_default(),
+                }))
+                .collect::<Vec<_>>(),
+            "methods": methods.iter()
+                .filter(|method| method.member_visibility == Visibility::Public)
+                .filter_map(|method| match &method.kind {
+                    StmtKind::Function { name, params, return_type, is_async, .. } => Some(api_function(
+                        "method", name, params, return_type.as_ref(), *is_async, method.is_static,
+                        comment_before(&method.span).unwrap_or_default(),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        })),
+        StmtKind::Protocol {
+            name,
+            fields,
+            methods,
+        } => Some(json!({
+            "kind": "protocol",
+            "name": name,
+            "documentation": documentation,
+            "fields": fields.iter().map(|field| json!({
+                "name": field.name,
+                "type": field.type_ref.name,
+            })).collect::<Vec<_>>(),
+            "methods": methods.iter().filter_map(|method| match &method.kind {
+                StmtKind::Function { name, params, return_type, is_async, .. } => Some(api_function(
+                    "method", name, params, return_type.as_ref(), *is_async, method.is_static,
+                    comment_before(&method.span).unwrap_or_default(),
+                )),
+                _ => None,
+            }).collect::<Vec<_>>(),
+        })),
+        _ => None,
+    }
+}
+
+fn api_function(
+    kind: &str,
+    name: &str,
+    parameters: &[Parameter],
+    result: Option<&TypeRef>,
+    is_async: bool,
+    is_static: bool,
+    documentation: String,
+) -> Value {
+    let parameters = parameters
+        .iter()
+        .map(|parameter| {
+            json!({
+                "name": parameter.name,
+                "type": api_optional_type(parameter.type_ref.as_ref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let result = api_optional_type(result);
+    let signature = format!(
+        "法（{}）：{}",
+        parameters
+            .iter()
+            .map(|parameter| parameter["type"].as_str().unwrap_or("任意"))
+            .collect::<Vec<_>>()
+            .join("，"),
+        if is_async {
+            format!("任务<{result}>")
+        } else {
+            result.clone()
+        }
+    );
+    json!({
+        "kind": kind,
+        "name": name,
+        "parameters": parameters,
+        "result": result,
+        "async": is_async,
+        "static": is_static,
+        "signature": signature,
+        "documentation": documentation,
+    })
+}
+
+fn api_optional_type(type_ref: Option<&TypeRef>) -> String {
+    type_ref.map_or_else(|| "任意".into(), |type_ref| type_ref.name.clone())
 }
 
 pub fn markdown_directory(path: impl AsRef<Path>) -> Result<String, String> {

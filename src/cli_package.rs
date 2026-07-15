@@ -94,11 +94,15 @@ pub(crate) fn package_protocol_command(arguments: &[String]) -> ExitCode {
 
 pub(crate) fn compile_command(arguments: &[String]) -> ExitCode {
     let Some(input) = arguments.first() else {
-        return fail("用法：yanxu compile <文卷或包目录> [-o 输出] [--release] [--standalone]");
+        return fail(
+            "用法：yanxu compile <文卷或包目录> [-o 输出] [--release] [--standalone|--bundle] [--runtime 路径]",
+        );
     };
     let mut output = None;
     let mut profile = "debug";
     let mut standalone = false;
+    let mut bundle = false;
+    let mut runtime = None;
     let mut index = 1;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -111,21 +115,66 @@ pub(crate) fn compile_command(arguments: &[String]) -> ExitCode {
             }
             "--release" | "--发布" => profile = "release",
             "--standalone" | "--独立" => standalone = true,
+            "--bundle" | "--应用包" => bundle = true,
+            "--runtime" | "--运行时" => {
+                index += 1;
+                let Some(path) = arguments.get(index) else {
+                    return fail("--runtime 后须给出目标平台言序运行时路径");
+                };
+                runtime = Some(PathBuf::from(path));
+            }
             option => return fail(format!("不识构建选项“{option}”")),
         }
         index += 1;
+    }
+    if standalone && bundle {
+        return fail("--standalone 与 --bundle 不能同时使用");
+    }
+    if runtime.is_some() && !bundle {
+        return fail("--runtime 只可与 --bundle 一同使用");
     }
     let archive = match yanxu::application::compile_application(input, profile) {
         Ok(archive) => archive,
         Err(error) => return fail(error.to_string()),
     };
-    let output = output.unwrap_or_else(|| default_application_output(input, standalone));
+    let output = match output {
+        Some(output) => output,
+        None if bundle => match yanxu::gui_bundle::default_output(&archive) {
+            Ok(output) => output,
+            Err(error) => return fail(error.to_string()),
+        },
+        None => default_application_output(input, standalone),
+    };
+    if bundle
+        && output.exists()
+        && yanxu::gui_bundle::verify_bundle(&output)
+            .is_ok_and(|manifest| manifest.yxb_checksum == archive.content_checksum)
+    {
+        println!("构建缓存命中：{}", output.display());
+        return ExitCode::SUCCESS;
+    }
     if !standalone
+        && !bundle
         && yanxu::application::read_archive(&output)
             .is_ok_and(|existing| existing.content_checksum == archive.content_checksum)
     {
         println!("构建缓存命中：{}", output.display());
         return ExitCode::SUCCESS;
+    }
+    if bundle {
+        let runtime = match runtime.map(Ok).unwrap_or_else(env::current_exe) {
+            Ok(runtime) => runtime,
+            Err(error) => return fail(format!("不能定位言序运行时：{error}")),
+        };
+        return match yanxu::gui_bundle::build_bundle(runtime, &archive, &output) {
+            Ok(report) => {
+                println!("已生成应用 Bundle：{}", report.output.display());
+                println!("Bundle 清单：{}", report.manifest.display());
+                println!("清单 SHA-256：{}", report.manifest_sha256);
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(error.to_string()),
+        };
     }
     let result = if standalone {
         env::current_exe()

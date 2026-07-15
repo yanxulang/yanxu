@@ -1920,6 +1920,45 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 TypeSet::named("列"),
             );
         }
+        "原生" => {
+            insert_std_function(
+                &mut shape,
+                "加载",
+                vec![TypeSet::named("文")],
+                TypeSet::named("原生模块"),
+            );
+            insert_std_function(
+                &mut shape,
+                "调用",
+                vec![
+                    TypeSet::named("原生模块"),
+                    TypeSet::named("文"),
+                    TypeSet::named("列"),
+                ],
+                TypeSet::any(),
+            );
+            insert_std_function(
+                &mut shape,
+                "关闭资源",
+                vec![TypeSet::named("原生资源")],
+                TypeSet::named("空"),
+            );
+            insert_std_function(
+                &mut shape,
+                "资源类型",
+                vec![TypeSet::named("原生资源")],
+                TypeSet::named("文"),
+            );
+            insert_std_function(
+                &mut shape,
+                "泄漏统计",
+                vec![],
+                TypeSet::single(StaticType::Map(
+                    Box::new(TypeSet::named("文")),
+                    Box::new(TypeSet::named("数")),
+                )),
+            );
+        }
         "哈希" => {
             insert_std_function(
                 &mut shape,

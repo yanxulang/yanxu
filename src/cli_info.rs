@@ -18,8 +18,12 @@ pub(crate) fn version_json() -> ExitCode {
         "lock_formats": yanxu::package::SUPPORTED_LOCK_FORMATS,
         "bytecode_formats": [yanxu::bytecode::BYTECODE_FORMAT_VERSION],
         "yxb_formats": [yanxu::application::YXB_FORMAT_VERSION],
-        "native_abi": [yanxu::native_abi::NATIVE_ABI_VERSION],
-        "native_capabilities": yanxu::native_abi::capabilities(),
+        "native_abi": [yanxu::native_abi::NATIVE_ABI_VERSION, yanxu::native_abi_v2::NATIVE_ABI_VERSION_V2],
+        "native_capabilities": {
+            "v1": yanxu::native_abi::capabilities(),
+            "v2": yanxu::native_abi_v2::capabilities(),
+        },
+        "permission_capabilities": yanxu::package::PERMISSION_CAPABILITIES,
         "target": yanxu::package::current_target(),
     });
     match serde_json::to_string_pretty(&document) {
@@ -65,7 +69,11 @@ pub(crate) fn standard_library(json: bool) -> ExitCode {
 }
 
 pub(crate) fn native_abi() -> ExitCode {
-    match serde_json::to_string_pretty(&yanxu::native_abi::capabilities()) {
+    let capabilities = serde_json::json!({
+        "v1": yanxu::native_abi::capabilities(),
+        "v2": yanxu::native_abi_v2::capabilities(),
+    });
+    match serde_json::to_string_pretty(&capabilities) {
         Ok(document) => {
             println!("{document}");
             ExitCode::SUCCESS

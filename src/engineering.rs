@@ -3,7 +3,10 @@
 //! 工具可以负责命令体验与流程编排，但清单、锁文件、依赖图和构建语义
 //! 必须通过这里进入言序核心，避免形成第二套包语义。
 
-use crate::package::{self, Dependency, Manifest, ResolutionGraph};
+use crate::package::{
+    self, ApplicationConfigEdit, ApplicationKind, Dependency, Manifest, ResolutionGraph,
+    WindowConfig,
+};
 use semver::VersionReq;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -43,10 +46,19 @@ pub fn handle(request: &Value) -> Result<Value, EngineeringError> {
         "handshake" => Ok(handshake()),
         "template" => {
             let name = required_string(request, "name")?;
-            let manifest = package::manifest_template(name).map_err(engineering_error)?;
+            let graphical = optional_bool(request, "gui").unwrap_or(false);
+            let manifest = if graphical {
+                package::gui_manifest_template(
+                    name,
+                    optional_string(request, "gui_dependency_path").map(std::path::Path::new),
+                )
+            } else {
+                package::manifest_template(name)
+            }
+            .map_err(engineering_error)?;
             Ok(json!({
                 "manifest": manifest,
-                "entry": "言 「你好，言序！」；\n",
+                "entry": if graphical { gui_entry_template(name) } else { "言 「你好，言序！」；\n".into() },
                 "gitignore": ".yanxu/\nbuild/\n",
             }))
         }
@@ -55,12 +67,14 @@ pub fn handle(request: &Value) -> Result<Value, EngineeringError> {
             Ok(manifest_json(&manifest))
         }
         "edit" => edit_dependency(request),
+        "edit_application" => edit_application(request),
         "resolve" | "graph" => resolve_graph(request),
         "plan_update" | "outdated" => plan_update(request),
         "why" => why(request),
         "doctor" => doctor(request),
         "workspace" => workspace(request),
         "pack" => pack(request),
+        "bundle" => bundle(request),
         "vendor" => vendor(request),
         "audit" => audit(request),
         other => Err(engineering_error(format!("不识操作“{other}”"))),
@@ -93,10 +107,14 @@ fn handshake() -> Value {
         "lock_formats": package::SUPPORTED_LOCK_FORMATS,
         "bytecode_formats": [crate::bytecode::BYTECODE_FORMAT_VERSION],
         "yxb_formats": [crate::application::YXB_FORMAT_VERSION],
-        "native_abi": [1],
-        "native_capabilities": crate::native_abi::capabilities(),
+        "native_abi": [1, 2],
+        "native_capabilities": {
+            "v1": crate::native_abi::capabilities(),
+            "v2": crate::native_abi_v2::capabilities(),
+        },
+        "permission_capabilities": package::PERMISSION_CAPABILITIES,
         "target": package::current_target(),
-        "operations": ["handshake", "template", "inspect", "edit", "resolve", "graph", "plan_update", "outdated", "why", "doctor", "workspace", "pack", "vendor", "audit"],
+        "operations": ["handshake", "template", "inspect", "edit", "edit_application", "resolve", "graph", "plan_update", "outdated", "why", "doctor", "workspace", "pack", "bundle", "vendor", "audit"],
     })
 }
 
@@ -119,6 +137,70 @@ fn edit_dependency(request: &Value) -> Result<Value, EngineeringError> {
         )
     }
     .map_err(package_error)?;
+    Ok(manifest_json(&updated))
+}
+
+fn edit_application(request: &Value) -> Result<Value, EngineeringError> {
+    let manifest = discover_manifest(optional_string(request, "path").unwrap_or("."))?;
+    if optional_bool(request, "remove").unwrap_or(false) {
+        let updated = package::edit_application(&manifest.path, None).map_err(package_error)?;
+        return Ok(manifest_json(&updated));
+    }
+    let current = manifest.application.as_ref();
+    let kind = match optional_string(request, "type")
+        .unwrap_or_else(|| current.map_or("命令行", |application| application.kind.as_str()))
+    {
+        "图形" | "gui" | "graphical" => ApplicationKind::Graphical,
+        "命令行" | "cli" | "console" => ApplicationKind::CommandLine,
+        other => return Err(engineering_error(format!("不支持应用类型“{other}”"))),
+    };
+    let name = optional_string(request, "name")
+        .map(str::to_owned)
+        .or_else(|| current.map(|application| application.name.clone()))
+        .unwrap_or_else(|| manifest.name.clone());
+    let identifier = optional_string(request, "identifier")
+        .map(str::to_owned)
+        .or_else(|| current.map(|application| application.identifier.clone()))
+        .ok_or_else(|| engineering_error("新增应用配置须给出 identifier"))?;
+    let version = optional_string(request, "version")
+        .map(str::to_owned)
+        .or_else(|| current.map(|application| application.version.to_string()))
+        .unwrap_or_else(|| manifest.version.to_string());
+    let existing_window = current
+        .map(|application| application.window.clone())
+        .unwrap_or_default();
+    let window = WindowConfig {
+        width: optional_u32(request, "width")?.unwrap_or(existing_window.width),
+        height: optional_u32(request, "height")?.unwrap_or(existing_window.height),
+        minimum_width: optional_u32(request, "minimum_width")?
+            .unwrap_or(existing_window.minimum_width),
+        minimum_height: optional_u32(request, "minimum_height")?
+            .unwrap_or(existing_window.minimum_height),
+        maximum_width: optional_u32(request, "maximum_width")?.or(existing_window.maximum_width),
+        maximum_height: optional_u32(request, "maximum_height")?.or(existing_window.maximum_height),
+        resizable: optional_bool(request, "resizable").unwrap_or(existing_window.resizable),
+        high_dpi: optional_bool(request, "high_dpi").unwrap_or(existing_window.high_dpi),
+    };
+    let edit = ApplicationConfigEdit {
+        kind,
+        name,
+        identifier,
+        version,
+        icon: optional_string(request, "icon")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| current.and_then(|application| application.icon.clone())),
+        company: optional_string(request, "company")
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| current.and_then(|application| application.company.clone())),
+        minimum_system_version: optional_string(request, "minimum_system_version")
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| current.and_then(|application| application.minimum_system_version.clone())),
+        window,
+    };
+    let updated = package::edit_application(&manifest.path, Some(&edit)).map_err(package_error)?;
     Ok(manifest_json(&updated))
 }
 
@@ -255,6 +337,45 @@ fn pack(request: &Value) -> Result<Value, EngineeringError> {
         "bytes": artifact.bytes,
         "entries": artifact.entries,
     }))
+}
+
+fn bundle(request: &Value) -> Result<Value, EngineeringError> {
+    let manifest = discover_manifest(optional_string(request, "path").unwrap_or("."))?;
+    let profile = optional_string(request, "profile").unwrap_or("release");
+    if !matches!(profile, "debug" | "release") {
+        return Err(engineering_error("Bundle profile 只可为 debug 或 release"));
+    }
+    let archive = crate::application::compile_application(&manifest.root, profile)
+        .map_err(|error| engineering_error(error.to_string()))?;
+    let output = match optional_string(request, "output").filter(|path| !path.is_empty()) {
+        Some(output) => PathBuf::from(output),
+        None => manifest.root.join("build").join(
+            crate::gui_bundle::default_output(&archive)
+                .map_err(|error| engineering_error(error.to_string()))?,
+        ),
+    };
+    let runtime = match optional_string(request, "runtime").filter(|path| !path.is_empty()) {
+        Some(runtime) => PathBuf::from(runtime),
+        None => std::env::current_exe()
+            .map_err(|error| engineering_error(format!("不能定位言序运行时：{error}")))?,
+    };
+    let report = crate::gui_bundle::build_bundle(runtime, &archive, &output)
+        .map_err(|error| engineering_error(error.to_string()))?;
+    Ok(json!({
+        "path": report.output,
+        "manifest": report.manifest,
+        "manifest_sha256": report.manifest_sha256,
+        "files": report.files,
+        "yxb_checksum": archive.content_checksum,
+        "target": archive.target,
+        "profile": archive.profile,
+    }))
+}
+
+fn gui_entry_template(name: &str) -> String {
+    format!(
+        "引「包:言窗」为 界面；\n\n定 应用 为 界面.应用（{name:?}）；\n定 窗口 为 应用.窗口（{{「标题」：{name:?}，「宽」：800，「高」：600，「最小宽」：480，「最小高」：320}}）；\n定 布局 为 窗口.纵向布局（{{「间距」：12，「内边距」：16}}）；\n布局.文字（「你好，言序 GUI！」）；\n\n法 关闭处理（事件）则 应用.退出（）；终\n窗口.关闭时（关闭处理）；\n窗口.显示（）；\n应用.运行（）；\n"
+    )
 }
 
 fn vendor(request: &Value) -> Result<Value, EngineeringError> {
@@ -471,6 +592,25 @@ fn manifest_json(manifest: &Manifest) -> Value {
         "resources": manifest.resources,
         "workspace_members": manifest.workspace_members,
         "build": {"target": manifest.build.target},
+        "application": manifest.application.as_ref().map(|application| json!({
+            "type": application.kind.as_str(),
+            "name": application.name,
+            "identifier": application.identifier,
+            "version": application.version.to_string(),
+            "icon": application.icon,
+            "company": application.company,
+            "minimum_system_version": application.minimum_system_version,
+            "window": {
+                "width": application.window.width,
+                "height": application.window.height,
+                "minimum_width": application.window.minimum_width,
+                "minimum_height": application.window.minimum_height,
+                "maximum_width": application.window.maximum_width,
+                "maximum_height": application.window.maximum_height,
+                "resizable": application.window.resizable,
+                "high_dpi": application.window.high_dpi,
+            },
+        })),
         "permissions": {
             "files": manifest.permissions.file_roots(),
             "network": manifest.permissions.network_hosts().collect::<Vec<_>>(),
@@ -479,6 +619,13 @@ fn manifest_json(manifest: &Manifest) -> Value {
             "environment": manifest.permissions.environment_variables().collect::<Vec<_>>(),
             "process": manifest.permissions.process_allowed(),
             "native_extensions": manifest.permissions.native_extensions_allowed(),
+            "graphical_interface": manifest.permissions.graphical_interface_allowed(),
+            "clipboard": manifest.permissions.clipboard_allowed(),
+            "file_dialog": manifest.permissions.file_dialog_allowed(),
+            "system_notifications": manifest.permissions.system_notifications_allowed(),
+            "tray": manifest.permissions.tray_allowed(),
+            "open_external_url": manifest.permissions.open_external_url_allowed(),
+            "global_shortcuts": manifest.permissions.global_shortcuts_allowed(),
         },
         "native": manifest.native.as_ref().map(|native| json!({
             "abi": native.abi_version,
@@ -569,6 +716,17 @@ fn optional_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 fn optional_bool(value: &Value, key: &str) -> Option<bool> {
     value.get(key).and_then(Value::as_bool)
+}
+
+fn optional_u32(value: &Value, key: &str) -> Result<Option<u32>, EngineeringError> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .map(Some)
+        .ok_or_else(|| engineering_error(format!("字段“{key}”须为非负 32 位整数")))
 }
 
 fn package_error(error: package::ManifestError) -> EngineeringError {

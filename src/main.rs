@@ -18,6 +18,9 @@ use yanxu::{parse, parse_named, repl, run_file_with};
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if let Ok(executable) = env::current_exe() {
+        if let Err(error) = yanxu::gui_bundle::verify_executable_bundle(&executable) {
+            return fail(format!("Bundle 校验有误：{error}"));
+        }
         match yanxu::application::read_embedded(&executable) {
             Ok(Some(archive)) => return run_archive(&archive, &args),
             Ok(None) => {}
@@ -177,6 +180,14 @@ fn main() -> ExitCode {
             }
         }
         [command, path] if command == "调" || command == "debug" => debug_file(path),
+        [command, flag, path] if (command == "文" || command == "doc") && flag == "--json" => {
+            document_json(path, None)
+        }
+        [command, flag, path, output]
+            if (command == "文" || command == "doc") && flag == "--json" =>
+        {
+            document_json(path, Some(output))
+        }
         [command, path] if command == "文" || command == "doc" => document_file(path, None),
         [command, path, output] if command == "文" || command == "doc" => {
             document_file(path, Some(output))
@@ -516,6 +527,38 @@ fn document_file(path: &str, output: Option<&str>) -> ExitCode {
     }
 }
 
+fn document_json(path: &str, output: Option<&str>) -> ExitCode {
+    let input = Path::new(path);
+    if input.is_dir() {
+        return fail("yanxu 文 --json 当前要求单个模块文卷");
+    }
+    let (canonical, statements) = match source_file(path) {
+        Ok(result) => result,
+        Err(error) => return fail(error),
+    };
+    let name = canonical
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("无名模块");
+    let document =
+        match serde_json::to_string_pretty(&yanxu::docgen::api_manifest(name, &statements)) {
+            Ok(document) => document + "\n",
+            Err(error) => return fail(format!("不能生成 API JSON：{error}")),
+        };
+    if let Some(output) = output {
+        match fs::write(output, document) {
+            Ok(()) => {
+                println!("已生成：{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("不能写入“{output}”：{error}")),
+        }
+    } else {
+        print!("{document}");
+        ExitCode::SUCCESS
+    }
+}
+
 fn source_file(path: &str) -> Result<(PathBuf, Vec<yanxu::ast::Stmt>), String> {
     let path = Path::new(path);
     let canonical =
@@ -644,8 +687,8 @@ fn help() {
   yanxu [文卷.yx] [-- 参数...]  以树解释器执行（兼容模式，不限制宿主能力）
   yanxu 查 <文卷>        静态类型检查并报告弃用
   yanxu 字节 <文卷> [-- 参数...]  以字节码 VM 执行
-  yanxu 编 <文卷或包目录> [-o 输出] [--release] [--standalone]
-                         编译完整 YXB 应用或当前平台独立应用
+  yanxu 编 <文卷或包目录> [-o 输出] [--release] [--standalone|--bundle]
+                         编译完整 YXB、独立程序或当前平台桌面应用 Bundle
   yanxu 行 <应用.yxb、文卷或包目录> [-- 参数...]
                          以字节码 VM 运行预编译应用
   yanxu 格 [--写] <文卷>  格式化
@@ -653,13 +696,14 @@ fn help() {
                          运行 .yx 规格测试
   yanxu 兼容 [目录] [--json]  对照树解释器与 VM 的版本语料
   yanxu 迁 [--检查|--差异|--写] <文卷>  检查或应用弃用迁移
+  yanxu 版本 --json       显示版本、构建、格式、ABI 与权限能力
   yanxu 标准库 [--json]   显示版本化标准库 API 清单
-  yanxu 原生 --json       显示原生扩展 ABI v1 能力
+  yanxu 原生 --json       显示原生扩展 ABI v1/v2 能力
   yanxu 包 [路径]          显示包清单
   yanxu 包 运行 [路径] [-- 参数...]  按清单权限运行包入口
   yanxu 包 锁 [--离线] [路径]  生成或验证锁文件
   yanxu 包 协议 '<JSON>'   言包使用的版本化工程协议
-  yanxu 文 <文卷> [输出]  生成公开 API 文档
+  yanxu 文 [--json] <文卷> [输出]  生成公开 API 文档或机器清单
   yanxu 调 <文卷>          执行并输出踪迹
   yanxu 调试服务          启动 DAP 调试适配器
   yanxu 基准 [轮数]       比较树解释器与 VM

@@ -40,9 +40,11 @@ fn artifact(library: &PathBuf) -> NativeArtifact {
     );
     let checksum = format!("{:x}", Sha256::digest(std::fs::read(library).unwrap()));
     NativeArtifact {
+        abi: 1,
         target: yanxu::package::current_target(),
         path: library.to_string_lossy().into_owned(),
         checksum,
+        size: std::fs::metadata(library).unwrap().len(),
     }
 }
 
