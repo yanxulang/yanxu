@@ -1,6 +1,6 @@
 [package]
 name = "yanxu-package"
-version = "1.1.7"
+version = "1.1.8"
 edition = "2024"
 description = "言序清单、锁文件、权限与可复现依赖解析核心"
 license = "MIT"
