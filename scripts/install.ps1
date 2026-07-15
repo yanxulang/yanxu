@@ -25,10 +25,14 @@ try {
     throw "Yanxu installation failed: invalid installation directory: $($_.Exception.Message)"
 }
 
-$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$Architecture = if ($env:PROCESSOR_ARCHITEW6432) {
+    $env:PROCESSOR_ARCHITEW6432
+} else {
+    $env:PROCESSOR_ARCHITECTURE
+}
 switch ($Architecture) {
-    "X64" { $Target = "x86_64-pc-windows-msvc" }
-    "Arm64" { $Target = "aarch64-pc-windows-msvc" }
+    "AMD64" { $Target = "x86_64-pc-windows-msvc" }
+    "ARM64" { $Target = "aarch64-pc-windows-msvc" }
     default { throw "Yanxu installation failed: unsupported processor architecture $Architecture" }
 }
 
