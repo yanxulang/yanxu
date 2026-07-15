@@ -268,7 +268,8 @@ jobs:
           $env:YANXU_VERSION = $version
           $env:YANXU_ASSET_DIR = $assetDir
           $install = Start-WindowsPowerShell -ArgumentList @(
-            "-NoProfile", "-File", (Resolve-Path scripts/install.ps1)
+            "-NoProfile", "-Command",
+            'Get-Content -Raw scripts/install.ps1 | Invoke-Expression'
           )
           if ($install.ExitCode -ne 0) { throw "Windows PowerShell 5.1 安装失败" }
           $installed = Join-Path $env:YANXU_INSTALL_DIR "yanxu.exe"
