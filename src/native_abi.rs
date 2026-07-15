@@ -246,7 +246,10 @@ fn stage_verified_library(bytes: &[u8], checksum: &str) -> Result<StagedLibrary,
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn set_staged_read_only(path: &Path, directory: bool) -> Result<(), NativeError> {
+fn set_staged_read_only(
+    path: &Path,
+    #[cfg_attr(not(unix), allow(unused_variables))] directory: bool,
+) -> Result<(), NativeError> {
     let mut permissions = std::fs::metadata(path)
         .map_err(|error| native_error("NATIVE_IO", error.to_string()))?
         .permissions();
@@ -273,7 +276,12 @@ fn make_staged_tree_writable(path: &Path) {
         permissions.set_mode(if metadata.is_dir() { 0o700 } else { 0o600 });
     }
     #[cfg(not(unix))]
-    permissions.set_readonly(false);
+    {
+        // Windows 没有 PermissionsExt；清除只读属性是删除已卸载 DLL 暂存树的
+        // 唯一标准库接口，不会在 Unix 上扩大写权限。
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+    }
     let _ = std::fs::set_permissions(path, permissions);
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
