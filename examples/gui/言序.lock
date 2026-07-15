@@ -4,16 +4,16 @@ target = "aarch64-apple-darwin"
 generator = "1.1.7"
 
 [root_dependencies]
-"言窗" = "yanxu-gui@0.1.0#10ca5099c1ca-cee40b3aeb86c449"
+"言窗" = "yanxu-gui@0.1.0#10ca5099c1ca-0c539ecaa782f21a"
 
 [root_dev_dependencies]
 
 [[package]]
-id = "yanxu-gui@0.1.0#10ca5099c1ca-cee40b3aeb86c449"
+id = "yanxu-gui@0.1.0#10ca5099c1ca-0c539ecaa782f21a"
 name = "yanxu-gui"
 version = "0.1.0"
 source = "path:../../../yanxu-gui"
-checksum = "cee40b3aeb86c449115998e8d614eb8c86faf85d410184d84f8427f4dac2c4b7"
+checksum = "0c539ecaa782f21ae725526d8bca673354ac6c2dcb1dcaccfebd85d6538fcbee"
 entry = "src/主.yx"
 target = "aarch64-apple-darwin"
 minimum_yanxu = ">=1.1.7"
