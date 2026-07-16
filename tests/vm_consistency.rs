@@ -98,6 +98,18 @@ fn official_examples_type_check_and_match_both_runtimes() {
 }
 
 #[test]
+fn module_oop_example_type_checks_and_matches_both_runtimes() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/module_oop");
+    let main = directory.join("main.yx");
+    let source = fs::read_to_string(&main).unwrap();
+    let statements = yanxu::parse_named(&source, main.display().to_string()).unwrap();
+    yanxu::type_checker::check_in_directory(&statements, &directory).unwrap();
+    let (tree, vm) = execute_both(&source, &directory);
+    assert_eq!(tree, ["视图：确定（按钮）", "真", "真", "真", "视图"]);
+    assert_eq!(tree, vm);
+}
+
+#[test]
 fn standard_library_manifest_matches_types_and_both_runtimes() {
     let manifest = yanxu::stdlib::api_manifest().unwrap();
     for module in manifest["modules"].as_array().unwrap() {
