@@ -3,13 +3,21 @@
 //! 编译结果不保留 AST，也没有解释器回退。法、类、协和模块均降为独立原型；
 //! 控制流、异常处理和迭代使用可定位的跳转指令。
 
-use crate::ast::{Expr, ExprKind, FieldDecl, Literal, Parameter, Stmt, StmtKind, Visibility};
+use crate::ast::{
+    Expr, ExprKind, FieldDecl, Literal, Parameter, Stmt, StmtKind, TypeKind, TypePath, TypeRef,
+    Visibility,
+};
 use crate::source::Span;
 use crate::token::TokenKind;
+use crate::type_model::{
+    ModuleId, RuntimeType, RuntimeTypePath, TypeDeclarationKind, TypeId, TypeLink,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::rc::Rc;
 
-pub const BYTECODE_FORMAT_VERSION: u32 = 1;
+pub const BYTECODE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Constant {
@@ -22,17 +30,17 @@ pub enum Constant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParameterSpec {
     pub name: String,
-    pub type_name: Option<String>,
+    pub type_ref: Option<RuntimeType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionPrototype {
     pub name: String,
     pub parameters: Vec<ParameterSpec>,
-    pub return_type: Option<String>,
+    pub return_type: Option<RuntimeType>,
     pub chunk: Chunk,
     pub span: Span,
-    pub owner_class: Option<String>,
+    pub owner_class: Option<TypeId>,
     pub is_static: bool,
     pub is_async: bool,
     pub visibility: Visibility,
@@ -41,7 +49,7 @@ pub struct FunctionPrototype {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldPrototype {
     pub name: String,
-    pub type_name: String,
+    pub type_ref: RuntimeType,
     pub visibility: Visibility,
     pub readonly: bool,
     pub is_static: bool,
@@ -50,18 +58,18 @@ pub struct FieldPrototype {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClassPrototype {
-    pub name: String,
-    pub superclass: Option<String>,
-    pub protocols: Vec<String>,
+    pub type_id: TypeId,
+    pub superclass: Option<TypeLink>,
+    pub protocols: Vec<TypeLink>,
     pub fields: Vec<FieldPrototype>,
     pub methods: Vec<FunctionPrototype>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProtocolPrototype {
-    pub name: String,
-    pub fields: Vec<(String, String)>,
-    pub methods: Vec<(String, Vec<ParameterSpec>, Option<String>)>,
+    pub type_id: TypeId,
+    pub fields: Vec<(String, RuntimeType)>,
+    pub methods: Vec<(String, Vec<ParameterSpec>, Option<RuntimeType>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,7 +79,7 @@ pub enum Instruction {
     Define {
         name: String,
         mutable: bool,
-        type_name: Option<String>,
+        type_ref: Option<RuntimeType>,
     },
     Store(String),
     EnterScope,
@@ -99,7 +107,7 @@ pub enum Instruction {
     GetProperty(String),
     GetSuper(String),
     SetProperty(String),
-    IsType(String),
+    IsType(RuntimeType),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
     Jump(usize),
@@ -125,6 +133,7 @@ pub enum Instruction {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Chunk {
     pub format_version: u32,
+    pub module_id: ModuleId,
     pub constants: Vec<Constant>,
     pub code: Vec<Instruction>,
     pub spans: Vec<Span>,
@@ -135,9 +144,10 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    fn empty() -> Self {
+    fn empty(module_id: ModuleId) -> Self {
         Self {
             format_version: BYTECODE_FORMAT_VERSION,
+            module_id,
             constants: Vec::new(),
             code: Vec::new(),
             spans: Vec::new(),
@@ -167,7 +177,7 @@ impl Chunk {
             for method in &class.methods {
                 output.push_str(&format!(
                     "\n\n== {}.{} ==\n{}",
-                    class.name,
+                    class.type_id.name,
                     method.name,
                     method.chunk.disassemble()
                 ));
@@ -227,20 +237,128 @@ pub fn deserialize(bytes: &[u8]) -> Result<Chunk, ArchiveError> {
     Ok(chunk)
 }
 
-fn validate_format(chunk: &Chunk) -> Result<(), ArchiveError> {
+pub fn validate_format(chunk: &Chunk) -> Result<(), ArchiveError> {
+    validate_chunk(chunk, None)
+}
+
+fn validate_chunk(chunk: &Chunk, parent_module: Option<&ModuleId>) -> Result<(), ArchiveError> {
     if chunk.format_version != BYTECODE_FORMAT_VERSION {
         return Err(archive_error(format!(
             "不支持格式版本 {}，本运行时仅支持版本 {BYTECODE_FORMAT_VERSION}",
             chunk.format_version
         )));
     }
+    if !chunk.module_id.is_valid() {
+        return Err(archive_error(format!(
+            "无效的规范模块身份：{}",
+            chunk.module_id
+        )));
+    }
+    if parent_module.is_some_and(|module| module != &chunk.module_id) {
+        return Err(archive_error(format!(
+            "嵌套字节码模块身份 {} 与外层 {} 不一致",
+            chunk.module_id,
+            parent_module.expect("parent module checked above")
+        )));
+    }
+    for instruction in &chunk.code {
+        match instruction {
+            Instruction::Define {
+                type_ref: Some(ty), ..
+            }
+            | Instruction::IsType(ty) => validate_runtime_type(ty)?,
+            _ => {}
+        }
+    }
     for function in &chunk.functions {
-        validate_format(&function.chunk)?;
+        validate_function(function, &chunk.module_id, None)?;
     }
     for class in &chunk.classes {
-        for method in &class.methods {
-            validate_format(&method.chunk)?;
+        validate_type_id(&class.type_id, TypeDeclarationKind::Class, &chunk.module_id)?;
+        if let Some(superclass) = &class.superclass {
+            validate_type_link(superclass, Some(TypeDeclarationKind::Class))?;
         }
+        for protocol in &class.protocols {
+            validate_type_link(protocol, Some(TypeDeclarationKind::Protocol))?;
+        }
+        for field in &class.fields {
+            validate_runtime_type(&field.type_ref)?;
+        }
+        for method in &class.methods {
+            validate_function(method, &chunk.module_id, Some(&class.type_id))?;
+        }
+    }
+    for protocol in &chunk.protocols {
+        validate_type_id(
+            &protocol.type_id,
+            TypeDeclarationKind::Protocol,
+            &chunk.module_id,
+        )?;
+        for (_, ty) in &protocol.fields {
+            validate_runtime_type(ty)?;
+        }
+        for (_, parameters, return_type) in &protocol.methods {
+            for parameter in parameters {
+                if let Some(ty) = &parameter.type_ref {
+                    validate_runtime_type(ty)?;
+                }
+            }
+            if let Some(ty) = return_type {
+                validate_runtime_type(ty)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_function(
+    function: &FunctionPrototype,
+    module_id: &ModuleId,
+    expected_owner: Option<&TypeId>,
+) -> Result<(), ArchiveError> {
+    if function.owner_class.as_ref() != expected_owner {
+        return Err(archive_error(format!(
+            "法“{}”的类型所有者身份无效",
+            function.name
+        )));
+    }
+    for parameter in &function.parameters {
+        if let Some(ty) = &parameter.type_ref {
+            validate_runtime_type(ty)?;
+        }
+    }
+    if let Some(ty) = &function.return_type {
+        validate_runtime_type(ty)?;
+    }
+    validate_chunk(&function.chunk, Some(module_id))
+}
+
+fn validate_type_id(
+    type_id: &TypeId,
+    expected_kind: TypeDeclarationKind,
+    module_id: &ModuleId,
+) -> Result<(), ArchiveError> {
+    if !type_id.is_valid() || type_id.kind != expected_kind || &type_id.module != module_id {
+        return Err(archive_error(format!("无效的规范类型身份：{type_id}")));
+    }
+    Ok(())
+}
+
+fn validate_type_link(
+    link: &TypeLink,
+    expected_kind: Option<TypeDeclarationKind>,
+) -> Result<(), ArchiveError> {
+    if !link.is_valid()
+        || expected_kind.is_some_and(|kind| link.target.as_ref().is_some_and(|id| id.kind != kind))
+    {
+        return Err(archive_error(format!("无效的字节码类型链接：{link}")));
+    }
+    Ok(())
+}
+
+fn validate_runtime_type(ty: &RuntimeType) -> Result<(), ArchiveError> {
+    if !ty.is_valid() {
+        return Err(archive_error(format!("无效的运行时类型：{ty}")));
     }
     Ok(())
 }
@@ -252,15 +370,39 @@ fn archive_error(message: impl Into<String>) -> ArchiveError {
 }
 
 pub fn compile(statements: &[Stmt]) -> Result<Chunk, CompileError> {
-    let mut compiler = Compiler {
-        chunk: Chunk::empty(),
-    };
+    let module_id = statements
+        .first()
+        .map(|statement| ModuleId::for_source(&statement.span.source.name))
+        .unwrap_or_else(|| ModuleId::for_source("<空模块>"));
+    compile_with_module_id(statements, module_id)
+}
+
+pub fn compile_with_module_id(
+    statements: &[Stmt],
+    module_id: ModuleId,
+) -> Result<Chunk, CompileError> {
+    let fallback_span = statements
+        .first()
+        .map(|statement| statement.span.clone())
+        .unwrap_or_else(Span::synthetic);
+    if !module_id.is_valid() {
+        return Err(CompileError {
+            message: format!("无效的规范模块身份：{module_id}"),
+            span: fallback_span,
+        });
+    }
+    let local_types = Rc::new(local_type_ids(statements, &module_id));
+    let mut compiler = Compiler::new(module_id, local_types);
     for statement in statements {
         compiler.statement(statement)?;
-        if statement.public
-            && let Some(name) = declared_name(statement)
-        {
-            compiler.chunk.exports.push(name.into());
+        if statement.public {
+            let export = match &statement.kind {
+                StmtKind::Import { alias, .. } => Some(alias.as_str()),
+                _ => declared_name(statement),
+            };
+            if let Some(name) = export {
+                compiler.chunk.exports.push(name.into());
+            }
         }
     }
     let span = statements
@@ -273,9 +415,60 @@ pub fn compile(statements: &[Stmt]) -> Result<Chunk, CompileError> {
 
 struct Compiler {
     chunk: Chunk,
+    local_types: Rc<BTreeMap<String, TypeId>>,
 }
 
 impl Compiler {
+    fn new(module_id: ModuleId, local_types: Rc<BTreeMap<String, TypeId>>) -> Self {
+        Self {
+            chunk: Chunk::empty(module_id),
+            local_types,
+        }
+    }
+
+    fn runtime_type(&self, type_ref: &TypeRef) -> RuntimeType {
+        runtime_type(&type_ref.kind, &self.local_types)
+    }
+
+    fn type_link(&self, path: &TypePath) -> TypeLink {
+        type_link(path, &self.local_types)
+    }
+
+    fn compile_function(
+        &self,
+        statement: &Stmt,
+        owner_class: Option<TypeId>,
+    ) -> Result<FunctionPrototype, CompileError> {
+        let StmtKind::Function {
+            name,
+            params,
+            return_type,
+            body,
+            is_async,
+        } = &statement.kind
+        else {
+            unreachable!("only function statements are compiled as functions")
+        };
+        let mut compiler = Compiler::new(self.chunk.module_id.clone(), self.local_types.clone());
+        for child in body {
+            compiler.statement(child)?;
+        }
+        let index = compiler.constant(Constant::Nil);
+        compiler.emit(Instruction::Constant(index), statement.span.clone());
+        compiler.emit(Instruction::Return, statement.span.clone());
+        Ok(FunctionPrototype {
+            name: name.clone(),
+            parameters: parameter_specs(params, &self.local_types),
+            return_type: return_type.as_ref().map(|ty| self.runtime_type(ty)),
+            chunk: compiler.chunk,
+            span: statement.span.clone(),
+            owner_class,
+            is_static: statement.is_static,
+            is_async: *is_async,
+            visibility: statement.member_visibility,
+        })
+    }
+
     fn statement(&mut self, statement: &Stmt) -> Result<(), CompileError> {
         match &statement.kind {
             StmtKind::Let {
@@ -289,7 +482,7 @@ impl Compiler {
                     Instruction::Define {
                         name: name.clone(),
                         mutable: *mutable,
-                        type_name: type_ref.as_ref().map(|ty| ty.name.clone()),
+                        type_ref: type_ref.as_ref().map(|ty| self.runtime_type(ty)),
                     },
                     statement.span.clone(),
                 );
@@ -366,7 +559,7 @@ impl Compiler {
                     Instruction::Define {
                         name: name.clone(),
                         mutable: false,
-                        type_name: type_ref.as_ref().map(|ty| ty.name.clone()),
+                        type_ref: type_ref.as_ref().map(|ty| self.runtime_type(ty)),
                     },
                     statement.span.clone(),
                 );
@@ -377,22 +570,8 @@ impl Compiler {
                 self.emit(Instruction::Jump(loop_start), statement.span.clone());
                 self.patch(next);
             }
-            StmtKind::Function {
-                name,
-                params,
-                return_type,
-                body,
-                is_async,
-            } => {
-                let prototype = compile_function(
-                    name,
-                    params,
-                    return_type.as_ref().map(|ty| ty.name.clone()),
-                    body,
-                    statement,
-                    None,
-                    *is_async,
-                )?;
+            StmtKind::Function { name, .. } => {
+                let prototype = self.compile_function(statement, None)?;
                 let index = self.chunk.functions.len();
                 self.chunk.functions.push(prototype);
                 self.emit(Instruction::MakeClosure(index), statement.span.clone());
@@ -400,7 +579,7 @@ impl Compiler {
                     Instruction::Define {
                         name: name.clone(),
                         mutable: false,
-                        type_name: Some("法".into()),
+                        type_ref: Some(RuntimeType::named("法")),
                     },
                     statement.span.clone(),
                 );
@@ -412,6 +591,11 @@ impl Compiler {
                 fields,
                 methods,
             } => {
+                let type_id = self
+                    .local_types
+                    .get(name)
+                    .cloned()
+                    .expect("local class identity was precomputed");
                 let mut initial_slot = 0;
                 let field_prototypes = fields
                     .iter()
@@ -421,7 +605,7 @@ impl Compiler {
                             initial_slot += 1;
                             slot
                         });
-                        field_prototype(field, slot)
+                        field_prototype(field, slot, &self.local_types)
                     })
                     .collect::<Vec<_>>();
                 for field in fields {
@@ -431,33 +615,13 @@ impl Compiler {
                 }
                 let method_prototypes = methods
                     .iter()
-                    .map(|method| {
-                        let StmtKind::Function {
-                            name: method_name,
-                            params,
-                            return_type,
-                            body,
-                            is_async,
-                        } = &method.kind
-                        else {
-                            unreachable!("class contains functions")
-                        };
-                        compile_function(
-                            method_name,
-                            params,
-                            return_type.as_ref().map(|ty| ty.name.clone()),
-                            body,
-                            method,
-                            Some(name.clone()),
-                            *is_async,
-                        )
-                    })
+                    .map(|method| self.compile_function(method, Some(type_id.clone())))
                     .collect::<Result<Vec<_>, _>>()?;
                 let index = self.chunk.classes.len();
                 self.chunk.classes.push(ClassPrototype {
-                    name: name.clone(),
-                    superclass: superclass.as_ref().map(ToString::to_string),
-                    protocols: protocols.iter().map(ToString::to_string).collect(),
+                    type_id,
+                    superclass: superclass.as_ref().map(|path| self.type_link(path)),
+                    protocols: protocols.iter().map(|path| self.type_link(path)).collect(),
                     fields: field_prototypes,
                     methods: method_prototypes,
                 });
@@ -468,6 +632,11 @@ impl Compiler {
                 fields,
                 methods,
             } => {
+                let type_id = self
+                    .local_types
+                    .get(name)
+                    .cloned()
+                    .expect("local protocol identity was precomputed");
                 let methods = methods
                     .iter()
                     .map(|method| {
@@ -482,17 +651,17 @@ impl Compiler {
                         };
                         (
                             name.clone(),
-                            parameter_specs(params),
-                            return_type.as_ref().map(|ty| ty.name.clone()),
+                            parameter_specs(params, &self.local_types),
+                            return_type.as_ref().map(|ty| self.runtime_type(ty)),
                         )
                     })
                     .collect();
                 let index = self.chunk.protocols.len();
                 self.chunk.protocols.push(ProtocolPrototype {
-                    name: name.clone(),
+                    type_id,
                     fields: fields
                         .iter()
-                        .map(|field| (field.name.clone(), field.type_ref.name.clone()))
+                        .map(|field| (field.name.clone(), self.runtime_type(&field.type_ref)))
                         .collect(),
                     methods,
                 });
@@ -647,7 +816,7 @@ impl Compiler {
             ExprKind::TypeTest { value, type_ref } => {
                 self.expression(value)?;
                 self.emit(
-                    Instruction::IsType(type_ref.name.clone()),
+                    Instruction::IsType(self.runtime_type(type_ref)),
                     expression.span.clone(),
                 );
             }
@@ -736,55 +905,98 @@ impl Compiler {
     }
 }
 
-fn compile_function(
-    name: &str,
+fn parameter_specs(
     params: &[Parameter],
-    return_type: Option<String>,
-    body: &[Stmt],
-    statement: &Stmt,
-    owner_class: Option<String>,
-    is_async: bool,
-) -> Result<FunctionPrototype, CompileError> {
-    let mut compiler = Compiler {
-        chunk: Chunk::empty(),
-    };
-    for child in body {
-        compiler.statement(child)?;
-    }
-    let index = compiler.constant(Constant::Nil);
-    compiler.emit(Instruction::Constant(index), statement.span.clone());
-    compiler.emit(Instruction::Return, statement.span.clone());
-    Ok(FunctionPrototype {
-        name: name.into(),
-        parameters: parameter_specs(params),
-        return_type,
-        chunk: compiler.chunk,
-        span: statement.span.clone(),
-        owner_class,
-        is_static: statement.is_static,
-        is_async,
-        visibility: statement.member_visibility,
-    })
-}
-
-fn parameter_specs(params: &[Parameter]) -> Vec<ParameterSpec> {
+    local_types: &BTreeMap<String, TypeId>,
+) -> Vec<ParameterSpec> {
     params
         .iter()
         .map(|parameter| ParameterSpec {
             name: parameter.name.clone(),
-            type_name: parameter.type_ref.as_ref().map(|ty| ty.name.clone()),
+            type_ref: parameter
+                .type_ref
+                .as_ref()
+                .map(|ty| runtime_type(&ty.kind, local_types)),
         })
         .collect()
 }
 
-fn field_prototype(field: &FieldDecl, initial_slot: Option<usize>) -> FieldPrototype {
+fn field_prototype(
+    field: &FieldDecl,
+    initial_slot: Option<usize>,
+    local_types: &BTreeMap<String, TypeId>,
+) -> FieldPrototype {
     FieldPrototype {
         name: field.name.clone(),
-        type_name: field.type_ref.name.clone(),
+        type_ref: runtime_type(&field.type_ref.kind, local_types),
         visibility: field.visibility,
         readonly: field.readonly,
         is_static: field.is_static,
         initial_slot,
+    }
+}
+
+fn local_type_ids(statements: &[Stmt], module_id: &ModuleId) -> BTreeMap<String, TypeId> {
+    statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            StmtKind::Class { name, .. } => Some((
+                name.clone(),
+                TypeId::new(module_id.clone(), name.clone(), TypeDeclarationKind::Class),
+            )),
+            StmtKind::Protocol { name, .. } => Some((
+                name.clone(),
+                TypeId::new(
+                    module_id.clone(),
+                    name.clone(),
+                    TypeDeclarationKind::Protocol,
+                ),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn runtime_type(kind: &TypeKind, local_types: &BTreeMap<String, TypeId>) -> RuntimeType {
+    match kind {
+        TypeKind::Named(path) => RuntimeType::Named {
+            link: type_link(path, local_types),
+        },
+        TypeKind::Union(types) => RuntimeType::Union {
+            variants: types
+                .iter()
+                .map(|ty| runtime_type(ty, local_types))
+                .collect(),
+        },
+        TypeKind::Nullable(inner) => RuntimeType::Nullable {
+            inner: Box::new(runtime_type(inner, local_types)),
+        },
+        TypeKind::Generic { base, arguments } => RuntimeType::Generic {
+            base: type_link(base, local_types),
+            arguments: arguments
+                .iter()
+                .map(|ty| runtime_type(ty, local_types))
+                .collect(),
+        },
+        TypeKind::Function { parameters, result } => RuntimeType::Function {
+            parameters: parameters
+                .iter()
+                .map(|ty| runtime_type(ty, local_types))
+                .collect(),
+            result: Box::new(runtime_type(result, local_types)),
+        },
+    }
+}
+
+fn type_link(path: &TypePath, local_types: &BTreeMap<String, TypeId>) -> TypeLink {
+    let source = RuntimeTypePath::new(path.names().map(str::to_owned).collect());
+    match path
+        .single_name()
+        .and_then(|name| local_types.get(name))
+        .cloned()
+    {
+        Some(target) => TypeLink::resolved(source, target),
+        None => TypeLink::unresolved(source),
     }
 }
 
@@ -846,9 +1058,92 @@ mod tests {
         assert_eq!(decoded, chunk);
 
         let mut document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        document["format_version"] = serde_json::json!(2);
+        document["format_version"] = serde_json::json!(1);
         let error = deserialize(&serde_json::to_vec(&document).unwrap()).unwrap_err();
-        assert!(error.message.contains("不支持格式版本 2"));
+        assert!(error.message.contains("不支持格式版本 1"));
         assert!(deserialize(b"not-json").is_err());
+    }
+
+    #[test]
+    fn format_two_preserves_canonical_and_source_type_links() {
+        let source = r#"
+            公 协 可描述 则 法 描述（）：文；终
+            公 类 视图 纳 可描述 则
+                公 法 描述（）：文 则 归 「视图」；终
+            终
+            公 类 按钮 承 视图 纳 可描述 则
+                域 父项：视图；
+                公 法 接受（值：列<视图?>）：视图 则 归 此.父项；终
+                公 法 是视图（值：任意）：理 则 归 值 是 视图；终
+            终
+            公 引「facade.yx」为 门面；
+        "#;
+        let module_id = ModuleId::archive("app:controls.yx");
+        let chunk =
+            compile_with_module_id(&crate::parse(source).unwrap(), module_id.clone()).unwrap();
+        let view_id = TypeId::new(module_id.clone(), "视图", TypeDeclarationKind::Class);
+        let protocol_id = TypeId::new(module_id.clone(), "可描述", TypeDeclarationKind::Protocol);
+        let button = chunk
+            .classes
+            .iter()
+            .find(|class| class.type_id.name == "按钮")
+            .unwrap();
+        assert_eq!(chunk.module_id, module_id);
+        assert_eq!(
+            button.superclass.as_ref().unwrap().target,
+            Some(view_id.clone())
+        );
+        assert_eq!(button.protocols[0].target, Some(protocol_id));
+        assert_eq!(button.fields[0].type_ref.to_string(), "视图");
+        let accepts = button
+            .methods
+            .iter()
+            .find(|method| method.name == "接受")
+            .unwrap();
+        assert_eq!(accepts.owner_class.as_ref(), Some(&button.type_id));
+        assert_eq!(
+            accepts.parameters[0].type_ref.as_ref().unwrap().to_string(),
+            "列<视图?>"
+        );
+        assert_eq!(accepts.return_type.as_ref().unwrap().to_string(), "视图");
+        assert!(button.methods.iter().any(|method| {
+            method.chunk.code.iter().any(|instruction| {
+                matches!(instruction, Instruction::IsType(RuntimeType::Named { link })
+                    if link.target.as_ref() == Some(&view_id))
+            })
+        }));
+        assert!(chunk.exports.contains(&"门面".to_owned()));
+
+        let decoded = deserialize(&serialize(&chunk).unwrap()).unwrap();
+        assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn qualified_links_remain_structured_and_corrupt_identities_are_rejected() {
+        let source = r#"
+            引「base.yx」为 基础；
+            类 按钮 承 基础.视图 纳 基础.可描述 则
+                域 内容：典<文，基础.视图?>；
+            终
+        "#;
+        let chunk = compile_with_module_id(
+            &crate::parse(source).unwrap(),
+            ModuleId::archive("app:controls.yx"),
+        )
+        .unwrap();
+        let class = &chunk.classes[0];
+        assert_eq!(
+            class.superclass.as_ref().unwrap().source.segments,
+            ["基础", "视图"]
+        );
+        assert!(class.superclass.as_ref().unwrap().target.is_none());
+        assert_eq!(class.protocols[0].source.segments, ["基础", "可描述"]);
+        assert_eq!(class.fields[0].type_ref.to_string(), "典<文，基础.视图?>");
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&serialize(&chunk).unwrap()).unwrap();
+        document["classes"][0]["type_id"]["name"] = serde_json::json!("");
+        let error = deserialize(&serde_json::to_vec(&document).unwrap()).unwrap_err();
+        assert!(error.message.contains("无效的规范类型身份"), "{error}");
     }
 }

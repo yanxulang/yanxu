@@ -25,6 +25,58 @@ fn assert_consistent(name: &str, source: &str) {
 }
 
 #[test]
+fn module_qualified_oop_fixtures_match_both_runtimes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vm_consistency");
+    let cases: &[(&str, &[&str])] = &[
+        ("cross_module_inheritance", &["视图-确定-按钮", "视图"]),
+        ("cross_module_protocol", &["按钮", "真"]),
+        ("qualified_type_test", &["真", "假"]),
+        ("qualified_nested_types", &["真", "节点"]),
+        ("same_short_name_types", &["真", "真", "假", "真", "左右"]),
+        ("public_module_reexport", &["公开项目", "真"]),
+        ("reexported_inheritance", &["基础-子类", "真"]),
+        ("cross_module_super_dispatch", &["基础-确定-按钮"]),
+    ];
+
+    for (name, expected) in cases {
+        let directory = root.join(name);
+        let main = directory.join("main.yx");
+        let source = fs::read_to_string(&main).unwrap();
+        let statements = yanxu::parse_named(&source, main.display().to_string()).unwrap();
+        yanxu::type_checker::check_in_directory(&statements, &directory)
+            .unwrap_or_else(|errors| panic!("{name} 静态检查失败：{errors:#?}"));
+        let (tree, vm) = execute_both(&source, &directory);
+        assert_eq!(tree, *expected, "{name} 输出快照不符");
+        assert_eq!(tree, vm, "{name} 的树解释器与 VM 输出不一致");
+    }
+}
+
+#[test]
+fn cross_module_private_super_errors_match_both_runtimes() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/vm_consistency/cross_module_private_access");
+    let main = directory.join("main.yx");
+    let source = fs::read_to_string(&main).unwrap();
+    let statements = yanxu::parse_named(&source, main.display().to_string()).unwrap();
+
+    let mut interpreter = Interpreter::silent();
+    let tree_error = interpreter
+        .execute_in_directory(&statements, &directory)
+        .unwrap_err()
+        .to_string();
+    let chunk = bytecode::compile(&statements).unwrap();
+    let mut vm = Vm::silent();
+    let vm_error = vm
+        .execute_in_directory(&chunk, &directory)
+        .unwrap_err()
+        .to_string();
+
+    for error in [tree_error, vm_error] {
+        assert!(error.contains("父类私法“秘密”不可由子类调用"), "{error}");
+    }
+}
+
+#[test]
 fn official_examples_type_check_and_match_both_runtimes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let mut paths = fs::read_dir(&root)

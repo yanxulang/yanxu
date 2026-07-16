@@ -104,6 +104,170 @@ pub struct TypeId {
     pub kind: TypeDeclarationKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RuntimeTypePath {
+    pub segments: Vec<String>,
+}
+
+impl RuntimeTypePath {
+    pub fn new(segments: Vec<String>) -> Self {
+        Self { segments }
+    }
+
+    pub fn single(name: impl Into<String>) -> Self {
+        Self {
+            segments: vec![name.into()],
+        }
+    }
+
+    pub fn single_name(&self) -> Option<&str> {
+        match self.segments.as_slice() {
+            [name] => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.segments.is_empty()
+            && self
+                .segments
+                .iter()
+                .all(|segment| valid_type_component(segment))
+    }
+}
+
+impl fmt::Display for RuntimeTypePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.segments.join("."))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TypeLink {
+    pub source: RuntimeTypePath,
+    pub target: Option<TypeId>,
+}
+
+impl TypeLink {
+    pub fn unresolved(source: RuntimeTypePath) -> Self {
+        Self {
+            source,
+            target: None,
+        }
+    }
+
+    pub fn resolved(source: RuntimeTypePath, target: TypeId) -> Self {
+        Self {
+            source,
+            target: Some(target),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.source.is_valid()
+            && self.target.as_ref().is_none_or(|target| {
+                target.is_valid()
+                    && self
+                        .source
+                        .segments
+                        .last()
+                        .is_some_and(|name| name == &target.name)
+            })
+    }
+}
+
+impl fmt::Display for TypeLink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.source)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeType {
+    Named {
+        link: TypeLink,
+    },
+    Union {
+        variants: Vec<RuntimeType>,
+    },
+    Nullable {
+        inner: Box<RuntimeType>,
+    },
+    Generic {
+        base: TypeLink,
+        arguments: Vec<RuntimeType>,
+    },
+    Function {
+        parameters: Vec<RuntimeType>,
+        result: Box<RuntimeType>,
+    },
+}
+
+impl RuntimeType {
+    pub fn named(name: impl Into<String>) -> Self {
+        Self::Named {
+            link: TypeLink::unresolved(RuntimeTypePath::single(name)),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Named { link } => link.is_valid(),
+            Self::Union { variants } => {
+                variants.len() >= 2 && variants.iter().all(RuntimeType::is_valid)
+            }
+            Self::Nullable { inner } => inner.is_valid(),
+            Self::Generic { base, arguments } => {
+                base.is_valid()
+                    && !arguments.is_empty()
+                    && arguments.iter().all(RuntimeType::is_valid)
+            }
+            Self::Function { parameters, result } => {
+                parameters.iter().all(RuntimeType::is_valid) && result.is_valid()
+            }
+        }
+    }
+}
+
+impl fmt::Display for RuntimeType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Named { link } => write!(formatter, "{link}"),
+            Self::Union { variants } => {
+                for (index, variant) in variants.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str("|")?;
+                    }
+                    write!(formatter, "{variant}")?;
+                }
+                Ok(())
+            }
+            Self::Nullable { inner } => write!(formatter, "{inner}?"),
+            Self::Generic { base, arguments } => {
+                write!(formatter, "{base}<")?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str("，")?;
+                    }
+                    write!(formatter, "{argument}")?;
+                }
+                formatter.write_str(">")
+            }
+            Self::Function { parameters, result } => {
+                formatter.write_str("法（")?;
+                for (index, parameter) in parameters.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str("，")?;
+                    }
+                    write!(formatter, "{parameter}")?;
+                }
+                write!(formatter, "）：{result}")
+            }
+        }
+    }
+}
+
 impl TypeId {
     pub fn new(module: ModuleId, name: impl Into<String>, kind: TypeDeclarationKind) -> Self {
         Self {
@@ -118,7 +282,7 @@ impl TypeId {
     }
 
     pub fn is_valid(&self) -> bool {
-        self.module.is_valid() && valid_component(&self.name)
+        self.module.is_valid() && valid_type_component(&self.name)
     }
 }
 
@@ -132,12 +296,21 @@ fn valid_component(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(char::is_control) && !value.contains(['/', '\\'])
 }
 
+fn valid_type_component(value: &str) -> bool {
+    valid_component(value) && !value.contains('.')
+}
+
 fn valid_module_path(value: &str) -> bool {
+    let logical_path = value.rsplit_once(':').map_or(value, |(_, path)| path);
     !value.is_empty()
+        && !logical_path.is_empty()
         && !value.chars().any(char::is_control)
-        && !Path::new(value)
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
+        && !value.contains('\\')
+        && !Path::new(value).is_absolute()
+        && !Path::new(logical_path).is_absolute()
+        && logical_path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn portable_path(path: &Path) -> String {
@@ -181,5 +354,14 @@ mod tests {
             TypeDeclarationKind::Class,
         );
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn portable_module_ids_reject_absolute_and_parent_paths() {
+        assert!(!ModuleId::archive("/tmp/app:main.yx").is_valid());
+        assert!(!ModuleId::archive("app:../main.yx").is_valid());
+        assert!(!ModuleId::archive("app:lib//main.yx").is_valid());
+        assert!(ModuleId::archive("app:lib/main.yx").is_valid());
+        assert!(ModuleId::archive("pkg:工具@1.0.0/src/main.yx").is_valid());
     }
 }

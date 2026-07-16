@@ -10,6 +10,7 @@ use crate::bytecode::{
     Chunk, ClassPrototype, Constant, FieldPrototype, FunctionPrototype, Instruction,
 };
 use crate::source::Span;
+use crate::type_model::{ModuleId, RuntimeType, TypeId, TypeLink};
 use crate::{host_events, host_handles, native_abi_v2};
 pub use native::VmNative;
 use native::{NativeKind, StandardNative};
@@ -41,7 +42,7 @@ pub enum VmValue {
     Class(Rc<VmClass>),
     Instance(Rc<RefCell<VmInstance>>),
     Module(Rc<VmModule>),
-    Protocol(String),
+    Protocol(Rc<VmProtocol>),
     Iterator(Rc<RefCell<VmIterator>>),
     Error(Rc<VmErrorValue>),
     Task(Rc<RefCell<VmTask>>),
@@ -79,7 +80,7 @@ impl VmValue {
             Self::Map(_) => "典".into(),
             Self::Closure(_) | Self::BoundMethod(_, _) | Self::Native(_) => "法".into(),
             Self::Class(_) => "类".into(),
-            Self::Instance(instance) => instance.borrow().class.name.clone(),
+            Self::Instance(instance) => instance.borrow().class.type_id.name.clone(),
             Self::Module(_) => "模块".into(),
             Self::Protocol(_) => "协".into(),
             Self::Iterator(_) => "遍器".into(),
@@ -124,12 +125,16 @@ impl fmt::Display for VmValue {
             Self::Closure(function) => write!(formatter, "<法 {}>", function.prototype.name),
             Self::BoundMethod(function, _) => write!(formatter, "<法 {}>", function.prototype.name),
             Self::Native(function) => write!(formatter, "<天授之法 {}>", function.name),
-            Self::Class(class) => write!(formatter, "<类 {}>", class.name),
+            Self::Class(class) => write!(formatter, "<类 {}>", class.type_id.name),
             Self::Instance(instance) => {
-                write!(formatter, "<{}之实例>", instance.borrow().class.name)
+                write!(
+                    formatter,
+                    "<{}之实例>",
+                    instance.borrow().class.type_id.name
+                )
             }
             Self::Module(module) => write!(formatter, "<模块 {}>", module.name),
-            Self::Protocol(name) => write!(formatter, "<协 {name}>"),
+            Self::Protocol(protocol) => write!(formatter, "<协 {}>", protocol.type_id.name),
             Self::Iterator(_) => formatter.write_str("<遍器>"),
             Self::Error(error) => write!(formatter, "<误 {}>", error.message),
             Self::Task(task) => write!(formatter, "<任务 {}>", task.borrow().status()),
@@ -185,7 +190,8 @@ impl VmError {
 struct Binding {
     value: VmValue,
     mutable: bool,
-    type_name: Option<String>,
+    type_ref: Option<RuntimeType>,
+    type_environment: Option<Weak<RefCell<Environment>>>,
 }
 
 #[derive(Default)]
@@ -201,26 +207,12 @@ impl Environment {
             .map(|binding| binding.value.clone())
             .or_else(|| self.parent.as_ref()?.borrow().get(name))
     }
-
-    fn assign(&mut self, name: &str, value: VmValue, span: &Span) -> Result<(), VmError> {
-        if let Some(binding) = self.values.get_mut(name) {
-            if !binding.mutable {
-                return Err(error(span, format!("“{name}”乃定值，不可改写")));
-            }
-            ensure_type(name, binding.type_name.as_deref(), &value, span)?;
-            binding.value = value;
-            return Ok(());
-        }
-        if let Some(parent) = &self.parent {
-            return parent.borrow_mut().assign(name, value, span);
-        }
-        Err(error(span, format!("不可改写未定义之名“{name}”")))
-    }
 }
 
 pub struct VmClosure {
     prototype: Rc<FunctionPrototype>,
     closure: EnvRef,
+    directory: PathBuf,
 }
 
 pub struct VmMap {
@@ -230,18 +222,19 @@ pub struct VmMap {
 struct RuntimeField {
     prototype: FieldPrototype,
     initial: Option<VmValue>,
-    owner: String,
+    owner: TypeId,
+    type_environment: EnvRef,
 }
 
 struct RuntimeMethod {
     closure: Rc<VmClosure>,
-    owner: String,
+    owner: TypeId,
 }
 
 pub struct VmClass {
-    name: String,
+    type_id: TypeId,
     superclass: Option<Rc<VmClass>>,
-    protocols: HashSet<String>,
+    protocols: HashSet<TypeId>,
     fields: HashMap<String, RuntimeField>,
     methods: HashMap<String, RuntimeMethod>,
     static_values: RefCell<HashMap<String, VmValue>>,
@@ -295,17 +288,17 @@ impl VmClass {
         }
     }
 
-    fn is_a(&self, type_name: &str) -> bool {
-        self.name == type_name
-            || self.protocols.contains(type_name)
+    fn is_a(&self, type_id: &TypeId) -> bool {
+        &self.type_id == type_id
+            || self.protocols.contains(type_id)
             || self
                 .superclass
                 .as_ref()
-                .is_some_and(|class| class.is_a(type_name))
+                .is_some_and(|class| class.is_a(type_id))
     }
 
-    fn superclass_of(&self, owner: &str) -> Option<Rc<VmClass>> {
-        if self.name == owner {
+    fn superclass_of(&self, owner: &TypeId) -> Option<Rc<VmClass>> {
+        if &self.type_id == owner {
             self.superclass.clone()
         } else {
             self.superclass
@@ -320,8 +313,13 @@ pub struct VmInstance {
     fields: HashMap<String, VmValue>,
 }
 
+pub struct VmProtocol {
+    type_id: TypeId,
+}
+
 pub struct VmModule {
     name: String,
+    module_id: ModuleId,
     environment: EnvRef,
     exports: HashSet<String>,
 }
@@ -403,7 +401,7 @@ pub struct CacheStats {
 struct FrameInfo {
     name: String,
     span: Span,
-    owner_class: Option<String>,
+    owner_class: Option<TypeId>,
     environment: EnvRef,
 }
 
@@ -880,6 +878,10 @@ impl Vm {
         chunk: &Chunk,
         directory: &Path,
     ) -> Result<VmValue, VmError> {
+        if chunk.format_version == crate::bytecode::BYTECODE_FORMAT_VERSION {
+            crate::bytecode::validate_format(chunk)
+                .map_err(|archive_error| error(&Span::synthetic(), archive_error.to_string()))?;
+        }
         self.resources.reset();
         let package_root = crate::package::discover(directory)
             .ok()
@@ -959,7 +961,7 @@ impl Vm {
         name: String,
         frame_span: Span,
         directory: PathBuf,
-        owner_class: Option<String>,
+        owner_class: Option<TypeId>,
     ) -> Result<VmValue, VmError> {
         if chunk.format_version != crate::bytecode::BYTECODE_FORMAT_VERSION {
             return Err(error(
@@ -1062,25 +1064,30 @@ impl Vm {
             Instruction::Define {
                 name,
                 mutable,
-                type_name,
+                type_ref,
             } => {
                 let value = self.pop(span)?;
-                ensure_type(&name, type_name.as_deref(), &value, span)?;
+                self.ensure_type(
+                    &format!("变量“{name}”"),
+                    type_ref.as_ref(),
+                    &value,
+                    environment.clone(),
+                    span,
+                )?;
                 environment.borrow_mut().values.insert(
                     name,
                     Binding {
                         value: value.clone(),
                         mutable,
-                        type_name,
+                        type_ref,
+                        type_environment: Some(Rc::downgrade(environment)),
                     },
                 );
                 *last = value;
             }
             Instruction::Store(name) => {
                 let value = self.pop(span)?;
-                environment
-                    .borrow_mut()
-                    .assign(&name, value.clone(), span)?;
+                self.assign_variable(environment.clone(), &name, value.clone(), span)?;
                 *last = value;
             }
             Instruction::EnterScope => *environment = self.child_env(environment.clone()),
@@ -1188,8 +1195,9 @@ impl Vm {
             }
             Instruction::IsType(type_name) => {
                 let value = self.pop(span)?;
-                self.stack
-                    .push(VmValue::Bool(vm_value_matches_type(&value, &type_name)));
+                let matches =
+                    self.value_matches_type(&value, &type_name, environment.clone(), span)?;
+                self.stack.push(VmValue::Bool(matches));
             }
             Instruction::JumpIfFalse(target) => {
                 if !self.peek(span)?.truthy() {
@@ -1211,6 +1219,7 @@ impl Vm {
                 self.stack.push(VmValue::Closure(Rc::new(VmClosure {
                     prototype: Rc::new(prototype),
                     closure: environment.clone(),
+                    directory: directory.to_path_buf(),
                 })));
             }
             Instruction::Call(count) => {
@@ -1251,7 +1260,7 @@ impl Vm {
                 }
             }
             Instruction::DefineClass(index) => {
-                self.define_class(chunk, index, environment, span)?;
+                self.define_class(chunk, index, environment, span, directory)?;
             }
             Instruction::DefineProtocol(index) => {
                 let protocol = chunk
@@ -1259,11 +1268,14 @@ impl Vm {
                     .get(index)
                     .ok_or_else(|| error(span, "协原型下标越界"))?;
                 environment.borrow_mut().values.insert(
-                    protocol.name.clone(),
+                    protocol.type_id.name.clone(),
                     Binding {
-                        value: VmValue::Protocol(protocol.name.clone()),
+                        value: VmValue::Protocol(Rc::new(VmProtocol {
+                            type_id: protocol.type_id.clone(),
+                        })),
                         mutable: false,
-                        type_name: Some("协".into()),
+                        type_ref: Some(RuntimeType::named("协")),
+                        type_environment: Some(Rc::downgrade(environment)),
                     },
                 );
             }
@@ -1274,7 +1286,8 @@ impl Vm {
                     Binding {
                         value: VmValue::Module(module),
                         mutable: false,
-                        type_name: Some("模块".into()),
+                        type_ref: Some(RuntimeType::named("模块")),
+                        type_environment: Some(Rc::downgrade(environment)),
                     },
                 );
             }
@@ -1295,7 +1308,8 @@ impl Vm {
                     Binding {
                         value,
                         mutable: false,
-                        type_name: Some("误".into()),
+                        type_ref: Some(RuntimeType::named("误")),
+                        type_environment: Some(Rc::downgrade(environment)),
                     },
                 );
             }
@@ -1305,12 +1319,291 @@ impl Vm {
         Ok(Step::Continue)
     }
 
+    fn assign_variable(
+        &self,
+        environment: EnvRef,
+        name: &str,
+        value: VmValue,
+        span: &Span,
+    ) -> Result<(), VmError> {
+        let mut current = environment;
+        loop {
+            if current.borrow().values.contains_key(name) {
+                let (mutable, type_ref, type_environment) = {
+                    let environment = current.borrow();
+                    let binding = environment
+                        .values
+                        .get(name)
+                        .expect("binding existence checked above");
+                    (
+                        binding.mutable,
+                        binding.type_ref.clone(),
+                        binding.type_environment.as_ref().and_then(Weak::upgrade),
+                    )
+                };
+                if !mutable {
+                    return Err(error(span, format!("“{name}”乃定值，不可改写")));
+                }
+                self.ensure_type(
+                    &format!("变量“{name}”"),
+                    type_ref.as_ref(),
+                    &value,
+                    type_environment.unwrap_or_else(|| current.clone()),
+                    span,
+                )?;
+                current
+                    .borrow_mut()
+                    .values
+                    .get_mut(name)
+                    .expect("binding existence checked above")
+                    .value = value;
+                return Ok(());
+            }
+            let parent = current.borrow().parent.clone();
+            let Some(parent) = parent else {
+                return Err(error(span, format!("不可改写未定义之名“{name}”")));
+            };
+            current = parent;
+        }
+    }
+
+    fn resolve_type_link(
+        &self,
+        environment: EnvRef,
+        link: &TypeLink,
+        span: &Span,
+    ) -> Result<VmValue, VmError> {
+        let Some(first) = link.source.segments.first() else {
+            return Err(error(span, "字节码类型路径不可为空"));
+        };
+        let mut value = environment
+            .borrow()
+            .get(first)
+            .ok_or_else(|| error(span, format!("类型路径“{link}”的首段“{first}”未定义")))?;
+        for segment in link.source.segments.iter().skip(1) {
+            let VmValue::Module(module) = value else {
+                return Err(error(span, format!("类型路径“{link}”的中间成员不是模块")));
+            };
+            if !module.module_id.is_valid() {
+                return Err(error(
+                    span,
+                    format!("模块“{}”携带无效规范身份", module.name),
+                ));
+            }
+            if !module.exports.contains(segment) {
+                return Err(error(
+                    span,
+                    format!("模块“{}”未导出“{segment}”（类型路径“{link}”）", module.name),
+                ));
+            }
+            value = module
+                .environment
+                .borrow()
+                .values
+                .get(segment)
+                .map(|binding| binding.value.clone())
+                .ok_or_else(|| {
+                    error(
+                        span,
+                        format!("模块“{}”未导出“{segment}”（类型路径“{link}”）", module.name),
+                    )
+                })?;
+        }
+        if let Some(target) = &link.target {
+            let linked = match &value {
+                VmValue::Class(class) => &class.type_id,
+                VmValue::Protocol(protocol) => &protocol.type_id,
+                other => {
+                    return Err(error(
+                        span,
+                        format!(
+                            "字节码类型引用“{link}”链接到{}而非类或协",
+                            other.type_name()
+                        ),
+                    ));
+                }
+            };
+            if linked != target {
+                return Err(error(
+                    span,
+                    format!("字节码类型引用“{link}”的规范身份不一致：期望 {target}，实得 {linked}"),
+                ));
+            }
+        }
+        Ok(value)
+    }
+
+    fn ensure_type(
+        &self,
+        subject: &str,
+        expected: Option<&RuntimeType>,
+        value: &VmValue,
+        environment: EnvRef,
+        span: &Span,
+    ) -> Result<(), VmError> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        if self.value_matches_type(value, expected, environment, span)? {
+            return Ok(());
+        }
+        Err(error(
+            span,
+            format!("{subject}注为{expected}，不可纳入{}", value.type_name()),
+        ))
+    }
+
+    fn value_matches_type(
+        &self,
+        value: &VmValue,
+        expected: &RuntimeType,
+        environment: EnvRef,
+        span: &Span,
+    ) -> Result<bool, VmError> {
+        match expected {
+            RuntimeType::Union { variants } => {
+                for variant in variants {
+                    if self.value_matches_type(value, variant, environment.clone(), span)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            RuntimeType::Nullable { inner } => Ok(matches!(value, VmValue::Nil)
+                || self.value_matches_type(value, inner, environment, span)?),
+            RuntimeType::Function { .. } => Ok(matches!(
+                value,
+                VmValue::Closure(_)
+                    | VmValue::BoundMethod(_, _)
+                    | VmValue::Native(_)
+                    | VmValue::Class(_)
+            )),
+            RuntimeType::Generic { base, arguments } => {
+                let Some(base_name) = base.source.single_name() else {
+                    return self.matches_object_link(value, base, environment, span);
+                };
+                match (base_name, value) {
+                    ("列", VmValue::List(items)) if arguments.len() == 1 => {
+                        for item in items.borrow().iter() {
+                            if !self.value_matches_type(
+                                item,
+                                &arguments[0],
+                                environment.clone(),
+                                span,
+                            )? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    ("典", VmValue::Map(map)) if arguments.len() == 2 => {
+                        for (key, item) in &map.borrow().entries {
+                            if !self.value_matches_type(
+                                key,
+                                &arguments[0],
+                                environment.clone(),
+                                span,
+                            )? || !self.value_matches_type(
+                                item,
+                                &arguments[1],
+                                environment.clone(),
+                                span,
+                            )? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    ("元", VmValue::Tuple(items)) if arguments.len() == items.len() => {
+                        for (item, item_type) in items.iter().zip(arguments) {
+                            if !self.value_matches_type(
+                                item,
+                                item_type,
+                                environment.clone(),
+                                span,
+                            )? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    ("遍器", VmValue::Iterator(_)) if arguments.len() == 1 => Ok(true),
+                    ("任务", VmValue::Task(_)) if arguments.len() == 1 => Ok(true),
+                    ("套接字", VmValue::Socket(_)) if arguments.is_empty() => Ok(true),
+                    _ if base.target.is_some() => {
+                        self.matches_object_link(value, base, environment, span)
+                    }
+                    _ => Ok(false),
+                }
+            }
+            RuntimeType::Named { link } => {
+                if let Some(expected) = link.source.single_name()
+                    && link.target.is_none()
+                {
+                    let builtin = match expected {
+                        "任意" => Some(true),
+                        "数" => Some(matches!(value, VmValue::Number(_))),
+                        "文" => Some(matches!(value, VmValue::String(_))),
+                        "字节串" => Some(matches!(value, VmValue::Bytes(_))),
+                        "理" => Some(matches!(value, VmValue::Bool(_))),
+                        "空" => Some(matches!(value, VmValue::Nil)),
+                        "法" => Some(matches!(
+                            value,
+                            VmValue::Closure(_)
+                                | VmValue::BoundMethod(_, _)
+                                | VmValue::Native(_)
+                                | VmValue::Class(_)
+                        )),
+                        "类" => Some(matches!(value, VmValue::Class(_))),
+                        "协" => Some(matches!(value, VmValue::Protocol(_))),
+                        "模块" => Some(matches!(value, VmValue::Module(_))),
+                        "对象" => Some(matches!(value, VmValue::Instance(_))),
+                        "列" => Some(matches!(value, VmValue::List(_))),
+                        "元" => Some(matches!(value, VmValue::Tuple(_))),
+                        "典" => Some(matches!(value, VmValue::Map(_))),
+                        "遍器" => Some(matches!(value, VmValue::Iterator(_))),
+                        "误" => Some(matches!(value, VmValue::Error(_))),
+                        "任务" => Some(matches!(value, VmValue::Task(_))),
+                        "套接字" => Some(matches!(value, VmValue::Socket(_))),
+                        "原生模块" => Some(matches!(value, VmValue::NativeModuleV2(_))),
+                        "原生资源" => Some(matches!(value, VmValue::NativeResource(_))),
+                        _ => None,
+                    };
+                    if let Some(matches) = builtin {
+                        return Ok(matches);
+                    }
+                }
+                self.matches_object_link(value, link, environment, span)
+            }
+        }
+    }
+
+    fn matches_object_link(
+        &self,
+        value: &VmValue,
+        link: &TypeLink,
+        environment: EnvRef,
+        span: &Span,
+    ) -> Result<bool, VmError> {
+        match self.resolve_type_link(environment, link, span)? {
+            VmValue::Class(class) => Ok(matches!(value, VmValue::Instance(instance)
+                if instance.borrow().class.is_a(&class.type_id))),
+            VmValue::Protocol(protocol) => Ok(matches!(value, VmValue::Instance(instance)
+                if instance.borrow().class.is_a(&protocol.type_id))),
+            other => Err(error(
+                span,
+                format!("类型路径“{link}”指向{}而非类或协", other.type_name()),
+            )),
+        }
+    }
+
     fn define_class(
         &mut self,
         chunk: &Chunk,
         index: usize,
         environment: &EnvRef,
         span: &Span,
+        directory: &Path,
     ) -> Result<(), VmError> {
         let prototype: ClassPrototype = chunk
             .classes
@@ -1326,15 +1619,30 @@ impl Vm {
         let superclass = prototype
             .superclass
             .as_ref()
-            .map(|name| match environment.borrow().get(name) {
-                Some(VmValue::Class(class)) => Ok(class),
-                Some(value) => Err(error(
-                    span,
-                    format!("“{name}”为{}，不可作父类", value.type_name()),
-                )),
-                None => Err(error(span, format!("未曾定义父类“{name}”"))),
-            })
+            .map(
+                |link| match self.resolve_type_link(environment.clone(), link, span)? {
+                    VmValue::Class(class) => Ok(class),
+                    value => Err(error(
+                        span,
+                        format!("“{link}”为{}，不可作父类", value.type_name()),
+                    )),
+                },
+            )
             .transpose()?;
+        let mut protocols = HashSet::new();
+        for link in &prototype.protocols {
+            match self.resolve_type_link(environment.clone(), link, span)? {
+                VmValue::Protocol(protocol) => {
+                    protocols.insert(protocol.type_id.clone());
+                }
+                value => {
+                    return Err(error(
+                        span,
+                        format!("“{link}”为{}，不可作协议", value.type_name()),
+                    ));
+                }
+            }
+        }
 
         let methods = prototype
             .methods
@@ -1343,12 +1651,13 @@ impl Vm {
                 let closure = Rc::new(VmClosure {
                     prototype: Rc::new(method.clone()),
                     closure: environment.clone(),
+                    directory: directory.to_path_buf(),
                 });
                 (
                     method.name.clone(),
                     RuntimeMethod {
                         closure,
-                        owner: prototype.name.clone(),
+                        owner: prototype.type_id.clone(),
                     },
                 )
             })
@@ -1359,35 +1668,46 @@ impl Vm {
             .into_iter()
             .map(|field| {
                 let initial = field.initial_slot.map(|slot| initials[slot].clone());
+                if let Some(value) = &initial {
+                    self.ensure_type(
+                        &format!("域“{}”", field.name),
+                        Some(&field.type_ref),
+                        value,
+                        environment.clone(),
+                        span,
+                    )?;
+                }
                 if field.is_static
                     && let Some(value) = &initial
                 {
                     static_values.insert(field.name.clone(), value.clone());
                 }
-                (
+                Ok((
                     field.name.clone(),
                     RuntimeField {
                         prototype: field,
                         initial,
-                        owner: prototype.name.clone(),
+                        owner: prototype.type_id.clone(),
+                        type_environment: environment.clone(),
                     },
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<HashMap<_, _>, VmError>>()?;
         let class = Rc::new(VmClass {
-            name: prototype.name.clone(),
+            type_id: prototype.type_id.clone(),
             superclass,
-            protocols: prototype.protocols.into_iter().collect(),
+            protocols,
             fields,
             methods,
             static_values: RefCell::new(static_values),
         });
         environment.borrow_mut().values.insert(
-            prototype.name,
+            prototype.type_id.name,
             Binding {
                 value: VmValue::Class(class),
                 mutable: false,
-                type_name: Some("类".into()),
+                type_ref: Some(RuntimeType::named("类")),
+                type_environment: Some(Rc::downgrade(environment)),
             },
         );
         Ok(())
@@ -1459,7 +1779,10 @@ impl Vm {
                         directory,
                     )?;
                 } else if !arguments.is_empty() {
-                    return Err(error(span, format!("“{}”应收 0 个参数", class.name)));
+                    return Err(error(
+                        span,
+                        format!("“{}”应收 0 个参数", class.type_id.name),
+                    ));
                 }
                 Ok(VmValue::Instance(instance))
             }
@@ -1473,7 +1796,7 @@ impl Vm {
         instance: Option<Rc<RefCell<VmInstance>>>,
         arguments: Vec<VmValue>,
         span: &Span,
-        directory: &Path,
+        _directory: &Path,
     ) -> Result<VmValue, VmError> {
         if arguments.len() != closure.prototype.parameters.len() {
             return Err(error(
@@ -1486,12 +1809,13 @@ impl Vm {
                 ),
             ));
         }
+        let directory = closure.directory.clone();
         Ok(VmValue::Task(Rc::new(RefCell::new(VmTask {
             state: VmTaskState::Pending {
                 closure,
                 instance,
                 arguments,
-                directory: directory.to_path_buf(),
+                directory,
             },
         }))))
     }
@@ -1502,12 +1826,12 @@ impl Vm {
         instance: Option<Rc<RefCell<VmInstance>>>,
         arguments: Vec<VmValue>,
         span: &Span,
-        directory: &Path,
+        _directory: &Path,
     ) -> Result<VmValue, VmError> {
         self.resources
             .enter_call()
             .map_err(|message| error(span, message))?;
-        let result = self.call_closure_inner(closure, instance, arguments, span, directory);
+        let result = self.call_closure_inner(closure, instance, arguments, span, _directory);
         self.resources.leave_call();
         result
     }
@@ -1518,7 +1842,7 @@ impl Vm {
         instance: Option<Rc<RefCell<VmInstance>>>,
         arguments: Vec<VmValue>,
         span: &Span,
-        directory: &Path,
+        _directory: &Path,
     ) -> Result<VmValue, VmError> {
         if arguments.len() != closure.prototype.parameters.len() {
             return Err(error(
@@ -1538,15 +1862,17 @@ impl Vm {
                 Binding {
                     value: VmValue::Instance(instance),
                     mutable: false,
-                    type_name: None,
+                    type_ref: None,
+                    type_environment: None,
                 },
             );
         }
         for (parameter, value) in closure.prototype.parameters.iter().zip(arguments) {
-            ensure_type(
-                &parameter.name,
-                parameter.type_name.as_deref(),
+            self.ensure_type(
+                &format!("变量“{}”", parameter.name),
+                parameter.type_ref.as_ref(),
                 &value,
+                closure.closure.clone(),
                 span,
             )?;
             environment.borrow_mut().values.insert(
@@ -1554,7 +1880,8 @@ impl Vm {
                 Binding {
                     value,
                     mutable: true,
-                    type_name: parameter.type_name.clone(),
+                    type_ref: parameter.type_ref.clone(),
+                    type_environment: Some(Rc::downgrade(&closure.closure)),
                 },
             );
         }
@@ -1563,13 +1890,14 @@ impl Vm {
             environment,
             format!("法“{}”", closure.prototype.name),
             closure.prototype.span.clone(),
-            directory.to_path_buf(),
+            closure.directory.clone(),
             closure.prototype.owner_class.clone(),
         )?;
-        ensure_type(
+        self.ensure_type(
             &format!("法“{}”之归值", closure.prototype.name),
-            closure.prototype.return_type.as_deref(),
+            closure.prototype.return_type.as_ref(),
             &result,
+            closure.closure.clone(),
             span,
         )?;
         Ok(result)
@@ -1618,7 +1946,9 @@ impl Vm {
                 let method = class
                     .method(name)
                     .filter(|method| method.closure.prototype.is_static)
-                    .ok_or_else(|| error(span, format!("类“{}”无静成员“{name}”", class.name)))?;
+                    .ok_or_else(|| {
+                        error(span, format!("类“{}”无静成员“{name}”", class.type_id.name))
+                    })?;
                 self.check_access(
                     method.closure.prototype.visibility,
                     &method.owner,
@@ -1631,7 +1961,12 @@ impl Vm {
                 if !module.exports.contains(name) {
                     return Err(error(span, format!("模块“{}”未导出“{name}”", module.name)));
                 }
-                let value = module.environment.borrow().get(name);
+                let value = module
+                    .environment
+                    .borrow()
+                    .values
+                    .get(name)
+                    .map(|binding| binding.value.clone());
                 value.ok_or_else(|| error(span, format!("模块“{}”未导出“{name}”", module.name)))
             }
             VmValue::Error(value) => match name {
@@ -1655,7 +1990,7 @@ impl Vm {
         let owner = self
             .frames
             .last()
-            .and_then(|frame| frame.owner_class.as_deref())
+            .and_then(|frame| frame.owner_class.as_ref())
             .ok_or_else(|| error(span, "“父”只可用于类之法内"))?;
         let instance = environment
             .borrow()
@@ -1671,14 +2006,14 @@ impl Vm {
             .ok_or_else(|| error(span, format!("类“{owner}”没有父类")))?;
         let method = parent
             .method(name)
-            .ok_or_else(|| error(span, format!("父类“{}”无方法“{name}”", parent.name)))?;
+            .ok_or_else(|| error(span, format!("父类“{}”无方法“{name}”", parent.type_id.name)))?;
         if method.closure.prototype.is_static {
             return Err(error(
                 span,
                 format!("父类方法“{name}”乃静法，不可绑定此实例"),
             ));
         }
-        if method.closure.prototype.visibility == Visibility::Private && method.owner != owner {
+        if method.closure.prototype.visibility == Visibility::Private && &method.owner != owner {
             return Err(error(span, format!("父类私法“{name}”不可由子类调用")));
         }
         Ok(VmValue::BoundMethod(method.closure.clone(), instance))
@@ -1790,9 +2125,18 @@ impl Vm {
                     if field.prototype.readonly && instance.borrow().fields.contains_key(name) {
                         return Err(error(span, format!("只读域“{name}”不可再次改写")));
                     }
-                    ensure_type(name, Some(&field.prototype.type_name), &value, span)?;
+                    self.ensure_type(
+                        &format!("域“{name}”"),
+                        Some(&field.prototype.type_ref),
+                        &value,
+                        field.type_environment.clone(),
+                        span,
+                    )?;
                 } else if class.has_instance_fields() {
-                    return Err(error(span, format!("类“{}”未声明域“{name}”", class.name)));
+                    return Err(error(
+                        span,
+                        format!("类“{}”未声明域“{name}”", class.type_id.name),
+                    ));
                 }
                 instance.borrow_mut().fields.insert(name.into(), value);
                 Ok(())
@@ -1802,7 +2146,9 @@ impl Vm {
                 let field = class
                     .field(name)
                     .filter(|field| field.prototype.is_static)
-                    .ok_or_else(|| error(span, format!("类“{}”无静域“{name}”", class.name)))?;
+                    .ok_or_else(|| {
+                        error(span, format!("类“{}”无静域“{name}”", class.type_id.name))
+                    })?;
                 self.check_access(field.prototype.visibility, &field.owner, name, span)?;
                 let storage = class
                     .static_storage(name)
@@ -1810,7 +2156,13 @@ impl Vm {
                 if field.prototype.readonly && storage.borrow().contains_key(name) {
                     return Err(error(span, format!("只读静域“{name}”不可再次改写")));
                 }
-                ensure_type(name, Some(&field.prototype.type_name), &value, span)?;
+                self.ensure_type(
+                    &format!("静域“{name}”"),
+                    Some(&field.prototype.type_ref),
+                    &value,
+                    field.type_environment.clone(),
+                    span,
+                )?;
                 storage.borrow_mut().insert(name.into(), value);
                 Ok(())
             }
@@ -1824,7 +2176,7 @@ impl Vm {
     fn check_access(
         &self,
         visibility: Visibility,
-        owner: &str,
+        owner: &TypeId,
         name: &str,
         span: &Span,
     ) -> Result<(), VmError> {
@@ -1832,7 +2184,7 @@ impl Vm {
             || self
                 .frames
                 .last()
-                .and_then(|frame| frame.owner_class.as_deref())
+                .and_then(|frame| frame.owner_class.as_ref())
                 == Some(owner)
         {
             Ok(())
@@ -3826,6 +4178,7 @@ impl Vm {
                 .and_then(|name| name.to_str())
                 .unwrap_or("无名")
                 .into(),
+            module_id: chunk.module_id.clone(),
             environment,
             exports: chunk.exports.iter().cloned().collect(),
         });
@@ -3882,6 +4235,7 @@ impl Vm {
             .to_owned();
         let module = Rc::new(VmModule {
             name,
+            module_id: application_module.chunk.module_id.clone(),
             environment,
             exports: application_module.chunk.exports.iter().cloned().collect(),
         });
@@ -4378,7 +4732,8 @@ impl Vm {
                 Binding {
                     value: VmValue::Number(std::f64::consts::PI),
                     mutable: false,
-                    type_name: Some("数".into()),
+                    type_ref: Some(RuntimeType::named("数")),
+                    type_environment: Some(Rc::downgrade(&environment)),
                 },
             );
             exports.insert("圆周率".into());
@@ -4389,6 +4744,7 @@ impl Vm {
         }
         Ok(Rc::new(VmModule {
             name: format!("标准:{name}"),
+            module_id: ModuleId::standard(name),
             environment,
             exports,
         }))
@@ -4406,7 +4762,8 @@ impl Vm {
             Binding {
                 value: VmValue::Native(Rc::new(VmNative { name, arity, kind })),
                 mutable: false,
-                type_name: Some("法".into()),
+                type_ref: Some(RuntimeType::named("法")),
+                type_environment: Some(Rc::downgrade(environment)),
             },
         );
     }
@@ -4721,132 +5078,6 @@ fn map_insert(map: &mut VmMap, key: VmValue, value: VmValue, span: &Span) -> Res
         map.entries.push((key, value));
     }
     Ok(())
-}
-
-fn ensure_type(
-    name: &str,
-    expected: Option<&str>,
-    value: &VmValue,
-    span: &Span,
-) -> Result<(), VmError> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    if vm_value_matches_type(value, expected) {
-        Ok(())
-    } else {
-        Err(error(
-            span,
-            format!("变量“{name}”注为{expected}，不可纳入{}", value.type_name()),
-        ))
-    }
-}
-
-fn vm_value_matches_type(value: &VmValue, expected: &str) -> bool {
-    let expected = expected.trim();
-    let union = split_type_level(expected, '|');
-    if union.len() > 1 {
-        return union
-            .into_iter()
-            .any(|candidate| vm_value_matches_type(value, candidate));
-    }
-    if let Some(inner) = expected.strip_suffix('?') {
-        return matches!(value, VmValue::Nil) || vm_value_matches_type(value, inner);
-    }
-    if let Some((base, arguments)) = generic_type(expected) {
-        let arguments = split_type_level(arguments, '，');
-        return match (base, value) {
-            ("列", VmValue::List(items)) if arguments.len() == 1 => items
-                .borrow()
-                .iter()
-                .all(|item| vm_value_matches_type(item, arguments[0])),
-            ("典", VmValue::Map(map)) if arguments.len() == 2 => {
-                map.borrow().entries.iter().all(|(key, item)| {
-                    vm_value_matches_type(key, arguments[0])
-                        && vm_value_matches_type(item, arguments[1])
-                })
-            }
-            ("元", VmValue::Tuple(items)) if arguments.len() == items.len() => items
-                .iter()
-                .zip(arguments)
-                .all(|(item, expected)| vm_value_matches_type(item, expected)),
-            ("遍器", VmValue::Iterator(_)) if arguments.len() == 1 => true,
-            ("任务", VmValue::Task(_)) if arguments.len() == 1 => true,
-            ("套接字", VmValue::Socket(_)) if arguments.is_empty() => true,
-            _ => false,
-        };
-    }
-    if expected.starts_with("法（") {
-        return matches!(
-            value,
-            VmValue::Closure(_)
-                | VmValue::BoundMethod(_, _)
-                | VmValue::Native(_)
-                | VmValue::Class(_)
-        );
-    }
-    match expected {
-        "任意" => true,
-        "数" => matches!(value, VmValue::Number(_)),
-        "文" => matches!(value, VmValue::String(_)),
-        "字节串" => matches!(value, VmValue::Bytes(_)),
-        "理" => matches!(value, VmValue::Bool(_)),
-        "空" => matches!(value, VmValue::Nil),
-        "法" => matches!(
-            value,
-            VmValue::Closure(_)
-                | VmValue::BoundMethod(_, _)
-                | VmValue::Native(_)
-                | VmValue::Class(_)
-        ),
-        "类" => matches!(value, VmValue::Class(_)),
-        "协" => matches!(value, VmValue::Protocol(_)),
-        "模块" => matches!(value, VmValue::Module(_)),
-        "对象" => matches!(value, VmValue::Instance(_)),
-        "列" => matches!(value, VmValue::List(_)),
-        "元" => matches!(value, VmValue::Tuple(_)),
-        "典" => matches!(value, VmValue::Map(_)),
-        "遍器" => matches!(value, VmValue::Iterator(_)),
-        "误" => matches!(value, VmValue::Error(_)),
-        "任务" => matches!(value, VmValue::Task(_)),
-        "套接字" => matches!(value, VmValue::Socket(_)),
-        "原生模块" => matches!(value, VmValue::NativeModuleV2(_)),
-        "原生资源" => matches!(value, VmValue::NativeResource(_)),
-        class_name => matches!(value, VmValue::Instance(instance)
-            if instance.borrow().class.is_a(class_name)),
-    }
-}
-
-fn generic_type(expected: &str) -> Option<(&str, &str)> {
-    let opening = expected.find('<')?;
-    expected.ends_with('>').then(|| {
-        (
-            &expected[..opening],
-            &expected[opening + 1..expected.len() - 1],
-        )
-    })
-}
-
-fn split_type_level(input: &str, separator: char) -> Vec<&str> {
-    let mut angle_depth = 0usize;
-    let mut paren_depth = 0usize;
-    let mut start = 0usize;
-    let mut parts = Vec::new();
-    for (index, character) in input.char_indices() {
-        match character {
-            '<' => angle_depth += 1,
-            '>' => angle_depth = angle_depth.saturating_sub(1),
-            '（' | '(' => paren_depth += 1,
-            '）' | ')' => paren_depth = paren_depth.saturating_sub(1),
-            _ if character == separator && angle_depth == 0 && paren_depth == 0 => {
-                parts.push(input[start..index].trim());
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(input[start..].trim());
-    parts
 }
 
 fn deep_clone(value: &VmValue) -> VmValue {

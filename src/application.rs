@@ -4,6 +4,7 @@ use crate::bytecode::{self, Chunk, Instruction};
 use crate::package::{self, Manifest, ResolutionGraph};
 use crate::permissions::PermissionSet;
 use crate::source::{SourceFile, Span};
+use crate::type_model::ModuleId;
 use base64::Engine as _;
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
@@ -418,7 +419,8 @@ impl ApplicationCompiler {
             )
         })?;
         let mut chunk =
-            bytecode::compile(&statements).map_err(|error| application_error(error.to_string()))?;
+            bytecode::compile_with_module_id(&statements, ModuleId::archive(id.to_owned()))
+                .map_err(|error| application_error(error.to_string()))?;
         self.rewrite_chunk_imports(&mut chunk, path)?;
         compact_debug_sources(&mut chunk);
         self.visiting.remove(id);
@@ -1007,6 +1009,13 @@ pub fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationE
                 YXB_MAX_MODULE_BYTES / 1024 / 1024
             )));
         }
+        if module.chunk.module_id != ModuleId::archive(id.clone()) {
+            return Err(application_error(format!(
+                "YXB 模块 {id} 的规范模块身份不一致"
+            )));
+        }
+        bytecode::validate_format(&module.chunk)
+            .map_err(|error| application_error(error.to_string()))?;
         validate_chunk(&module.chunk, archive, &mut stats)?;
     }
     if stats.instructions > YXB_MAX_INSTRUCTIONS {
@@ -1629,7 +1638,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.join("src/模块.yx"),
-            "公 定 答：数 为 42；\n公 定 最大安全整数：数 为 9007199254740991；\n",
+            "公 定 答：数 为 42；\n公 定 最大安全整数：数 为 9007199254740991；\n公 类 项目 则 终\n",
         )
         .unwrap();
         fs::write(
@@ -1646,6 +1655,19 @@ mod tests {
         assert!(bytes.len() < serde_json::to_vec(&first).unwrap().len());
         assert_eq!(first.modules.len(), 2);
         assert_eq!(first.resources.len(), 1);
+        for (id, module) in &first.modules {
+            assert_eq!(module.chunk.module_id, ModuleId::archive(id.clone()));
+        }
+        let module = &first.modules["app:src/模块.yx"];
+        assert_eq!(
+            module.chunk.classes[0].type_id.module,
+            module.chunk.module_id
+        );
+        assert!(
+            !serde_json::to_string(module)
+                .unwrap()
+                .contains(&root.display().to_string())
+        );
         let decoded = deserialize(&bytes).unwrap();
         assert_eq!(decoded.content_checksum, first.content_checksum);
         let mut legacy = YXB_MAGIC.to_vec();
