@@ -104,8 +104,8 @@ fn api_declaration(statement: &Stmt) -> Option<Value> {
         } => Some(json!({
             "kind": "class",
             "name": name,
-            "superclass": superclass,
-            "protocols": protocols,
+            "superclass": superclass.as_ref().map(ToString::to_string),
+            "protocols": protocols.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "documentation": documentation,
             "fields": fields.iter()
                 .filter(|field| field.visibility == Visibility::Public)
@@ -310,13 +310,23 @@ fn render_declaration(output: &mut String, statement: &Stmt, context: &TypeLinks
             let conformance = if protocols.is_empty() {
                 String::new()
             } else {
-                format!(" 纳 {}", protocols.join("，"))
+                format!(
+                    " 纳 {}",
+                    protocols
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("，")
+                )
             };
             output.push_str(&format!(
                 "```yanxu\n公 类 {name}{inheritance}{conformance}\n```\n\n"
             ));
             if let Some(parent) = superclass {
-                output.push_str(&format!("父类：{}\n\n", context.render_named(parent)));
+                output.push_str(&format!(
+                    "父类：{}\n\n",
+                    context.render_named(&parent.to_string())
+                ));
             }
             for field in fields
                 .iter()
@@ -542,7 +552,7 @@ impl TypeLinks {
 
     fn render(&self, kind: &TypeKind) -> String {
         match kind {
-            TypeKind::Named(name) => self.render_named(name),
+            TypeKind::Named(path) => self.render_named(&path.to_string()),
             TypeKind::Union(types) => types
                 .iter()
                 .map(|ty| self.render(ty))
@@ -551,7 +561,7 @@ impl TypeLinks {
             TypeKind::Nullable(ty) => format!("{} `?`", self.render(ty)),
             TypeKind::Generic { base, arguments } => format!(
                 "{}`<`{} `>`",
-                self.render_named(base),
+                self.render_named(&base.to_string()),
                 arguments
                     .iter()
                     .map(|argument| self.render(argument))

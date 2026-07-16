@@ -103,7 +103,10 @@ impl Resolver {
                 methods,
                 ..
             } => {
-                if superclass.as_ref() == Some(name) {
+                if superclass
+                    .as_ref()
+                    .is_some_and(|superclass| superclass.is_single(name))
+                {
                     return Err(self.error("类不可承自身", statement.span.clone()));
                 }
                 let mut member_names = HashSet::new();

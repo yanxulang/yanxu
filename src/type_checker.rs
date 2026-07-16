@@ -65,24 +65,30 @@ impl TypeSet {
 
     fn from_kind(kind: &TypeKind) -> Self {
         match kind {
-            TypeKind::Named(name) => Self::named(name),
+            TypeKind::Named(path) => Self::named(path.to_string()),
             TypeKind::Union(types) => {
                 Self::union(types.iter().map(Self::from_kind).collect::<Vec<_>>())
             }
             TypeKind::Nullable(ty) => Self::union(vec![Self::from_kind(ty), Self::named("空")]),
-            TypeKind::Generic { base, arguments } if base == "列" && arguments.len() == 1 => {
+            TypeKind::Generic { base, arguments }
+                if base.is_single("列") && arguments.len() == 1 =>
+            {
                 Self::single(StaticType::List(Box::new(Self::from_kind(&arguments[0]))))
             }
-            TypeKind::Generic { base, arguments } if base == "典" && arguments.len() == 2 => {
+            TypeKind::Generic { base, arguments }
+                if base.is_single("典") && arguments.len() == 2 =>
+            {
                 Self::single(StaticType::Map(
                     Box::new(Self::from_kind(&arguments[0])),
                     Box::new(Self::from_kind(&arguments[1])),
                 ))
             }
-            TypeKind::Generic { base, arguments } if base == "任务" && arguments.len() == 1 => {
+            TypeKind::Generic { base, arguments }
+                if base.is_single("任务") && arguments.len() == 1 =>
+            {
                 Self::single(StaticType::Task(Box::new(Self::from_kind(&arguments[0]))))
             }
-            TypeKind::Generic { base, arguments } if base == "元" => Self::single(
+            TypeKind::Generic { base, arguments } if base.is_single("元") => Self::single(
                 StaticType::Tuple(arguments.iter().map(Self::from_kind).collect()),
             ),
             TypeKind::Generic { base, arguments } => Self::named(format!(
@@ -441,10 +447,13 @@ impl Checker {
             {
                 self.classes
                     .insert(name.clone(), object_shape(name, fields, methods));
-                self.class_protocols
-                    .insert(name.clone(), protocols.iter().cloned().collect());
+                self.class_protocols.insert(
+                    name.clone(),
+                    protocols.iter().map(ToString::to_string).collect(),
+                );
                 if let Some(superclass) = superclass {
-                    self.class_parents.insert(name.clone(), superclass.clone());
+                    self.class_parents
+                        .insert(name.clone(), superclass.to_string());
                 }
             }
         }
@@ -628,7 +637,7 @@ impl Checker {
             } => {
                 if let Some(superclass) = superclass
                     && !scope
-                        .get(superclass)
+                        .get(&superclass.to_string())
                         .is_some_and(|item| item.ty.contains("类"))
                 {
                     self.error(
@@ -660,9 +669,13 @@ impl Checker {
                 }
                 self.current_class = previous_class;
                 if let Some(superclass) = superclass {
-                    self.verify_overrides(name, superclass, &statement.span);
+                    self.verify_overrides(name, &superclass.to_string(), &statement.span);
                 }
-                self.verify_protocols(name, protocols, &statement.span);
+                let protocols = protocols
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                self.verify_protocols(name, &protocols, &statement.span);
             }
             StmtKind::Protocol { .. } => {}
             StmtKind::Import { .. } => {}

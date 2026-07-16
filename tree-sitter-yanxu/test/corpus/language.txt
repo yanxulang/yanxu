@@ -18,11 +18,13 @@
       (type_annotation
         (type
           (named_type
-            (identifier)))))
+            (type_path
+              (identifier))))))
     (type_annotation
       (type
         (named_type
-          (identifier))))
+          (type_path
+            (identifier)))))
     (return_statement
       (expression
         (binary_expression
@@ -35,10 +37,12 @@
     (type_annotation
       (type
         (generic_type
-          (identifier)
+          (type_path
+            (identifier))
           (type
             (named_type
-              (identifier))))))
+              (type_path
+                (identifier)))))))
     (expression
       (call_expression
         (expression
@@ -75,16 +79,19 @@
       (type_annotation
         (type
           (named_type
-            (identifier)))))
+            (type_path
+              (identifier))))))
     (protocol_method
       (identifier)
       (type_annotation
         (type
           (named_type
-            (identifier))))))
+            (type_path
+              (identifier)))))))
   (class_declaration
     (identifier)
-    (identifier)
+    (type_path
+      (identifier))
     (class_member
       (field_declaration
         (member_modifiers)
@@ -92,7 +99,8 @@
         (type_annotation
           (type
             (named_type
-              (identifier))))))
+              (type_path
+                (identifier)))))))
     (class_member
       (method_declaration
         (identifier)
@@ -101,7 +109,8 @@
           (type_annotation
             (type
               (named_type
-                (identifier)))))
+                (type_path
+                  (identifier))))))
         (assignment
           (expression
             (member_expression
@@ -115,7 +124,8 @@
         (type_annotation
           (type
             (named_type
-              (identifier))))
+              (type_path
+                (identifier)))))
         (return_statement
           (expression
             (member_expression
@@ -141,10 +151,12 @@
     (type_annotation
       (type
         (generic_type
-          (identifier)
+          (type_path
+            (identifier))
           (type
             (named_type
-              (identifier))))))
+              (type_path
+                (identifier)))))))
     (expression
       (list
         (expression
@@ -185,14 +197,16 @@
 (source_file
   (class_declaration
     (identifier)
-    (identifier)
+    (type_path
+      (identifier))
     (class_member
       (method_declaration
         (identifier)
         (type_annotation
           (type
             (named_type
-              (identifier))))
+              (type_path
+                (identifier)))))
         (return_statement
           (expression
             (binary_expression
@@ -208,7 +222,8 @@
     (type_annotation
       (type
         (named_type
-          (identifier))))
+          (type_path
+            (identifier)))))
     (expression
       (call_expression
         (expression
@@ -221,8 +236,83 @@
         (type
           (union_type
             (named_type
-              (identifier))
+              (type_path
+                (identifier)))
             (named_type)))))
+    (print_statement
+      (expression
+        (identifier)))))
+
+==================
+限定类型与公开重导出
+==================
+
+公 引「base.yx」为 基础；
+公 类 按钮 承 基础.视图 纳 基础.可描述，协议库.可点击 则
+    公 域 内容：列<基础.视图|基础.窗口?>；
+终
+定 根：基础.视图 为 按钮（）；
+若 根 是 基础.按钮 则 言 根；终
+
+---
+
+(source_file
+  (public_import_statement
+    (string)
+    (identifier))
+  (class_declaration
+    (identifier)
+    (type_path
+      (identifier)
+      (identifier))
+    (type_path
+      (identifier)
+      (identifier))
+    (type_path
+      (identifier)
+      (identifier))
+    (class_member
+      (field_declaration
+        (member_modifiers)
+        (identifier)
+        (type_annotation
+          (type
+            (generic_type
+              (type_path
+                (identifier))
+              (type
+                (union_type
+                  (named_type
+                    (type_path
+                      (identifier)
+                      (identifier)))
+                  (nullable_type
+                    (named_type
+                      (type_path
+                        (identifier)
+                        (identifier))))))))))))
+  (declaration
+    (identifier)
+    (type_annotation
+      (type
+        (named_type
+          (type_path
+            (identifier)
+            (identifier)))))
+    (expression
+      (call_expression
+        (expression
+          (identifier)))))
+  (if_statement
+    (expression
+      (type_test_expression
+        (expression
+          (identifier))
+        (type
+          (named_type
+            (type_path
+              (identifier)
+              (identifier))))))
     (print_statement
       (expression
         (identifier)))))

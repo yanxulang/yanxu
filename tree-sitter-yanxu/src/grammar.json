@@ -6,8 +6,17 @@
     "source_file": {
       "type": "REPEAT",
       "content": {
-        "type": "SYMBOL",
-        "name": "_statement"
+        "type": "CHOICE",
+        "members": [
+          {
+            "type": "SYMBOL",
+            "name": "_statement"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "public_import_statement"
+          }
+        ]
       }
     },
     "comment": {
@@ -264,6 +273,44 @@
         }
       ]
     },
+    "public_import_statement": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "公"
+        },
+        {
+          "type": "STRING",
+          "value": "引"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "string"
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "为"
+            },
+            {
+              "type": "STRING",
+              "value": "作"
+            }
+          ]
+        },
+        {
+          "type": "SYMBOL",
+          "name": "identifier"
+        },
+        {
+          "type": "STRING",
+          "value": "；"
+        }
+      ]
+    },
     "function_declaration": {
       "type": "SEQ",
       "members": [
@@ -445,7 +492,7 @@
                   "name": "superclass",
                   "content": {
                     "type": "SYMBOL",
-                    "name": "identifier"
+                    "name": "type_path"
                   }
                 }
               ]
@@ -473,7 +520,7 @@
                       "name": "protocol",
                       "content": {
                         "type": "SYMBOL",
-                        "name": "identifier"
+                        "name": "type_path"
                       }
                     },
                     {
@@ -499,7 +546,7 @@
                             "name": "protocol",
                             "content": {
                               "type": "SYMBOL",
-                              "name": "identifier"
+                              "name": "type_path"
                             }
                           }
                         ]
@@ -1232,7 +1279,7 @@
         "members": [
           {
             "type": "SYMBOL",
-            "name": "identifier"
+            "name": "type_path"
           },
           {
             "type": "STRING",
@@ -1355,7 +1402,7 @@
       "members": [
         {
           "type": "SYMBOL",
-          "name": "identifier"
+          "name": "type_path"
         },
         {
           "type": "STRING",
@@ -1370,6 +1417,35 @@
           "value": "空"
         }
       ]
+    },
+    "type_path": {
+      "type": "PREC_RIGHT",
+      "value": 10,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "SYMBOL",
+            "name": "identifier"
+          },
+          {
+            "type": "REPEAT",
+            "content": {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "."
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "identifier"
+                }
+              ]
+            }
+          }
+        ]
+      }
     },
     "expression": {
       "type": "CHOICE",

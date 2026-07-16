@@ -1,5 +1,5 @@
 use crate::ast::{
-    Expr, ExprKind, Literal, Parameter, Stmt, StmtKind, TypeKind, TypeRef, Visibility,
+    Expr, ExprKind, Literal, Parameter, Stmt, StmtKind, TypeKind, TypePath, TypeRef, Visibility,
 };
 use crate::source::Span;
 use crate::token::TokenKind;
@@ -1082,23 +1082,27 @@ impl Interpreter {
             } => {
                 let superclass = superclass
                     .as_ref()
-                    .map(|parent| match env.borrow().get(parent)? {
-                        Value::Class(class) => Ok(class),
-                        value => Err(RuntimeError::new(format!(
-                            "“{parent}”为{}，不可作父类",
-                            value.type_name()
-                        ))),
-                    })
+                    .map(
+                        |parent| match self.resolve_type_path(env.clone(), parent)? {
+                            Value::Class(class) => Ok(class),
+                            value => Err(RuntimeError::new(format!(
+                                "“{parent}”为{}，不可作父类",
+                                value.type_name()
+                            ))),
+                        },
+                    )
                     .transpose()?;
                 let protocol_names = protocols
                     .iter()
-                    .map(|protocol| match env.borrow().get(protocol)? {
-                        Value::Protocol(protocol) => Ok(protocol.name.clone()),
-                        value => Err(RuntimeError::new(format!(
-                            "“{protocol}”为{}，不可作为协",
-                            value.type_name()
-                        ))),
-                    })
+                    .map(
+                        |protocol| match self.resolve_type_path(env.clone(), protocol)? {
+                            Value::Protocol(protocol) => Ok(protocol.name.clone()),
+                            value => Err(RuntimeError::new(format!(
+                                "“{protocol}”为{}，不可作为协",
+                                value.type_name()
+                            ))),
+                        },
+                    )
                     .collect::<Result<HashSet<_>, _>>()?;
                 let mut method_map = HashMap::new();
                 for method in methods {
@@ -2019,6 +2023,37 @@ impl Interpreter {
                 value.type_name()
             ))),
         }
+    }
+
+    fn resolve_type_path(&self, env: EnvRef, path: &TypePath) -> Result<Value, RuntimeError> {
+        let Some(first) = path.segments.first() else {
+            return Err(RuntimeError::new("类型路径不可为空"));
+        };
+        let mut value = env.borrow().get(&first.name)?;
+        for segment in path.segments.iter().skip(1) {
+            let Value::Module(module) = value else {
+                return Err(RuntimeError::new(format!(
+                    "类型路径“{path}”的中间成员不是模块"
+                )));
+            };
+            if !module.exports.contains(&segment.name) {
+                return Err(RuntimeError::new(format!(
+                    "模块“{}”未导出“{}”（类型路径“{path}”）",
+                    module.name, segment.name
+                )));
+            }
+            value = module
+                .environment
+                .borrow()
+                .get_local(&segment.name)
+                .ok_or_else(|| {
+                    RuntimeError::new(format!(
+                        "模块“{}”未导出“{}”（类型路径“{path}”）",
+                        module.name, segment.name
+                    ))
+                })?;
+        }
+        Ok(value)
     }
 
     fn set_property(&self, object: Value, name: &str, value: Value) -> Result<(), RuntimeError> {
@@ -4732,7 +4767,7 @@ fn value_matches_type(value: &Value, expected: &TypeKind) -> bool {
         TypeKind::Function { .. } => {
             matches!(value, Value::Function(_) | Value::Native(_))
         }
-        TypeKind::Generic { base, arguments } => match (base.as_str(), value) {
+        TypeKind::Generic { base, arguments } => match (base.single_name().unwrap_or(""), value) {
             ("列", Value::List(items)) if arguments.len() == 1 => items
                 .borrow()
                 .iter()
@@ -4752,7 +4787,7 @@ fn value_matches_type(value: &Value, expected: &TypeKind) -> bool {
             ("套接字", Value::Socket(_)) if arguments.is_empty() => true,
             _ => false,
         },
-        TypeKind::Named(expected) => match expected.as_str() {
+        TypeKind::Named(expected) => match expected.single_name().unwrap_or("") {
             "任意" => true,
             "数" => matches!(value, Value::Number(_)),
             "文" => matches!(value, Value::String(_)),

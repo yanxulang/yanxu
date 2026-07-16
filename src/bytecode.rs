@@ -456,8 +456,8 @@ impl Compiler {
                 let index = self.chunk.classes.len();
                 self.chunk.classes.push(ClassPrototype {
                     name: name.clone(),
-                    superclass: superclass.clone(),
-                    protocols: protocols.clone(),
+                    superclass: superclass.as_ref().map(ToString::to_string),
+                    protocols: protocols.iter().map(ToString::to_string).collect(),
                     fields: field_prototypes,
                     methods: method_prototypes,
                 });
