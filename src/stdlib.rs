@@ -2578,6 +2578,7 @@ fn network_error_from_ureq(error: ureq::Error) -> NetworkError {
         {
             "NET_WRITE"
         }
+        ureq::Error::Io(io_error) if io_error.kind() == ErrorKind::InvalidData => "NET_TLS",
         ureq::Error::Io(_) => "NET_READ",
         _ => "NET_PROTOCOL",
     };
