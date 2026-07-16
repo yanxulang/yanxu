@@ -1627,10 +1627,14 @@ mod tests {
             "[包]\n格式=2\n名称='应用'\n版本='0.1.0'\n言序='>=1.1.5'\n入口='src/主.yx'\n[导出]\n默认='src/主.yx'\n[资源]\n目录=['assets']\n",
         )
         .unwrap();
-        fs::write(root.join("src/模块.yx"), "公 定 答：数 为 42；\n").unwrap();
+        fs::write(
+            root.join("src/模块.yx"),
+            "公 定 答：数 为 42；\n公 定 最大安全整数：数 为 9007199254740991；\n",
+        )
+        .unwrap();
         fs::write(
             root.join("src/主.yx"),
-            "引「模块.yx」为 模块；引「标准:资源」为 资源；\n言 模块.答；言 长度（资源.读取字节（「assets/图.bin」））；言 资源.目录（「assets」）；\n",
+            "引「模块.yx」为 模块；引「标准:资源」为 资源；\n言 模块.答；言 模块.最大安全整数；言 长度（资源.读取字节（「assets/图.bin」））；言 资源.目录（「assets」）；\n",
         )
         .unwrap();
         fs::write(root.join("assets/图.bin"), [0, 255, 128]).unwrap();
@@ -1653,7 +1657,10 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
         let mut vm = crate::vm::Vm::silent();
         vm.execute_application(&decoded).unwrap();
-        assert_eq!(vm.take_output(), vec!["42", "3", "【图.bin】"]);
+        assert_eq!(
+            vm.take_output(),
+            vec!["42", "9007199254740991", "3", "【图.bin】"]
+        );
         let mut tampered = decoded;
         tampered.package.name = "篡改".into();
         assert!(serialize(&tampered).is_err());
@@ -1680,6 +1687,9 @@ mod tests {
             .insert("yanxu-gui".into(), module.clone());
         archive.content_checksum = archive_checksum(&archive).unwrap();
         assert_eq!(decode_native_modules(&archive).unwrap().len(), 1);
+        let serialized = serialize(&archive).unwrap();
+        let decoded = deserialize(&serialized).unwrap();
+        assert_eq!(decoded.native_modules, archive.native_modules);
 
         let mut tampered = archive.clone();
         let mut altered_bytes = bytes.to_vec();
