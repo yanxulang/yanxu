@@ -3,12 +3,16 @@
 //! 服务以 UTF-16 LSP 坐标对外，语义功能共享 [`crate::semantic::SemanticIndex`]，
 //! 包括补全、定义、引用、重命名、悬停和文档符号。
 
+use crate::ast::{Stmt, StmtKind, TypePath, Visibility};
 use crate::semantic::{SemanticIndex, Symbol, SymbolKind};
 use crate::source::{SourceFile, Span};
 use crate::token::TokenKind;
+use crate::type_model::{ModuleId, TypeDeclarationKind, TypeId};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 const KEYWORDS: &[&str] = &[
     "令", "定", "置", "为", "言", "若", "则", "否则", "终", "当", "逐", "于", "异", "候", "法",
@@ -167,7 +171,8 @@ fn semantic_response(method: &str, uri: &str, source: &str, request: &Value) -> 
             line,
             column,
         ),
-        "textDocument/definition" => definition(&index, uri, source, line, column),
+        "textDocument/definition" => qualified_definition(uri, source, line, column)
+            .unwrap_or_else(|| definition(&index, uri, source, line, column)),
         "textDocument/references" => references(
             &index,
             uri,
@@ -179,9 +184,22 @@ fn semantic_response(method: &str, uri: &str, source: &str, request: &Value) -> 
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
         ),
-        "textDocument/prepareRename" => prepare_rename(&index, source, line, column),
-        "textDocument/rename" => rename(&index, uri, source, line, column, request),
-        "textDocument/hover" => hover(&index, source, line, column),
+        "textDocument/prepareRename" => {
+            if qualified_external_symbol(uri, source, line, column) {
+                Value::Null
+            } else {
+                prepare_rename(&index, source, line, column)
+            }
+        }
+        "textDocument/rename" => {
+            if qualified_external_symbol(uri, source, line, column) {
+                Value::Null
+            } else {
+                rename(&index, uri, source, line, column, request)
+            }
+        }
+        "textDocument/hover" => qualified_hover(uri, source, line, column)
+            .unwrap_or_else(|| hover(&index, source, line, column)),
         "textDocument/documentSymbol" => document_symbols(&index, source),
         _ => Value::Null,
     }
@@ -196,6 +214,7 @@ fn with_package_completions(
 ) -> Value {
     if let Some(items) = completion["items"].as_array_mut() {
         items.extend(package_completion_items(uri, source, line, column));
+        items.extend(qualified_module_completion_items(uri, source, line, column));
         items.extend(package_member_completion_items(uri, source, line, column));
     }
     completion
@@ -395,6 +414,507 @@ fn package_completion_items(uri: &str, source: &str, line: usize, column: usize)
 
 fn uri_file_path(uri: &str) -> Option<std::path::PathBuf> {
     url::Url::parse(uri).ok()?.to_file_path().ok()
+}
+
+struct LspModuleGraph {
+    root: ModuleId,
+    modules: BTreeMap<ModuleId, LspModule>,
+}
+
+struct LspModule {
+    uri: String,
+    source: String,
+    imports: BTreeMap<String, ModuleId>,
+    exports: BTreeMap<String, LspExport>,
+    local_types: BTreeMap<String, TypeId>,
+}
+
+struct LspExport {
+    symbol: Symbol,
+    statement: Stmt,
+    module_id: ModuleId,
+    type_id: Option<TypeId>,
+    target_module: Option<ModuleId>,
+}
+
+struct QualifiedSelection {
+    segments: Vec<String>,
+    selected: usize,
+    span: Span,
+}
+
+impl LspModuleGraph {
+    fn build(uri: &str, source: &str) -> Result<Self, String> {
+        let path = uri_file_path(uri).ok_or_else(|| "文档 URI 不是文件".to_owned())?;
+        let canonical = fs::canonicalize(&path).unwrap_or(path);
+        let root = ModuleId::for_path(&canonical);
+        let mut graph = Self {
+            root: root.clone(),
+            modules: BTreeMap::new(),
+        };
+        let directory = canonical
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        graph.load_module(root, canonical, source.to_owned(), &directory)?;
+        Ok(graph)
+    }
+
+    fn load_module(
+        &mut self,
+        module_id: ModuleId,
+        path: PathBuf,
+        source: String,
+        directory: &Path,
+    ) -> Result<(), String> {
+        if self.modules.contains_key(&module_id) {
+            return Ok(());
+        }
+        let parsed_source = lsp_parseable_source(&source);
+        let source_name = path.display().to_string();
+        let statements = crate::parse_named(&parsed_source, source_name.clone())
+            .map_err(|error| error.to_string())?;
+        let semantic = SemanticIndex::build(&parsed_source, &source_name)
+            .map_err(|errors| format!("语义索引失败：{errors:?}"))?;
+        let imports = statements
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                StmtKind::Import { path, alias } => Some((
+                    path.clone(),
+                    alias.clone(),
+                    statement.public,
+                    statement.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut exports = BTreeMap::new();
+        let mut local_types = BTreeMap::new();
+        for statement in &statements {
+            let (name, kind, declaration_kind) = match &statement.kind {
+                StmtKind::Let { name, mutable, .. } => (
+                    name,
+                    if *mutable {
+                        SymbolKind::Variable
+                    } else {
+                        SymbolKind::Constant
+                    },
+                    None,
+                ),
+                StmtKind::Function { name, .. } => (name, SymbolKind::Function, None),
+                StmtKind::Class { name, .. } => {
+                    (name, SymbolKind::Class, Some(TypeDeclarationKind::Class))
+                }
+                StmtKind::Protocol { name, .. } => (
+                    name,
+                    SymbolKind::Protocol,
+                    Some(TypeDeclarationKind::Protocol),
+                ),
+                _ => continue,
+            };
+            let type_id =
+                declaration_kind.map(|kind| TypeId::new(module_id.clone(), name.clone(), kind));
+            if let Some(type_id) = &type_id {
+                local_types.insert(name.clone(), type_id.clone());
+            }
+            if statement.public
+                && let Some(symbol) = top_level_symbol(&semantic, name, kind)
+            {
+                exports.insert(
+                    name.clone(),
+                    LspExport {
+                        symbol: symbol.clone(),
+                        statement: statement.clone(),
+                        module_id: module_id.clone(),
+                        type_id,
+                        target_module: None,
+                    },
+                );
+            }
+        }
+        let uri = url::Url::from_file_path(&path)
+            .map_err(|_| format!("不能把模块路径转换为 URI：{}", path.display()))?
+            .to_string();
+        self.modules.insert(
+            module_id.clone(),
+            LspModule {
+                uri,
+                source,
+                imports: BTreeMap::new(),
+                exports,
+                local_types,
+            },
+        );
+        for (requested, alias, public, statement) in imports {
+            let target = self.load_import(&requested, directory)?;
+            let module = self
+                .modules
+                .get_mut(&module_id)
+                .expect("module inserted before imports are linked");
+            module.imports.insert(alias.clone(), target.clone());
+            if public && let Some(symbol) = top_level_symbol(&semantic, &alias, SymbolKind::Module)
+            {
+                module.exports.insert(
+                    alias,
+                    LspExport {
+                        symbol: symbol.clone(),
+                        statement,
+                        module_id: module_id.clone(),
+                        type_id: None,
+                        target_module: Some(target),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn load_import(&mut self, requested: &str, directory: &Path) -> Result<ModuleId, String> {
+        if let Some(name) = requested.strip_prefix("标准:") {
+            return Ok(ModuleId::standard(name));
+        }
+        let path = if let Some(name) = requested.strip_prefix("包:") {
+            crate::package::resolve_dependency_scoped(None, directory, name)
+                .map_err(|error| error.to_string())?
+                .entry
+        } else {
+            let requested = Path::new(requested);
+            if requested.is_absolute() {
+                requested.to_path_buf()
+            } else {
+                directory.join(requested)
+            }
+        };
+        let canonical = fs::canonicalize(&path)
+            .map_err(|error| format!("不能读取 LSP 模块“{}”：{error}", path.display()))?;
+        let module_id = ModuleId::for_path(&canonical);
+        if self.modules.contains_key(&module_id) {
+            return Ok(module_id);
+        }
+        let source = fs::read_to_string(&canonical)
+            .map_err(|error| format!("不能读取 LSP 模块“{}”：{error}", canonical.display()))?;
+        let child_directory = canonical.parent().unwrap_or(directory).to_path_buf();
+        self.load_module(module_id.clone(), canonical, source, &child_directory)?;
+        Ok(module_id)
+    }
+
+    fn resolve_module(&self, segments: &[String]) -> Option<&LspModule> {
+        let root = self.modules.get(&self.root)?;
+        let (alias, rest) = segments.split_first()?;
+        let mut module_id = root.imports.get(alias)?;
+        for segment in rest {
+            let module = self.modules.get(module_id)?;
+            module_id = module.exports.get(segment)?.target_module.as_ref()?;
+        }
+        self.modules.get(module_id)
+    }
+
+    fn resolve_export(&self, segments: &[String]) -> Option<&LspExport> {
+        let (last, modules) = segments.split_last()?;
+        let module = self.resolve_module(modules)?;
+        module.exports.get(last)
+    }
+
+    fn resolve_type(&self, module_id: &ModuleId, path: &TypePath) -> Option<TypeId> {
+        let names = path.names().map(str::to_owned).collect::<Vec<_>>();
+        let module = self.modules.get(module_id)?;
+        match names.as_slice() {
+            [name] => module.local_types.get(name).cloned(),
+            [alias, rest @ ..] => {
+                let mut target = module.imports.get(alias)?;
+                for segment in &rest[..rest.len().saturating_sub(1)] {
+                    let module = self.modules.get(target)?;
+                    target = module.exports.get(segment)?.target_module.as_ref()?;
+                }
+                let module = self.modules.get(target)?;
+                module.exports.get(rest.last()?)?.type_id.clone()
+            }
+            [] => None,
+        }
+    }
+}
+
+fn lsp_parseable_source(source: &str) -> String {
+    if crate::parse(source).is_ok() {
+        return source.to_owned();
+    }
+    if source.trim_end().ends_with('.') {
+        let mut completed = source.to_owned();
+        completed.push_str("占位；");
+        if crate::parse(&completed).is_ok() {
+            return completed;
+        }
+        if let Some((prefix, _)) = source.rsplit_once('\n') {
+            return format!("{prefix}\n");
+        }
+    }
+    source.to_owned()
+}
+
+fn top_level_symbol<'a>(
+    index: &'a SemanticIndex,
+    name: &str,
+    kind: SymbolKind,
+) -> Option<&'a Symbol> {
+    index
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.container.is_none() && symbol.name == name && symbol.kind == kind)
+}
+
+fn module_path_at_completion(
+    source: &str,
+    line: usize,
+    column: usize,
+) -> Option<(Vec<String>, bool)> {
+    let prefix = source
+        .lines()
+        .nth(line.saturating_sub(1))?
+        .chars()
+        .take(column.saturating_sub(1))
+        .collect::<String>();
+    let tokens = crate::lexer::scan(&prefix).ok()?;
+    let tokens = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Eof))
+        .collect::<Vec<_>>();
+    if !matches!(tokens.last().map(|token| &token.kind), Some(TokenKind::Dot)) {
+        return None;
+    }
+    let mut cursor = tokens.len().checked_sub(2)?;
+    let mut segments = Vec::new();
+    loop {
+        let TokenKind::Identifier(name) = &tokens.get(cursor)?.kind else {
+            return None;
+        };
+        segments.push(name.clone());
+        if cursor < 2 || !matches!(tokens[cursor - 1].kind, TokenKind::Dot) {
+            break;
+        }
+        cursor -= 2;
+    }
+    segments.reverse();
+    let type_context = tokens.get(cursor.wrapping_sub(1)).is_some_and(|token| {
+        matches!(
+            token.kind,
+            TokenKind::Colon
+                | TokenKind::Inherit
+                | TokenKind::Implements
+                | TokenKind::Is
+                | TokenKind::Less
+                | TokenKind::Pipe
+                | TokenKind::Comma
+        )
+    });
+    Some((segments, type_context))
+}
+
+fn qualified_module_completion_items(
+    uri: &str,
+    source: &str,
+    line: usize,
+    column: usize,
+) -> Vec<Value> {
+    let Some((segments, type_context)) = module_path_at_completion(source, line, column) else {
+        return Vec::new();
+    };
+    let Ok(graph) = LspModuleGraph::build(uri, source) else {
+        return Vec::new();
+    };
+    let Some(module) = graph.resolve_module(&segments) else {
+        return Vec::new();
+    };
+    module
+        .exports
+        .values()
+        .map(|export| {
+            let type_priority = matches!(export.symbol.kind, SymbolKind::Class | SymbolKind::Protocol);
+            let canonical = export.type_id.as_ref().map(TypeId::qualified_name);
+            json!({
+                "label": export.symbol.name,
+                "kind": export.symbol.kind.completion_kind(),
+                "detail": export.symbol.detail,
+                "documentation": canonical.unwrap_or_else(|| {
+                    export.symbol.documentation.clone().unwrap_or_else(|| module.uri.clone())
+                }),
+                "sortText": if type_context {
+                    format!("{}-qualified-{}", if type_priority { 0 } else { 1 }, export.symbol.name)
+                } else {
+                    format!("0-qualified-{}", export.symbol.name)
+                }
+            })
+        })
+        .collect()
+}
+
+fn qualified_path_at(
+    uri: &str,
+    source: &str,
+    line: usize,
+    column: usize,
+) -> Option<QualifiedSelection> {
+    let tokens = crate::lexer::scan_named(source, uri).ok()?;
+    let selected = tokens.iter().position(|token| {
+        matches!(token.kind, TokenKind::Identifier(_))
+            && token.span.line == line
+            && column >= token.span.column
+            && column <= token.span.end_column
+    })?;
+    let mut start = selected;
+    while start >= 2
+        && matches!(tokens[start - 1].kind, TokenKind::Dot)
+        && matches!(tokens[start - 2].kind, TokenKind::Identifier(_))
+    {
+        start -= 2;
+    }
+    let mut end = selected;
+    while end + 2 < tokens.len()
+        && matches!(tokens[end + 1].kind, TokenKind::Dot)
+        && matches!(tokens[end + 2].kind, TokenKind::Identifier(_))
+    {
+        end += 2;
+    }
+    if start == end {
+        return None;
+    }
+    let segments = (start..=end)
+        .step_by(2)
+        .map(|index| match &tokens[index].kind {
+            TokenKind::Identifier(name) => name.clone(),
+            _ => unreachable!("qualified path contains identifier positions"),
+        })
+        .collect::<Vec<_>>();
+    Some(QualifiedSelection {
+        segments,
+        selected: (selected - start) / 2,
+        span: tokens[selected].span.clone(),
+    })
+}
+
+fn qualified_definition(uri: &str, source: &str, line: usize, column: usize) -> Option<Value> {
+    let selection = qualified_path_at(uri, source, line, column)?;
+    if selection.selected == 0 {
+        return None;
+    }
+    let graph = LspModuleGraph::build(uri, source).ok()?;
+    let export = graph.resolve_export(&selection.segments[..=selection.selected])?;
+    let module = graph.modules.get(&export.module_id)?;
+    Some(json!({
+        "uri": module.uri,
+        "range": range(&export.symbol.selection, &module.source)
+    }))
+}
+
+fn qualified_external_symbol(uri: &str, source: &str, line: usize, column: usize) -> bool {
+    let Some(selection) = qualified_path_at(uri, source, line, column) else {
+        return false;
+    };
+    selection.selected > 0
+        && LspModuleGraph::build(uri, source)
+            .ok()
+            .and_then(|graph| {
+                graph
+                    .resolve_export(&selection.segments[..=selection.selected])
+                    .map(|_| ())
+            })
+            .is_some()
+}
+
+fn qualified_hover(uri: &str, source: &str, line: usize, column: usize) -> Option<Value> {
+    let selection = qualified_path_at(uri, source, line, column)?;
+    if selection.selected == 0 {
+        return None;
+    }
+    let graph = LspModuleGraph::build(uri, source).ok()?;
+    let export = graph.resolve_export(&selection.segments[..=selection.selected])?;
+    let markdown = qualified_hover_markdown(&graph, export);
+    Some(json!({
+        "contents": {"kind": "markdown", "value": markdown},
+        "range": range(&selection.span, source)
+    }))
+}
+
+fn qualified_hover_markdown(graph: &LspModuleGraph, export: &LspExport) -> String {
+    let mut markdown = format!("```yanxu\n{}\n```", export.symbol.detail);
+    if let Some(type_id) = &export.type_id {
+        markdown.push_str(&format!(
+            "\n\n- 声明种类：{}\n- 完整限定名称：`{}`\n- 所属模块：`{}`",
+            type_id.kind,
+            type_id.qualified_name(),
+            type_id.module
+        ));
+    } else if let Some(target) = &export.target_module {
+        markdown.push_str(&format!("\n\n- 声明种类：模块\n- 原始模块：`{target}`"));
+    }
+    match &export.statement.kind {
+        StmtKind::Class {
+            superclass,
+            protocols,
+            fields,
+            methods,
+            ..
+        } => {
+            if let Some(superclass) = superclass {
+                let resolved = graph
+                    .resolve_type(&export.module_id, superclass)
+                    .map_or_else(
+                        || superclass.to_string(),
+                        |type_id| type_id.qualified_name(),
+                    );
+                markdown.push_str(&format!("\n- 父类：`{resolved}`"));
+            }
+            if !protocols.is_empty() {
+                let protocols = protocols
+                    .iter()
+                    .map(|protocol| {
+                        graph.resolve_type(&export.module_id, protocol).map_or_else(
+                            || protocol.to_string(),
+                            |type_id| type_id.qualified_name(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("，");
+                markdown.push_str(&format!("\n- 协议：`{protocols}`"));
+            }
+            let members = fields
+                .iter()
+                .filter(|field| field.visibility == Visibility::Public)
+                .map(|field| format!("{}：{}", field.name, field.type_ref.name))
+                .chain(methods.iter().filter_map(|method| match &method.kind {
+                    StmtKind::Function { name, .. }
+                        if method.member_visibility == Visibility::Public =>
+                    {
+                        Some(format!("{name}（法）"))
+                    }
+                    _ => None,
+                }))
+                .collect::<Vec<_>>();
+            if !members.is_empty() {
+                markdown.push_str(&format!("\n- 公开成员：{}", members.join("，")));
+            }
+        }
+        StmtKind::Protocol {
+            fields, methods, ..
+        } => {
+            let members = fields
+                .iter()
+                .map(|field| format!("{}：{}", field.name, field.type_ref.name))
+                .chain(methods.iter().filter_map(|method| match &method.kind {
+                    StmtKind::Function { name, .. } => Some(format!("{name}（法）")),
+                    _ => None,
+                }))
+                .collect::<Vec<_>>();
+            if !members.is_empty() {
+                markdown.push_str(&format!("\n- 必需成员：{}", members.join("，")));
+            }
+        }
+        _ => {}
+    }
+    if let Some(documentation) = &export.symbol.documentation {
+        markdown.push_str("\n\n");
+        markdown.push_str(documentation);
+    }
+    markdown
 }
 
 fn completion_items(
@@ -848,6 +1368,39 @@ mod tests {
         })
     }
 
+    fn request_for(
+        uri: &str,
+        method: &str,
+        line: usize,
+        character: usize,
+        new_name: &str,
+    ) -> Value {
+        json!({
+            "method": method,
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": true},
+                "newName": new_name
+            }
+        })
+    }
+
+    fn last_position(source: &str, text: &str, inner_offset: usize) -> (usize, usize) {
+        let byte = source.rfind(text).expect("test text exists");
+        let prefix = &source[..byte];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+        let line_prefix = prefix.rsplit_once('\n').map_or(prefix, |(_, line)| line);
+        let character = line_prefix.encode_utf16().count()
+            + text
+                .chars()
+                .take(inner_offset)
+                .collect::<String>()
+                .encode_utf16()
+                .count();
+        (line, character)
+    }
+
     #[test]
     fn exposes_static_diagnostics_in_utf16_coordinates() {
         let items = diagnostics("定 😀 = 1；", "file:///bad.yx");
@@ -1038,5 +1591,212 @@ mod tests {
                 .contains("锁文件与清单不一致")
         }));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn qualified_modules_complete_hover_define_and_rename_without_name_collisions() {
+        let root = std::env::temp_dir().join(format!(
+            "yanxu-lsp-qualified-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("child.yx"), "公 定 子值：数 为 1；\n").unwrap();
+        std::fs::write(
+            root.join("base.yx"),
+            "公 引「child.yx」为 子模块；\n公 协 可描述 则 法 描述（）：文；终\n公 类 视图 纳 可描述 则 公 域 名称：文；公 法 描述（）：文 则 归 此.名称；终 终\n公 法 建立（）：视图 则 归 视图（）；终\n公 定 版本：文 为「1」；\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("controls.yx"),
+            "引「base.yx」为 基础；\n公 类 按钮 承 基础.视图 纳 基础.可描述 则 公 法 描述（）：文 则 归「按钮」；终 终\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("facade.yx"), "公 引「controls.yx」为 控件；\n").unwrap();
+        std::fs::write(root.join("a.yx"), "公 类 节点 则 终\n").unwrap();
+        std::fs::write(root.join("b.yx"), "公 类 节点 则 终\n").unwrap();
+
+        let main_path = root.join("main.yx");
+        let main_uri = url::Url::from_file_path(&main_path).unwrap().to_string();
+        let canonical_uri = |path: PathBuf| {
+            url::Url::from_file_path(std::fs::canonicalize(path).unwrap())
+                .unwrap()
+                .to_string()
+        };
+        let completion_source = "引「base.yx」为 基础；\n基础.";
+        std::fs::write(&main_path, completion_source).unwrap();
+        let completion = semantic_response(
+            "textDocument/completion",
+            &main_uri,
+            completion_source,
+            &request_for(
+                &main_uri,
+                "textDocument/completion",
+                1,
+                "基础.".encode_utf16().count(),
+                "未用",
+            ),
+        );
+        let items = completion["items"].as_array().unwrap();
+        for (name, kind) in [
+            ("视图", 7),
+            ("可描述", 8),
+            ("子模块", 9),
+            ("建立", 3),
+            ("版本", 21),
+        ] {
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item["label"] == name && item["kind"] == kind),
+                "缺少 {name}：{completion}"
+            );
+        }
+
+        let type_completion_source = "引「base.yx」为 基础；\n定 值：基础.";
+        std::fs::write(&main_path, type_completion_source).unwrap();
+        let type_completion = semantic_response(
+            "textDocument/completion",
+            &main_uri,
+            type_completion_source,
+            &request_for(
+                &main_uri,
+                "textDocument/completion",
+                1,
+                "定 值：基础.".encode_utf16().count(),
+                "未用",
+            ),
+        );
+        let type_items = type_completion["items"].as_array().unwrap();
+        let view = type_items
+            .iter()
+            .find(|item| item["label"] == "视图")
+            .unwrap();
+        let function = type_items
+            .iter()
+            .find(|item| item["label"] == "建立")
+            .unwrap();
+        assert!(
+            view["sortText"]
+                .as_str()
+                .unwrap()
+                .starts_with("0-qualified")
+        );
+        assert!(
+            function["sortText"]
+                .as_str()
+                .unwrap()
+                .starts_with("1-qualified")
+        );
+
+        let semantic_source = "引「base.yx」为 基础；\n定 根：基础.视图 为 基础.视图（）；\n";
+        std::fs::write(&main_path, semantic_source).unwrap();
+        let (line, character) = last_position(semantic_source, "基础.视图", 3);
+        let definition = semantic_response(
+            "textDocument/definition",
+            &main_uri,
+            semantic_source,
+            &request_for(
+                &main_uri,
+                "textDocument/definition",
+                line,
+                character,
+                "未用",
+            ),
+        );
+        assert_eq!(definition["uri"], canonical_uri(root.join("base.yx")));
+        assert_eq!(definition["range"]["start"]["line"], 2);
+        let hover = semantic_response(
+            "textDocument/hover",
+            &main_uri,
+            semantic_source,
+            &request_for(&main_uri, "textDocument/hover", line, character, "未用"),
+        );
+        let hover_text = hover["contents"]["value"].as_str().unwrap();
+        assert!(hover_text.contains("完整限定名称"), "{hover_text}");
+        assert!(hover_text.contains("可描述"), "{hover_text}");
+        assert!(hover_text.contains("公开成员"), "{hover_text}");
+        let rejected = semantic_response(
+            "textDocument/rename",
+            &main_uri,
+            semantic_source,
+            &request_for(&main_uri, "textDocument/rename", line, character, "新视图"),
+        );
+        assert!(rejected.is_null());
+
+        let alias_character = last_position(semantic_source, "基础.视图", 0);
+        let renamed = semantic_response(
+            "textDocument/rename",
+            &main_uri,
+            semantic_source,
+            &request_for(
+                &main_uri,
+                "textDocument/rename",
+                alias_character.0,
+                alias_character.1,
+                "核心",
+            ),
+        );
+        let edits = renamed["changes"][&main_uri].as_array().unwrap();
+        assert_eq!(edits.len(), 3);
+        assert!(edits.iter().all(|edit| edit["newText"] == "核心"));
+
+        let reexport_source =
+            "引「facade.yx」为 门面；\n定 值：门面.控件.按钮 为 门面.控件.按钮（）；\n";
+        std::fs::write(&main_path, reexport_source).unwrap();
+        let (line, character) = last_position(reexport_source, "门面.控件.按钮", 6);
+        let reexport_definition = semantic_response(
+            "textDocument/definition",
+            &main_uri,
+            reexport_source,
+            &request_for(
+                &main_uri,
+                "textDocument/definition",
+                line,
+                character,
+                "未用",
+            ),
+        );
+        assert_eq!(
+            reexport_definition["uri"],
+            canonical_uri(root.join("controls.yx"))
+        );
+        let reexport_hover = semantic_response(
+            "textDocument/hover",
+            &main_uri,
+            reexport_source,
+            &request_for(&main_uri, "textDocument/hover", line, character, "未用"),
+        );
+        let reexport_hover_text = reexport_hover["contents"]["value"].as_str().unwrap();
+        assert!(
+            reexport_hover_text.contains("父类"),
+            "{reexport_hover_text}"
+        );
+        assert!(
+            reexport_hover_text.contains("base.yx.视图"),
+            "{reexport_hover_text}"
+        );
+
+        let same_name_source = "引「a.yx」为 甲；引「b.yx」为 乙；\n定 左：甲.节点 为 甲.节点（）；\n定 右：乙.节点 为 乙.节点（）；\n";
+        std::fs::write(&main_path, same_name_source).unwrap();
+        for (path_text, target) in [("甲.节点", "a.yx"), ("乙.节点", "b.yx")] {
+            let (line, character) = last_position(same_name_source, path_text, 2);
+            let definition = semantic_response(
+                "textDocument/definition",
+                &main_uri,
+                same_name_source,
+                &request_for(
+                    &main_uri,
+                    "textDocument/definition",
+                    line,
+                    character,
+                    "未用",
+                ),
+            );
+            assert_eq!(definition["uri"], canonical_uri(root.join(target)));
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
