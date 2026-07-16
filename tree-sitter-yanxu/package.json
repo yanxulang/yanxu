@@ -1,6 +1,6 @@
 {
   "name": "tree-sitter-yanxu",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "description": "Tree-sitter grammar for the Yanxu programming language",
   "main": "bindings/node",
   "scripts": {
