@@ -1,7 +1,7 @@
 lock_version = 2
-manifest_checksum = "5df57daa83686c7daae1d1246924c69bb296d321ca6f636d9523089241a38c30"
+manifest_checksum = "b3d459114edb3d2a69ce596885f2a4f27fc0541a33c4e9b52235ad711c545be8"
 target = "aarch64-apple-darwin"
-generator = "1.1.10"
+generator = "1.1.11"
 
 [root_dependencies]
 "言窗" = "yanxu-gui@0.1.0#10ca5099c1ca-5e8dde8d5972e57f"

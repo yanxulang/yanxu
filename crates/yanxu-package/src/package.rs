@@ -681,7 +681,7 @@ pub fn gui_manifest_template(name: &str, gui_path: Option<&Path>) -> Result<Stri
         },
     );
     Ok(format!(
-        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.10\"\n入口 = \"src/主.yx\"\n\n[依赖]\n{dependency}\n\n[应用]\n类型 = \"图形\"\n名称 = {name:?}\n标识 = {identifier:?}\n版本 = \"0.1.0\"\n\n[应用.窗口]\n宽 = 800\n高 = 600\n最小宽 = 480\n最小高 = 320\n可缩放 = true\n高分屏 = true\n\n[权限]\n文件 = []\n网络 = []\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n图形界面 = true\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
+        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.11\"\n入口 = \"src/主.yx\"\n\n[依赖]\n{dependency}\n\n[应用]\n类型 = \"图形\"\n名称 = {name:?}\n标识 = {identifier:?}\n版本 = \"0.1.0\"\n\n[应用.窗口]\n宽 = 800\n高 = 600\n最小宽 = 480\n最小高 = 320\n可缩放 = true\n高分屏 = true\n\n[权限]\n文件 = []\n网络 = []\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n图形界面 = true\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
     ))
 }
 
@@ -1060,7 +1060,7 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         return Err(manifest_error(
             &path,
             None,
-            format!("1.1.10 仅支持“字节码”构建目标，不支持“{}”", build.target),
+            format!("1.1.11 仅支持“字节码”构建目标，不支持“{}”", build.target),
         ));
     }
 
@@ -1299,7 +1299,7 @@ fn parse_native_package(
         return Err(manifest_error(
             manifest_path,
             None,
-            format!("不支持原生扩展 ABI {abi_version}，1.1.10 支持 ABI 1、2"),
+            format!("不支持原生扩展 ABI {abi_version}，1.1.11 支持 ABI 1、2"),
         ));
     }
     let mut artifacts = BTreeMap::new();
@@ -2015,6 +2015,11 @@ fn lock_local(
     revision: Option<String>,
     requirement: Option<&VersionReq>,
 ) -> Result<ResolvedDependency, ManifestError> {
+    let root = fs::canonicalize(root)
+        .map_err(|error| manifest_error(root, None, format!("不能规范化依赖包根目录：{error}")))?;
+    if !root.is_dir() {
+        return Err(manifest_error(&root, None, "依赖包根路径不是目录"));
+    }
     let dependency_manifest = load(root.join(MANIFEST_NAME))?;
     if dependency_manifest.name != expected_name {
         return Err(manifest_error(
@@ -2038,7 +2043,7 @@ fn lock_local(
             ),
         ));
     }
-    let checksum = tree_checksum(root)?;
+    let checksum = tree_checksum(&root)?;
     Ok(ResolvedDependency {
         locked: LockedPackage {
             id: String::new(),
@@ -2054,8 +2059,8 @@ fn lock_local(
             native: None,
             minimum_yanxu: None,
         },
-        root: root.to_path_buf(),
         entry: root.join(dependency_manifest.entry),
+        root,
     })
 }
 
@@ -3293,7 +3298,7 @@ mod tests {
         let application = manifest.application.as_ref().unwrap();
         assert_eq!(
             manifest.minimum_yanxu.as_ref().unwrap().to_string(),
-            ">=1.1.10"
+            ">=1.1.11"
         );
         assert_eq!(application.kind, ApplicationKind::Graphical);
         assert_eq!(application.name, "窗口应用");
@@ -3577,6 +3582,16 @@ mod tests {
         let url = root.to_string_lossy();
         let (cache, first_revision) = resolve_git(&url, "HEAD", false).unwrap();
         assert_eq!(first_revision.len(), 40);
+        let resolved = lock_local(
+            "Git包",
+            &cache,
+            &format!("git:{url}"),
+            Some(first_revision.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.root, fs::canonicalize(&cache).unwrap());
+        assert_eq!(resolved.entry, resolved.root.join("主.yx"));
         for arguments in [vec!["branch", "channel"], vec!["tag", "v1"]] {
             let status = Command::new("git")
                 .args(arguments)

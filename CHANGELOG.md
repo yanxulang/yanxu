@@ -1,5 +1,28 @@
 # 变更记录
 
+## 1.1.11
+
+### Windows 依赖构建
+
+- 依赖图现在统一保存经过文件系统规范化的包根路径，修复 Windows 上构建含 Git 依赖的 YXB 时，模块路径带扩展长度前缀而被误判为不属于锁定依赖图的问题。
+- 同一修复覆盖 Git、注册表、供应商目录和路径依赖，并保持模块只能来自应用或锁定依赖图的既有安全边界。
+
+### 兼容与升级
+
+- 不改变语言规范 1、标准库 API、原生 ABI v1/v2、清单、锁文件、YXB 或 Bundle 格式。
+- 在 Windows 上构建含非路径依赖的项目应升级到 1.1.11；既有清单与锁文件无需迁移。
+
+### 安装
+
+macOS 与 Linux 可固定安装本版本：
+
+```sh
+curl -fsSL https://get.yanxu.dev | YANXU_VERSION=1.1.11 sh
+```
+
+Windows PowerShell 可先设置`$env:YANXU_VERSION = "1.1.11"`，再运行
+`irm https://get.yanxu.dev/windows | iex`。
+
 ## 1.1.10
 
 ### HTTP 响应边界
