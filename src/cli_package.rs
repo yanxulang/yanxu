@@ -3,12 +3,46 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
+use yanxu::budget::ExecutionBudget;
 use yanxu::interpreter::Interpreter;
 use yanxu::run_file_with;
 
 fn fail(message: impl AsRef<str>) -> ExitCode {
     eprintln!("{}", message.as_ref());
     ExitCode::from(1)
+}
+
+static MAX_STEPS_OVERRIDE: OnceLock<u64> = OnceLock::new();
+
+pub(crate) fn set_max_steps_override(max_steps: u64) {
+    let _ = MAX_STEPS_OVERRIDE.set(max_steps);
+}
+
+pub(crate) fn parse_max_steps(raw: &str) -> Result<u64, String> {
+    match raw.trim().parse::<u64>() {
+        Ok(max_steps) if max_steps > 0 => Ok(max_steps),
+        _ => Err(format!("max_steps 须为正整数，得到“{}”", raw.trim())),
+    }
+}
+
+/// 命令行 --max-steps 优先，其次 YANXU_MAX_STEPS 环境变量；都未设置时返回 None。
+pub(crate) fn configured_budget() -> Result<Option<ExecutionBudget>, String> {
+    let max_steps = match MAX_STEPS_OVERRIDE.get() {
+        Some(max_steps) => Some(*max_steps),
+        None => match env::var("YANXU_MAX_STEPS") {
+            Ok(raw) if !raw.trim().is_empty() => Some(parse_max_steps(&raw)?),
+            _ => None,
+        },
+    };
+    Ok(max_steps.map(|max_steps| {
+        let default = ExecutionBudget::default();
+        ExecutionBudget::new(
+            max_steps,
+            default.max_call_depth,
+            default.max_collection_elements,
+        )
+    }))
 }
 
 pub(crate) fn package_info(path: &str) -> ExitCode {
@@ -62,6 +96,11 @@ pub(crate) fn package_run(path: &str, arguments: &[String]) -> ExitCode {
     }
     let entry = manifest.root.join(&manifest.entry);
     let mut interpreter = Interpreter::with_permissions(manifest.permissions);
+    match configured_budget() {
+        Ok(Some(budget)) => interpreter.set_budget(budget),
+        Ok(None) => {}
+        Err(message) => return fail(message),
+    }
     interpreter.set_arguments(arguments.to_vec());
     match run_file_with(&mut interpreter, entry) {
         Ok(_) => ExitCode::SUCCESS,
@@ -252,6 +291,11 @@ pub(crate) fn run_archive(
     arguments: &[String],
 ) -> ExitCode {
     let mut vm = yanxu::vm::Vm::new();
+    match configured_budget() {
+        Ok(Some(budget)) => vm.set_budget(budget),
+        Ok(None) => {}
+        Err(message) => return fail(message),
+    }
     vm.set_arguments(arguments.to_vec());
     match vm.execute_application(archive) {
         Ok(_) => ExitCode::SUCCESS,

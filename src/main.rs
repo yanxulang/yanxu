@@ -16,7 +16,7 @@ use yanxu::interpreter::Interpreter;
 use yanxu::{parse, parse_named, repl, run_file_with};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
     if let Ok(executable) = env::current_exe() {
         if let Err(error) = yanxu::gui_bundle::verify_executable_bundle(&executable) {
             return fail(format!("Bundle 校验有误：{error}"));
@@ -26,6 +26,9 @@ fn main() -> ExitCode {
             Ok(None) => {}
             Err(error) => return fail(error.to_string()),
         }
+    }
+    if let Err(message) = extract_max_steps_flag(&mut args) {
+        return fail(message);
     }
     if args
         .first()
@@ -205,6 +208,33 @@ fn success(action: fn()) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// 从命令参数中剥离全局旗标 --max-steps（`--` 之后的程序参数不受影响）。
+fn extract_max_steps_flag(args: &mut Vec<String>) -> Result<(), String> {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--" {
+            break;
+        }
+        if let Some(raw) = args[index].strip_prefix("--max-steps=") {
+            let max_steps = cli_package::parse_max_steps(raw)?;
+            args.remove(index);
+            cli_package::set_max_steps_override(max_steps);
+            return Ok(());
+        }
+        if args[index] == "--max-steps" {
+            let Some(raw) = args.get(index + 1) else {
+                return Err("--max-steps 需要一个正整数参数".into());
+            };
+            let max_steps = cli_package::parse_max_steps(raw)?;
+            args.drain(index..index + 2);
+            cli_package::set_max_steps_override(max_steps);
+            return Ok(());
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
 fn fail(message: impl AsRef<str>) -> ExitCode {
     eprintln!("{}", message.as_ref());
     ExitCode::from(1)
@@ -212,6 +242,11 @@ fn fail(message: impl AsRef<str>) -> ExitCode {
 
 fn run_file(path: &str, arguments: &[String]) -> ExitCode {
     let mut interpreter = Interpreter::new();
+    match cli_package::configured_budget() {
+        Ok(Some(budget)) => interpreter.set_budget(budget),
+        Ok(None) => {}
+        Err(message) => return fail(message),
+    }
     interpreter.set_arguments(arguments.to_vec());
     match run_file_with(&mut interpreter, path) {
         Ok(_) => ExitCode::SUCCESS,
@@ -259,6 +294,11 @@ fn run_vm(path: &str, disassemble: bool, arguments: &[String]) -> ExitCode {
         println!("{}", chunk.disassemble());
     }
     let mut vm = yanxu::vm::Vm::new();
+    match cli_package::configured_budget() {
+        Ok(Some(budget)) => vm.set_budget(budget),
+        Ok(None) => {}
+        Err(message) => return fail(message),
+    }
     vm.set_arguments(arguments.to_vec());
     match vm.execute_in_directory(&chunk, canonical.parent().unwrap_or_else(|| Path::new("."))) {
         Ok(_) => ExitCode::SUCCESS,
@@ -709,6 +749,7 @@ fn help() {
   yanxu 基准 [轮数]       比较树解释器与 VM
   yanxu 语言服务          启动 LSP stdio 服务
 
+全局旗标 --max-steps <N>（或环境变量 YANXU_MAX_STEPS）设置单次执行/单个事件回调的步数预算，默认 1000000。
 程序参数通过 `--` 与言序命令分隔，并由 `标准:环境.参数（）` 读取。
 不带参数时进入带历史与补全的多行 REPL。"#
     );
