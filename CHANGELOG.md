@@ -1,5 +1,28 @@
 # 变更记录
 
+## 1.1.10
+
+### HTTP 响应边界
+
+- `网络.请求`和`网络.请求字节`现在会把 4xx、5xx 的状态、地址、首部与正文作为正常响应返回，不再错误标记为`NET_STATUS`。
+- HTTPS 证书格式、信任链或主机校验失败统一归入`NET_TLS`，不再混入`NET_READ`。
+
+### 兼容与升级
+
+- 这是与既有标准库文档一致的修复；调用方应根据返回典中的`状态`判定 HTTP 业务结果。
+- 不改变语言规范 1、标准库 API 签名、原生 ABI v1/v2、清单、锁文件、YXB 或 Bundle 格式。
+
+### 安装
+
+macOS 与 Linux 可固定安装本版本：
+
+```sh
+curl -fsSL https://get.yanxu.dev | YANXU_VERSION=1.1.10 sh
+```
+
+Windows PowerShell 可先设置`$env:YANXU_VERSION = "1.1.10"`，再运行
+`irm https://get.yanxu.dev/windows | iex`。
+
 ## 1.1.9
 
 ### 执行预算

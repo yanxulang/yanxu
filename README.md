@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/YanXuLang/yanxu?include_prereleases)](https://github.com/YanXuLang/yanxu/releases)
 [![License](https://img.shields.io/badge/license-MIT-c43b2f)](LICENSE)
 
-言序是一门面向现代软件工程的中文编程语言。它使用中文关键字、标识符与诊断信息，同时提供静态检查、模块与包、结构化错误、字节码虚拟机、自包含应用和可嵌入运行时。1.1.9 为命令行和常驻宿主回调补充可配置、彼此隔离的执行步数预算。
+言序是一门面向现代软件工程的中文编程语言。它使用中文关键字、标识符与诊断信息，同时提供静态检查、模块与包、结构化错误、字节码虚拟机、自包含应用和可嵌入运行时。1.1.10 修复 HTTP 非成功响应与 TLS 证书错误的结构化边界。
 
 - [官方网站](https://yanxu.dev/)
 - [语言文档](https://docs.yanxu.dev/)
