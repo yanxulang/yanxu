@@ -1,5 +1,28 @@
 # 变更记录
 
+## 1.1.12
+
+### YXB 精确往返
+
+- YXB 序列化现在启用 JSON 浮点数精确往返，修复包含 `9007199254740991` 等大整数数字常量的字节码在重新加载时因数值变化而校验失败的问题。
+- 应用归档与原生模块归档增加序列化、反序列化与执行回归，覆盖最大安全整数和 ABI v2 元数据。
+
+### 兼容与升级
+
+- 不改变语言规范 1、标准库 API、原生 ABI v1/v2、清单、锁文件、YXB 或 Bundle 格式。
+- 使用 1.1.11 构建且包含大整数数字常量的 YXB 应升级到 1.1.12 后重新构建；既有清单与锁文件无需迁移。
+
+### 安装
+
+macOS 与 Linux 可固定安装本版本：
+
+```sh
+curl -fsSL https://get.yanxu.dev | YANXU_VERSION=1.1.12 sh
+```
+
+Windows PowerShell 可先设置`$env:YANXU_VERSION = "1.1.12"`，再运行
+`irm https://get.yanxu.dev/windows | iex`。
+
 ## 1.1.11
 
 ### Windows 依赖构建

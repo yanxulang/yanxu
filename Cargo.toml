@@ -1,6 +1,6 @@
 [package]
 name = "yanxu"
-version = "1.1.11"
+version = "1.1.12"
 edition = "2024"
 description = "言序：以 Rust 编写的文言风格解释型编程语言"
 license = "MIT"
@@ -66,12 +66,12 @@ editpe = "0.2.3"
 regex = "1"
 semver = "1.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 sha2 = "0.10"
 toml = "0.8"
 tar = "0.4"
 url = "2"
-yanxu-package = { path = "crates/yanxu-package", version = "1.1.11" }
+yanxu-package = { path = "crates/yanxu-package", version = "1.1.12" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8"
