@@ -257,3 +257,127 @@ fn vm_executes_posted_v2_callbacks_only_through_the_owner_thread_event_pump() {
     packaged_vm.execute_application(&decoded).unwrap();
     assert_eq!(packaged_vm.output(), &["99", "42"]);
 }
+
+fn scaffold_native_project(tag: &str, source: &str) -> (PathBuf, PathBuf) {
+    let library = library_path();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("yanxu-native-v2-{tag}-{unique}"));
+    let dependency = root.join("dependency");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(dependency.join("src")).unwrap();
+    let staged_name = format!("backend{}", std::env::consts::DLL_SUFFIX);
+    let staged_library = dependency.join(&staged_name);
+    std::fs::copy(&library, &staged_library).unwrap();
+    let bytes = std::fs::read(&staged_library).unwrap();
+    let checksum = format!("{:x}", Sha256::digest(&bytes));
+    let (os, architecture) = if cfg!(target_os = "windows") {
+        (
+            "windows",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            },
+        )
+    } else if cfg!(target_os = "macos") {
+        (
+            "macos",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            },
+        )
+    } else {
+        (
+            "linux",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            },
+        )
+    };
+    std::fs::write(
+        dependency.join("言序.toml"),
+        format!(
+            "[包]\n格式=2\n名称='v2-example'\n版本='0.1.0'\n言序='>=1.1.7'\n入口='src/主.yx'\n[导出]\n默认='src/主.yx'\n[\"原生\"]\nABI=2\n[\"原生\".{os}.{architecture}]\n文件='{staged_name}'\n校验和='{checksum}'\n大小={}\n",
+            bytes.len()
+        ),
+    )
+    .unwrap();
+    std::fs::write(dependency.join("src/主.yx"), "公 定 ABI：数 为 2；\n").unwrap();
+    std::fs::write(
+        root.join("言序.toml"),
+        "[包]\n格式=2\n名称='v2-budget-test'\n版本='0.1.0'\n言序='>=1.1.7'\n入口='src/主.yx'\n[依赖]\n例={包='v2-example',路径='dependency',版='^0.1'}\n[权限]\n原生扩展=true\n[导出]\n默认='src/主.yx'\n",
+    )
+    .unwrap();
+    let entry = root.join("src/主.yx");
+    std::fs::write(&entry, source).unwrap();
+    (root, entry)
+}
+
+#[test]
+fn host_callback_step_budget_is_metered_per_event_not_cumulatively() {
+    // 常驻程序回归：每个回调远低于预算，但所有回调的累计步数远超预算。
+    // 预算按事件计量后必须能跑完；按全程累计则会以 RUN000 中止。
+    let source = r#"
+        引「标准:原生」为 原生；
+        定 后端 为 原生.加载（「v2-example」）；
+        法 回调（值：数）则
+            令 计 为 0；
+            当 计 小于 200 则
+                置 计 为 计 加 1；
+            终
+            言 值；
+        终
+        令 轮 为 0；
+        当 轮 小于 12 则
+            原生.调用（后端，「callback」，【回调】）；
+            置 轮 为 轮 加 1；
+        终
+    "#;
+    let (root, entry) = scaffold_native_project("budget-window", source);
+    let statements = yanxu::parse_named(source, entry.display().to_string()).unwrap();
+    let chunk = yanxu::bytecode::compile(&statements).unwrap();
+    let mut vm = yanxu::vm::Vm::silent();
+    vm.set_budget(yanxu::budget::ExecutionBudget::new(3_000, 256, 100_000));
+    vm.execute_in_directory(&chunk, entry.parent().unwrap())
+        .unwrap();
+    // 十二个回调必须全部真实执行过，防止“事件未被泵送”造成的假通过。
+    assert_eq!(vm.output(), &["99"; 12]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn runaway_host_callback_still_exhausts_step_budget() {
+    // 反向回归：单个回调内的死循环仍须被步数预算拦截。
+    let source = r#"
+        引「标准:原生」为 原生；
+        定 后端 为 原生.加载（「v2-example」）；
+        法 回调（值：数）则
+            令 计 为 0；
+            当 真 则
+                置 计 为 计 加 1；
+            终
+        终
+        原生.调用（后端，「callback」，【回调】）；
+    "#;
+    let (root, entry) = scaffold_native_project("budget-runaway", source);
+    let statements = yanxu::parse_named(source, entry.display().to_string()).unwrap();
+    let chunk = yanxu::bytecode::compile(&statements).unwrap();
+    let mut vm = yanxu::vm::Vm::silent();
+    vm.set_budget(yanxu::budget::ExecutionBudget::new(3_000, 256, 100_000));
+    let error = vm
+        .execute_in_directory(&chunk, entry.parent().unwrap())
+        .unwrap_err();
+    assert!(
+        error.message.contains("步数超过预算"),
+        "意外错误：{}",
+        error.message
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

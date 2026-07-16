@@ -3675,7 +3675,13 @@ impl Vm {
                         .map(|argument| self.host_to_vm_value(argument, &Span::synthetic()))
                         .collect::<Result<Vec<_>, _>>()?;
                     let directory = self.host_state.current_directory.borrow().clone();
-                    self.call_value(callable, arguments, &Span::synthetic(), &directory)?;
+                    // 常驻程序（GUI、服务）的每个宿主回调独立计量步数预算，
+                    // 防死循环检查仍对单次回调生效，但预算不再跨事件累计。
+                    let saved_steps = self.resources.open_step_window();
+                    let result =
+                        self.call_value(callable, arguments, &Span::synthetic(), &directory);
+                    self.resources.close_step_window(saved_steps);
+                    result?;
                 }
                 host_events::HostEvent::Timer { timer, callback } => {
                     if let Some(callback) = callback {
@@ -3683,12 +3689,15 @@ impl Vm {
                             |runtime_error| host_event_error(&Span::synthetic(), runtime_error),
                         )?;
                         let directory = self.host_state.current_directory.borrow().clone();
-                        self.call_value(
+                        let saved_steps = self.resources.open_step_window();
+                        let result = self.call_value(
                             callable,
                             vec![VmValue::Number(timer as f64)],
                             &Span::synthetic(),
                             &directory,
-                        )?;
+                        );
+                        self.resources.close_step_window(saved_steps);
+                        result?;
                     }
                 }
                 host_events::HostEvent::Quit => {

@@ -61,11 +61,21 @@ impl ResourceMeter {
         self.call_depth = 0;
     }
 
+    /// 进入一个独立计量的步数窗口（如宿主事件回调）：暂存累计步数并清零。
+    /// 返回值必须交还给 `close_step_window`，以恢复外层执行的余额。
+    pub(crate) fn open_step_window(&mut self) -> u64 {
+        std::mem::take(&mut self.steps)
+    }
+
+    pub(crate) fn close_step_window(&mut self, saved_steps: u64) {
+        self.steps = saved_steps;
+    }
+
     pub(crate) fn charge_step(&mut self) -> Result<(), String> {
         self.steps = self.steps.saturating_add(1);
         if self.steps > self.budget.max_steps {
             Err(format!(
-                "执行步数超过预算 {}；可提高 max_steps 或检查无穷循环",
+                "执行步数超过预算 {}；可提高 max_steps（命令行 --max-steps 或环境变量 YANXU_MAX_STEPS），或检查无穷循环",
                 self.budget.max_steps
             ))
         } else {
@@ -117,5 +127,20 @@ mod tests {
         assert!(meter.enter_call().unwrap_err().contains("max_call_depth"));
         meter.leave_call();
         assert!(meter.check_collection(2).unwrap_err().contains("分批"));
+    }
+
+    #[test]
+    fn step_window_isolates_callback_budget_and_restores_outer_steps() {
+        let mut meter = ResourceMeter::new(ExecutionBudget::new(2, 8, 8));
+        assert!(meter.charge_step().is_ok());
+        assert!(meter.charge_step().is_ok());
+        // 外层余额已耗尽；窗口内应重新获得完整预算。
+        let saved = meter.open_step_window();
+        assert!(meter.charge_step().is_ok());
+        assert!(meter.charge_step().is_ok());
+        assert!(meter.charge_step().is_err());
+        meter.close_step_window(saved);
+        // 恢复后外层余额保持耗尽状态，不因窗口而放宽。
+        assert!(meter.charge_step().is_err());
     }
 }
