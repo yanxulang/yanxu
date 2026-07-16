@@ -33,6 +33,7 @@ pub mod stdlib;
 pub mod testing;
 pub mod token;
 pub mod type_checker;
+pub mod type_model;
 pub mod vm;
 pub mod wasm;
 
