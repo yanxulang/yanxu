@@ -3294,6 +3294,8 @@ mod tests {
             定 私协值：基础.私协 为 基础.公开类（）；
             定 非类型：基础.值 为 1；
             定 坏中段：基础.值.内部 为 1；
+            定 无别名：未知.公开类 为 基础.公开类（）；
+            定 缺成员：基础.不存在 为 基础.公开类（）；
             类 错父 承 基础.可协议 则 终
             类 错纳 纳 基础.公开类 则 终
         "#;
@@ -3319,6 +3321,16 @@ mod tests {
             messages
                 .iter()
                 .any(|message| message.contains("中间段“值”不是模块"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("模块别名“未知”不存在"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("未公开成员“不存在”"))
         );
         assert!(
             messages
