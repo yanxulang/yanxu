@@ -2015,6 +2015,12 @@ fn lock_local(
     revision: Option<String>,
     requirement: Option<&VersionReq>,
 ) -> Result<ResolvedDependency, ManifestError> {
+    let root = fs::canonicalize(root).map_err(|error| {
+        manifest_error(root, None, format!("不能规范化依赖包根目录：{error}"))
+    })?;
+    if !root.is_dir() {
+        return Err(manifest_error(&root, None, "依赖包根路径不是目录"));
+    }
     let dependency_manifest = load(root.join(MANIFEST_NAME))?;
     if dependency_manifest.name != expected_name {
         return Err(manifest_error(
@@ -2038,7 +2044,7 @@ fn lock_local(
             ),
         ));
     }
-    let checksum = tree_checksum(root)?;
+    let checksum = tree_checksum(&root)?;
     Ok(ResolvedDependency {
         locked: LockedPackage {
             id: String::new(),
@@ -2054,8 +2060,8 @@ fn lock_local(
             native: None,
             minimum_yanxu: None,
         },
-        root: root.to_path_buf(),
         entry: root.join(dependency_manifest.entry),
+        root,
     })
 }
 
@@ -3577,6 +3583,16 @@ mod tests {
         let url = root.to_string_lossy();
         let (cache, first_revision) = resolve_git(&url, "HEAD", false).unwrap();
         assert_eq!(first_revision.len(), 40);
+        let resolved = lock_local(
+            "Git包",
+            &cache,
+            &format!("git:{url}"),
+            Some(first_revision.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.root, fs::canonicalize(&cache).unwrap());
+        assert_eq!(resolved.entry, resolved.root.join("主.yx"));
         for arguments in [vec!["branch", "channel"], vec!["tag", "v1"]] {
             let status = Command::new("git")
                 .args(arguments)
