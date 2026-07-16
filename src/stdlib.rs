@@ -2272,6 +2272,7 @@ pub fn http_request_bytes_with_options_guarded(
             .timeout_global(Some(remaining))
             .max_redirects(0)
             .max_redirects_will_error(false)
+            .http_status_as_error(false)
             .proxy(None)
             .build();
         let agent = ureq::Agent::with_parts(
@@ -2577,6 +2578,7 @@ fn network_error_from_ureq(error: ureq::Error) -> NetworkError {
         {
             "NET_WRITE"
         }
+        ureq::Error::Io(io_error) if io_error.kind() == ErrorKind::InvalidData => "NET_TLS",
         ureq::Error::Io(_) => "NET_READ",
         _ => "NET_PROTOCOL",
     };
@@ -2667,6 +2669,44 @@ mod tests {
         server.join().unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, [255, 0, 128]);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn binary_http_request_returns_non_success_status_and_body() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = [0_u8; 1024];
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /missing "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing",
+                )
+                .unwrap();
+        });
+        let permissions = crate::permissions::PermissionSet::unrestricted();
+        let response = http_request_bytes_with_options_guarded(
+            "GET",
+            &format!("http://{address}/missing"),
+            &[],
+            None,
+            1_000,
+            64,
+            &permissions,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status, 404);
+        assert_eq!(response.body, b"missing");
     }
 
     #[test]
@@ -2927,7 +2967,7 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn classifies_http_status_and_non_utf8_responses() {
+    fn returns_http_status_and_classifies_non_utf8_responses() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -2943,11 +2983,12 @@ mod tests {
                 )
                 .unwrap();
         });
-        let error =
+        let response =
             http_request_with_options("GET", &format!("http://{address}/missing"), None, 1_000, 64)
-                .unwrap_err();
+                .unwrap();
         server.join().unwrap();
-        assert_eq!(error.code, "NET_STATUS");
+        assert_eq!(response.status, 404);
+        assert!(response.body.is_empty());
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
