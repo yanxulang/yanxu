@@ -3,6 +3,7 @@ use crate::ast::{
 };
 use crate::source::Span;
 use crate::token::TokenKind;
+use crate::type_model::{ModuleId, TypeDeclarationKind, TypeId};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -10,7 +11,7 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type EnvRef = Rc<RefCell<Environment>>;
@@ -125,7 +126,7 @@ impl fmt::Display for Value {
             Self::Class(class) => write!(f, "<类 {}>", class.name),
             Self::Protocol(protocol) => write!(f, "<协 {}>", protocol.name),
             Self::Instance(instance) => write!(f, "<{}之实例>", instance.borrow().class.name),
-            Self::Module(module) => write!(f, "<模块 {}>", module.name),
+            Self::Module(module) => write!(f, "<模块 {}>", module.module_id),
             Self::List(items) => {
                 let rendered = items
                     .borrow()
@@ -295,7 +296,7 @@ pub struct Function {
     closure: EnvRef,
     module_dir: PathBuf,
     span: Span,
-    owner_class: Option<String>,
+    owner_class: Option<TypeId>,
     is_async: bool,
 }
 
@@ -363,10 +364,11 @@ pub struct NativeFunction {
 
 pub struct YanxuClass {
     name: String,
+    type_id: TypeId,
     methods: HashMap<String, MethodSpec>,
     fields: HashMap<String, FieldSpec>,
     static_fields: RefCell<HashMap<String, Value>>,
-    protocols: HashSet<String>,
+    protocols: HashSet<TypeId>,
     superclass: Option<Rc<YanxuClass>>,
 }
 
@@ -411,17 +413,17 @@ impl YanxuClass {
                 .is_some_and(|class| class.has_instance_fields())
     }
 
-    fn is_a(&self, type_name: &str) -> bool {
-        self.name == type_name
-            || self.protocols.contains(type_name)
+    fn is_a(&self, type_id: &TypeId) -> bool {
+        &self.type_id == type_id
+            || self.protocols.contains(type_id)
             || self
                 .superclass
                 .as_ref()
-                .is_some_and(|class| class.is_a(type_name))
+                .is_some_and(|class| class.is_a(type_id))
     }
 
-    fn superclass_of(&self, owner: &str) -> Option<Rc<YanxuClass>> {
-        if self.name == owner {
+    fn superclass_of(&self, owner: &TypeId) -> Option<Rc<YanxuClass>> {
+        if &self.type_id == owner {
             self.superclass.clone()
         } else {
             self.superclass
@@ -448,13 +450,14 @@ impl YanxuClass {
 
 pub struct YanxuProtocol {
     name: String,
+    type_id: TypeId,
 }
 
 struct MethodSpec {
     function: Rc<Function>,
     visibility: Visibility,
     is_static: bool,
-    owner: String,
+    owner: TypeId,
 }
 
 #[derive(Clone)]
@@ -464,7 +467,8 @@ struct FieldSpec {
     readonly: bool,
     is_static: bool,
     initial: Option<Value>,
-    owner: String,
+    owner: TypeId,
+    type_env: EnvRef,
 }
 
 pub struct YanxuInstance {
@@ -474,6 +478,7 @@ pub struct YanxuInstance {
 
 pub struct YanxuModule {
     name: String,
+    module_id: ModuleId,
     environment: EnvRef,
     exports: HashSet<String>,
 }
@@ -558,6 +563,7 @@ pub trait DebugHook {
 struct Binding {
     value: Value,
     type_ref: Option<TypeRef>,
+    type_env: Option<Weak<RefCell<Environment>>>,
     mutable: bool,
 }
 
@@ -575,23 +581,23 @@ impl Environment {
         }))
     }
 
-    fn define(
+    fn define_typed(
         &mut self,
         name: String,
         value: Value,
         type_ref: Option<TypeRef>,
+        type_env: Weak<RefCell<Environment>>,
         mutable: bool,
-    ) -> Result<(), RuntimeError> {
-        ensure_type(&format!("变量“{name}”"), type_ref.as_ref(), &value)?;
+    ) {
         self.values.insert(
             name,
             Binding {
                 value,
                 type_ref,
+                type_env: Some(type_env),
                 mutable,
             },
         );
-        Ok(())
     }
 
     fn define_unchecked(&mut self, name: String, value: Value, mutable: bool) {
@@ -600,6 +606,7 @@ impl Environment {
             Binding {
                 value,
                 type_ref: None,
+                type_env: None,
                 mutable,
             },
         );
@@ -613,21 +620,6 @@ impl Environment {
             return enclosing.borrow().get(name);
         }
         Err(RuntimeError::new(format!("未曾定义“{name}”")))
-    }
-
-    fn assign(&mut self, name: &str, value: Value) -> Result<(), RuntimeError> {
-        if let Some(binding) = self.values.get_mut(name) {
-            if !binding.mutable {
-                return Err(RuntimeError::new(format!("“{name}”乃定值，不可改写")));
-            }
-            ensure_type(&format!("变量“{name}”"), binding.type_ref.as_ref(), &value)?;
-            binding.value = value;
-            return Ok(());
-        }
-        if let Some(enclosing) = &self.enclosing {
-            return enclosing.borrow_mut().assign(name, value);
-        }
-        Err(RuntimeError::new(format!("不可改写未定义之名“{name}”")))
     }
 
     fn get_local(&self, name: &str) -> Option<Value> {
@@ -662,8 +654,12 @@ fn debug_value(value: &Value) -> String {
         Value::Tuple(items) => format!("<元，{} 项>", items.len()),
         Value::Map(map) => format!("<典，{} 项>", map.borrow().entries.len()),
         Value::Iterator(_) => "<遍器>".into(),
-        Value::Instance(instance) => format!("<{}之实例>", instance.borrow().class.name),
-        Value::Module(module) => format!("<模块 {}>", module.name),
+        Value::Class(class) => format!("<类 {}>", class.type_id),
+        Value::Protocol(protocol) => format!("<协 {}>", protocol.type_id),
+        Value::Instance(instance) => {
+            format!("<{}之实例>", instance.borrow().class.type_id)
+        }
+        Value::Module(module) => format!("<模块 {}>", module.module_id),
         value => value.to_string(),
     }
 }
@@ -680,7 +676,8 @@ pub struct Interpreter {
     initialization_order: Vec<PathBuf>,
     tracing: bool,
     trace: Vec<String>,
-    access_classes: Vec<String>,
+    access_classes: Vec<TypeId>,
+    current_module_id: ModuleId,
     debug_hook: Option<Box<dyn DebugHook>>,
     debug_frames: Vec<ActiveDebugFrame>,
     permissions: crate::permissions::PermissionSet,
@@ -776,6 +773,7 @@ impl Interpreter {
             tracing: false,
             trace: Vec::new(),
             access_classes: Vec::new(),
+            current_module_id: ModuleId::for_source("<文句>"),
             debug_hook: None,
             debug_frames: Vec::new(),
             permissions: crate::permissions::PermissionSet::unrestricted(),
@@ -824,6 +822,11 @@ impl Interpreter {
         directory: Option<&Path>,
     ) -> Result<Value, RuntimeError> {
         self.resources.reset();
+        let module_id = statements
+            .first()
+            .map(|statement| ModuleId::for_source(&statement.span.source.name))
+            .unwrap_or_else(|| ModuleId::for_source("<空模块>"));
+        let previous_module_id = std::mem::replace(&mut self.current_module_id, module_id);
         let previous = directory
             .map(|directory| std::mem::replace(&mut self.current_dir, directory.to_path_buf()));
         let previous_package_root = directory.map(|directory| {
@@ -862,6 +865,7 @@ impl Interpreter {
         if let Some(previous) = previous_package_module_roots {
             self.package_module_roots = previous;
         }
+        self.current_module_id = previous_module_id;
         result
     }
 
@@ -967,21 +971,20 @@ impl Interpreter {
                 mutable,
             } => {
                 let value = self.evaluate(value, env.clone())?;
-                env.borrow_mut()
-                    .define(name.clone(), value.clone(), type_ref.clone(), *mutable)?;
+                self.define_variable(env, name.clone(), value.clone(), type_ref.clone(), *mutable)?;
                 Ok(Control::Continue(value))
             }
             StmtKind::Set { target, value } => {
                 let result = match &target.kind {
                     ExprKind::Variable(name) => {
                         let value = self.evaluate(value, env.clone())?;
-                        env.borrow_mut().assign(name, value.clone())?;
+                        self.assign_variable(env, name, value.clone())?;
                         value
                     }
                     ExprKind::Get { object, name } => {
                         let object = self.evaluate(object, env.clone())?;
-                        let value = self.evaluate(value, env)?;
-                        self.set_property(object, name, value.clone())?;
+                        let value = self.evaluate(value, env.clone())?;
+                        self.set_property(object, name, value.clone(), env)?;
                         value
                     }
                     ExprKind::Index { object, index } => {
@@ -1036,7 +1039,8 @@ impl Interpreter {
                 let iterator = self.make_iterator(iterable)?;
                 while let Some(item) = self.next_iterator(&iterator)? {
                     let iteration_env = Environment::child(env.clone());
-                    iteration_env.borrow_mut().define(
+                    self.define_variable(
+                        iteration_env.clone(),
                         name.clone(),
                         item,
                         type_ref.clone(),
@@ -1080,6 +1084,11 @@ impl Interpreter {
                 fields,
                 methods,
             } => {
+                let class_id = TypeId::new(
+                    self.current_module_id.clone(),
+                    name,
+                    TypeDeclarationKind::Class,
+                );
                 let superclass = superclass
                     .as_ref()
                     .map(
@@ -1096,7 +1105,7 @@ impl Interpreter {
                     .iter()
                     .map(
                         |protocol| match self.resolve_type_path(env.clone(), protocol)? {
-                            Value::Protocol(protocol) => Ok(protocol.name.clone()),
+                            Value::Protocol(protocol) => Ok(protocol.type_id.clone()),
                             value => Err(RuntimeError::new(format!(
                                 "“{protocol}”为{}，不可作为协",
                                 value.type_name()
@@ -1127,14 +1136,14 @@ impl Interpreter {
                         },
                         env.clone(),
                     );
-                    function.owner_class = Some(name.clone());
+                    function.owner_class = Some(class_id.clone());
                     method_map.insert(
                         method_name.clone(),
                         MethodSpec {
                             function: Rc::new(function),
                             visibility: method.member_visibility,
                             is_static: method.is_static,
-                            owner: name.clone(),
+                            owner: class_id.clone(),
                         },
                     );
                 }
@@ -1147,10 +1156,11 @@ impl Interpreter {
                         .map(|initial| self.evaluate(initial, env.clone()))
                         .transpose()?;
                     if let Some(initial) = &initial {
-                        ensure_type(
+                        self.ensure_type(
                             &format!("域“{}”", field.name),
                             Some(&field.type_ref),
                             initial,
+                            env.clone(),
                         )?;
                     }
                     if field.is_static
@@ -1166,12 +1176,14 @@ impl Interpreter {
                             readonly: field.readonly,
                             is_static: field.is_static,
                             initial,
-                            owner: name.clone(),
+                            owner: class_id.clone(),
+                            type_env: env.clone(),
                         },
                     );
                 }
                 let class = Value::Class(Rc::new(YanxuClass {
                     name: name.clone(),
+                    type_id: class_id,
                     methods: method_map,
                     fields: field_map,
                     static_fields: RefCell::new(static_fields),
@@ -1183,7 +1195,14 @@ impl Interpreter {
                 Ok(Control::Continue(class))
             }
             StmtKind::Protocol { name, .. } => {
-                let protocol = Value::Protocol(Rc::new(YanxuProtocol { name: name.clone() }));
+                let protocol = Value::Protocol(Rc::new(YanxuProtocol {
+                    name: name.clone(),
+                    type_id: TypeId::new(
+                        self.current_module_id.clone(),
+                        name,
+                        TypeDeclarationKind::Protocol,
+                    ),
+                }));
                 env.borrow_mut()
                     .define_unchecked(name.clone(), protocol.clone(), false);
                 Ok(Control::Continue(protocol))
@@ -1358,8 +1377,12 @@ impl Interpreter {
                 self.binary(left, operator, right)
             }
             ExprKind::TypeTest { value, type_ref } => {
-                let value = self.evaluate(value, env)?;
-                Ok(Value::Bool(value_matches_type(&value, &type_ref.kind)))
+                let value = self.evaluate(value, env.clone())?;
+                Ok(Value::Bool(self.value_matches_type(
+                    &value,
+                    &type_ref.kind,
+                    env,
+                )?))
             }
             ExprKind::Call { callee, arguments } => {
                 let callee = self.evaluate(callee, env.clone())?;
@@ -1906,14 +1929,14 @@ impl Interpreter {
         let env = Environment::child(function.closure.clone());
         let frame = format!("法“{}”（{}）", function.name, function.span);
         for (parameter, value) in function.params.iter().zip(arguments) {
-            env.borrow_mut()
-                .define(
-                    parameter.name.clone(),
-                    value,
-                    parameter.type_ref.clone(),
-                    true,
-                )
-                .map_err(|error| error.with_frame(frame.clone()))?;
+            self.define_variable(
+                env.clone(),
+                parameter.name.clone(),
+                value,
+                parameter.type_ref.clone(),
+                true,
+            )
+            .map_err(|error| error.with_frame(frame.clone()))?;
         }
         let previous = std::mem::replace(&mut self.current_dir, function.module_dir.clone());
         if let Some(owner) = &function.owner_class {
@@ -1926,7 +1949,7 @@ impl Interpreter {
                 environment: env.clone(),
             });
         }
-        let result = self.execute_statements(&function.body, env);
+        let result = self.execute_statements(&function.body, env.clone());
         if self.debug_hook.is_some() {
             self.debug_frames.pop();
         }
@@ -1938,10 +1961,11 @@ impl Interpreter {
             Control::Return(value) => value,
             Control::Continue(_) => Value::Nil,
         };
-        ensure_type(
+        self.ensure_type(
             &format!("法“{}”之归值", function.name),
             function.return_type.as_ref(),
             &value,
+            function.closure.clone(),
         )
         .map_err(|error| error.with_frame(frame))?;
         Ok(value)
@@ -2056,7 +2080,194 @@ impl Interpreter {
         Ok(value)
     }
 
-    fn set_property(&self, object: Value, name: &str, value: Value) -> Result<(), RuntimeError> {
+    fn define_variable(
+        &self,
+        env: EnvRef,
+        name: String,
+        value: Value,
+        type_ref: Option<TypeRef>,
+        mutable: bool,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_type(
+            &format!("变量“{name}”"),
+            type_ref.as_ref(),
+            &value,
+            env.clone(),
+        )?;
+        let type_env = Rc::downgrade(&env);
+        env.borrow_mut()
+            .define_typed(name, value, type_ref, type_env, mutable);
+        Ok(())
+    }
+
+    fn assign_variable(&self, env: EnvRef, name: &str, value: Value) -> Result<(), RuntimeError> {
+        let mut current = env;
+        loop {
+            let contains = current.borrow().values.contains_key(name);
+            if contains {
+                let (mutable, type_ref, type_env) = {
+                    let environment = current.borrow();
+                    let binding = environment.values.get(name).expect("binding checked above");
+                    (
+                        binding.mutable,
+                        binding.type_ref.clone(),
+                        binding.type_env.as_ref().and_then(Weak::upgrade),
+                    )
+                };
+                if !mutable {
+                    return Err(RuntimeError::new(format!("“{name}”乃定值，不可改写")));
+                }
+                self.ensure_type(
+                    &format!("变量“{name}”"),
+                    type_ref.as_ref(),
+                    &value,
+                    type_env.unwrap_or_else(|| current.clone()),
+                )?;
+                current
+                    .borrow_mut()
+                    .values
+                    .get_mut(name)
+                    .expect("binding checked above")
+                    .value = value;
+                return Ok(());
+            }
+            let enclosing = current.borrow().enclosing.clone();
+            let Some(enclosing) = enclosing else {
+                return Err(RuntimeError::new(format!("不可改写未定义之名“{name}”")));
+            };
+            current = enclosing;
+        }
+    }
+
+    fn ensure_type(
+        &self,
+        subject: &str,
+        expected: Option<&TypeRef>,
+        value: &Value,
+        env: EnvRef,
+    ) -> Result<(), RuntimeError> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        if self.value_matches_type(value, &expected.kind, env)? {
+            return Ok(());
+        }
+        Err(RuntimeError::new(format!(
+            "{subject}注为{}，不可纳入{}",
+            expected.name,
+            value.type_name()
+        )))
+    }
+
+    fn value_matches_type(
+        &self,
+        value: &Value,
+        expected: &TypeKind,
+        env: EnvRef,
+    ) -> Result<bool, RuntimeError> {
+        match expected {
+            TypeKind::Union(types) => {
+                for ty in types {
+                    if self.value_matches_type(value, ty, env.clone())? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            TypeKind::Nullable(ty) => {
+                Ok(matches!(value, Value::Nil) || self.value_matches_type(value, ty, env)?)
+            }
+            TypeKind::Function { .. } => Ok(matches!(value, Value::Function(_) | Value::Native(_))),
+            TypeKind::Generic { base, arguments } => {
+                let Some(base_name) = base.single_name() else {
+                    let target = self.resolve_type_path(env, base)?;
+                    return Ok(matches!(
+                        (value, target),
+                        (Value::Instance(instance), Value::Class(class))
+                            if instance.borrow().class.is_a(&class.type_id)
+                    ));
+                };
+                match (base_name, value) {
+                    ("列", Value::List(items)) if arguments.len() == 1 => {
+                        for item in items.borrow().iter() {
+                            if !self.value_matches_type(item, &arguments[0], env.clone())? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    ("典", Value::Map(map)) if arguments.len() == 2 => {
+                        for (key, item) in &map.borrow().entries {
+                            if !self.value_matches_type(key, &arguments[0], env.clone())?
+                                || !self.value_matches_type(item, &arguments[1], env.clone())?
+                            {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    ("元", Value::Tuple(items)) if arguments.len() == items.len() => {
+                        for (item, expected) in items.iter().zip(arguments) {
+                            if !self.value_matches_type(item, expected, env.clone())? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    ("遍器", Value::Iterator(_)) if arguments.len() == 1 => Ok(true),
+                    ("任务", Value::Task(_)) if arguments.len() == 1 => Ok(true),
+                    ("套接字", Value::Socket(_)) if arguments.is_empty() => Ok(true),
+                    _ => Ok(false),
+                }
+            }
+            TypeKind::Named(path) => {
+                if let Some(expected) = path.single_name() {
+                    let builtin = match expected {
+                        "任意" => Some(true),
+                        "数" => Some(matches!(value, Value::Number(_))),
+                        "文" => Some(matches!(value, Value::String(_))),
+                        "字节串" => Some(matches!(value, Value::Bytes(_))),
+                        "理" => Some(matches!(value, Value::Bool(_))),
+                        "空" => Some(matches!(value, Value::Nil)),
+                        "法" => Some(matches!(value, Value::Function(_) | Value::Native(_))),
+                        "类" => Some(matches!(value, Value::Class(_))),
+                        "协" => Some(matches!(value, Value::Protocol(_))),
+                        "模块" => Some(matches!(value, Value::Module(_))),
+                        "对象" => Some(matches!(value, Value::Instance(_))),
+                        "列" => Some(matches!(value, Value::List(_))),
+                        "元" => Some(matches!(value, Value::Tuple(_))),
+                        "典" => Some(matches!(value, Value::Map(_))),
+                        "遍器" => Some(matches!(value, Value::Iterator(_))),
+                        "误" => Some(matches!(value, Value::Error(_))),
+                        "任务" => Some(matches!(value, Value::Task(_))),
+                        "套接字" => Some(matches!(value, Value::Socket(_))),
+                        _ => None,
+                    };
+                    if let Some(matches) = builtin {
+                        return Ok(matches);
+                    }
+                }
+                match self.resolve_type_path(env, path)? {
+                    Value::Class(class) => Ok(matches!(value, Value::Instance(instance)
+                        if instance.borrow().class.is_a(&class.type_id))),
+                    Value::Protocol(protocol) => Ok(matches!(value, Value::Instance(instance)
+                        if instance.borrow().class.is_a(&protocol.type_id))),
+                    other => Err(RuntimeError::new(format!(
+                        "类型路径“{path}”指向{}而非类或协",
+                        other.type_name()
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn set_property(
+        &self,
+        object: Value,
+        name: &str,
+        value: Value,
+        _environment: EnvRef,
+    ) -> Result<(), RuntimeError> {
         match object {
             Value::Instance(instance) => {
                 let class = instance.borrow().class.clone();
@@ -2070,7 +2281,12 @@ impl Interpreter {
                     if field.readonly && instance.borrow().fields.contains_key(name) {
                         return Err(RuntimeError::new(format!("只读域“{name}”不可再次改写")));
                     }
-                    ensure_type(&format!("域“{name}”"), Some(&field.type_ref), &value)?;
+                    self.ensure_type(
+                        &format!("域“{name}”"),
+                        Some(&field.type_ref),
+                        &value,
+                        field.type_env,
+                    )?;
                 } else if class.has_instance_fields() {
                     return Err(RuntimeError::new(format!(
                         "类“{}”未声明域“{name}”",
@@ -2097,7 +2313,12 @@ impl Interpreter {
                 if field.readonly && storage.borrow().contains_key(name) {
                     return Err(RuntimeError::new(format!("只读静域“{name}”不可再次改写")));
                 }
-                ensure_type(&format!("静域“{name}”"), Some(&field.type_ref), &value)?;
+                self.ensure_type(
+                    &format!("静域“{name}”"),
+                    Some(&field.type_ref),
+                    &value,
+                    field.type_env,
+                )?;
                 storage.borrow_mut().insert(name.into(), value);
                 Ok(())
             }
@@ -2112,7 +2333,7 @@ impl Interpreter {
         }
     }
 
-    fn can_access(&self, visibility: Visibility, owner: &str) -> bool {
+    fn can_access(&self, visibility: Visibility, owner: &TypeId) -> bool {
         visibility == Visibility::Public
             || self
                 .access_classes
@@ -2483,10 +2704,13 @@ impl Interpreter {
         let module_env = Environment::child(self.globals.clone());
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
         let previous = std::mem::replace(&mut self.current_dir, directory.to_path_buf());
+        let module_id = ModuleId::for_path(path);
+        let previous_module_id = std::mem::replace(&mut self.current_module_id, module_id.clone());
         let execution = self
             .execute_statements(&statements, module_env.clone())
             .map_err(|error| error.with_frame(format!("模块“{}”", path.display())));
         self.current_dir = previous;
+        self.current_module_id = previous_module_id;
         match execution? {
             Control::Return(_) => return Err(RuntimeError::new("模块顶层不可用“归”")),
             Control::Continue(_) => {}
@@ -2507,13 +2731,15 @@ impl Interpreter {
                     StmtKind::Let { name, .. }
                     | StmtKind::Function { name, .. }
                     | StmtKind::Class { name, .. }
-                    | StmtKind::Protocol { name, .. } => Some(name.clone()),
+                    | StmtKind::Protocol { name, .. }
+                    | StmtKind::Import { alias: name, .. } => Some(name.clone()),
                     _ => None,
                 }
             })
             .collect();
         Ok(Rc::new(YanxuModule {
             name,
+            module_id,
             environment: module_env,
             exports,
         }))
@@ -3043,6 +3269,7 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
     }
     Ok(Rc::new(YanxuModule {
         name: format!("标准:{name}"),
+        module_id: ModuleId::standard(name),
         environment,
         exports,
     }))
@@ -4740,76 +4967,6 @@ fn http_request(
     )
     .map(|response| response.body)
     .map_err(RuntimeError::network)
-}
-
-fn ensure_type(
-    subject: &str,
-    expected: Option<&TypeRef>,
-    value: &Value,
-) -> Result<(), RuntimeError> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    if value_matches_type(value, &expected.kind) {
-        return Ok(());
-    }
-    Err(RuntimeError::new(format!(
-        "{subject}注为{}，不可纳入{}",
-        expected.name,
-        value.type_name()
-    )))
-}
-
-fn value_matches_type(value: &Value, expected: &TypeKind) -> bool {
-    match expected {
-        TypeKind::Union(types) => types.iter().any(|ty| value_matches_type(value, ty)),
-        TypeKind::Nullable(ty) => matches!(value, Value::Nil) || value_matches_type(value, ty),
-        TypeKind::Function { .. } => {
-            matches!(value, Value::Function(_) | Value::Native(_))
-        }
-        TypeKind::Generic { base, arguments } => match (base.single_name().unwrap_or(""), value) {
-            ("列", Value::List(items)) if arguments.len() == 1 => items
-                .borrow()
-                .iter()
-                .all(|value| value_matches_type(value, &arguments[0])),
-            ("典", Value::Map(map)) if arguments.len() == 2 => {
-                map.borrow().entries.iter().all(|(key, value)| {
-                    value_matches_type(key, &arguments[0])
-                        && value_matches_type(value, &arguments[1])
-                })
-            }
-            ("元", Value::Tuple(items)) if arguments.len() == items.len() => items
-                .iter()
-                .zip(arguments)
-                .all(|(value, expected)| value_matches_type(value, expected)),
-            ("遍器", Value::Iterator(_)) if arguments.len() == 1 => true,
-            ("任务", Value::Task(_)) if arguments.len() == 1 => true,
-            ("套接字", Value::Socket(_)) if arguments.is_empty() => true,
-            _ => false,
-        },
-        TypeKind::Named(expected) => match expected.single_name().unwrap_or("") {
-            "任意" => true,
-            "数" => matches!(value, Value::Number(_)),
-            "文" => matches!(value, Value::String(_)),
-            "字节串" => matches!(value, Value::Bytes(_)),
-            "理" => matches!(value, Value::Bool(_)),
-            "空" => matches!(value, Value::Nil),
-            "法" => matches!(value, Value::Function(_) | Value::Native(_)),
-            "类" => matches!(value, Value::Class(_)),
-            "协" => matches!(value, Value::Protocol(_)),
-            "模块" => matches!(value, Value::Module(_)),
-            "对象" => matches!(value, Value::Instance(_)),
-            "列" => matches!(value, Value::List(_)),
-            "元" => matches!(value, Value::Tuple(_)),
-            "典" => matches!(value, Value::Map(_)),
-            "遍器" => matches!(value, Value::Iterator(_)),
-            "误" => matches!(value, Value::Error(_)),
-            "任务" => matches!(value, Value::Task(_)),
-            "套接字" => matches!(value, Value::Socket(_)),
-            class_name => matches!(value, Value::Instance(instance)
-            if instance.borrow().class.is_a(class_name)),
-        },
-    }
 }
 
 fn numeric_pair(
