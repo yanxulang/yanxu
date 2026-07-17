@@ -1,6 +1,6 @@
 # 变更记录
 
-## 未发布
+## 1.1.13
 
 ### 模块限定类型与跨模块对象
 
@@ -8,6 +8,7 @@
 - 类与协议使用包含规范模块所有权的`TypeId`，不同模块同名类型互不碰撞，同一模块的不同导入别名保持同一身份。
 - 新增顶层`公 引「模块」为 别名；`，支持任意深度 facade 重导出；检查器、树解释器和 VM 同步支持跨模块继承、协议、动态派发、`父.方法`、静态成员和私有边界。
 - 字节码块升级为格式 2，保存`ModuleId`、`TypeId`及结构化运行时类型链接；YXB 外层格式仍为 1，但声明`bytecode_format: 2`。
+- 规范模块身份校验以平台无关规则拒绝 Unix、Windows 盘符和 UNC 绝对路径，避免同一归档身份在不同宿主上得到不一致结果。
 - `yanxu 文 --json`升级为模块 API 清单 v2，新增类型所有者、完整限定名称、结构化类型引用与重导出暴露路径；Markdown 与 LSP 可跟随限定路径和 reexport 到原声明。
 
 ### 兼容与迁移
@@ -15,6 +16,17 @@
 - 有意移除“检查过导入模块后可偶然裸写其类型”的未规定行为；改写为`导入别名.类型`。当前模块裸类型、普通模块值访问和现有对象语法不变。
 - 字节码格式 1 不再由当前运行时读取，旧 YXB 需要从源码重新构建；标准库`stdlib-api-v1`不受模块 API 清单版本变化影响。
 - 迁移步骤见[模块限定类型迁移](reference/migration-module-qualified-types.md)，完整示例见[`examples/module_oop`](examples/module_oop)。
+
+### 安装
+
+macOS 与 Linux 可固定安装本版本：
+
+```sh
+curl -fsSL https://get.yanxu.dev | YANXU_VERSION=1.1.13 sh
+```
+
+Windows PowerShell 可先设置`$env:YANXU_VERSION = "1.1.13"`，再运行
+`irm https://get.yanxu.dev/windows | iex`。
 
 ## 1.1.12
 
