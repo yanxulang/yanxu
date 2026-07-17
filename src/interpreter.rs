@@ -4235,7 +4235,7 @@ fn native_http_bytes_request(
         }
     };
     let timeout = positive_u64_argument(arguments, 4, "网络.请求字节", "超时毫秒")?;
-    let max_bytes = socket_max_bytes_argument(arguments, 5, "网络.请求字节")?;
+    let max_bytes = positive_u64_argument(arguments, 5, "网络.请求字节", "最大字节")?;
     let response = crate::stdlib::http_request_bytes_with_options_guarded(
         string_argument(arguments, 0, "网络.请求字节")?,
         string_argument(arguments, 1, "网络.请求字节")?,

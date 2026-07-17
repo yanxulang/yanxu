@@ -3020,7 +3020,7 @@ impl Vm {
                     }
                 };
                 let timeout = vm_positive_u64(&arguments[4], "网络.请求字节", "超时毫秒", span)?;
-                let max_bytes = vm_socket_max_bytes(&arguments[5], "网络.请求字节", span)?;
+                let max_bytes = vm_positive_u64(&arguments[5], "网络.请求字节", "最大字节", span)?;
                 let response = crate::stdlib::http_request_bytes_with_options_guarded(
                     method,
                     url,
