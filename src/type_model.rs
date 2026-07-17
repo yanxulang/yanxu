@@ -306,11 +306,23 @@ fn valid_module_path(value: &str) -> bool {
         && !logical_path.is_empty()
         && !value.chars().any(char::is_control)
         && !value.contains('\\')
+        && !portable_path_is_absolute(value)
+        && !portable_path_is_absolute(logical_path)
         && !Path::new(value).is_absolute()
         && !Path::new(logical_path).is_absolute()
         && logical_path
             .split('/')
             .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn portable_path_is_absolute(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with(['/', '\\'])
+        || matches!(
+            bytes,
+            [drive, b':', separator, ..]
+                if drive.is_ascii_alphabetic() && matches!(separator, b'/' | b'\\')
+        )
 }
 
 fn portable_path(path: &Path) -> String {
@@ -359,6 +371,11 @@ mod tests {
     #[test]
     fn portable_module_ids_reject_absolute_and_parent_paths() {
         assert!(!ModuleId::archive("/tmp/app:main.yx").is_valid());
+        assert!(!ModuleId::archive("app:/main.yx").is_valid());
+        assert!(!ModuleId::archive("C:/tmp/main.yx").is_valid());
+        assert!(!ModuleId::archive("C:\\tmp\\main.yx").is_valid());
+        assert!(!ModuleId::archive("//server/share/main.yx").is_valid());
+        assert!(!ModuleId::archive("\\\\server\\share\\main.yx").is_valid());
         assert!(!ModuleId::archive("app:../main.yx").is_valid());
         assert!(!ModuleId::archive("app:lib//main.yx").is_valid());
         assert!(ModuleId::archive("app:lib/main.yx").is_valid());
