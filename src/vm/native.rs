@@ -111,6 +111,7 @@ pub(super) enum StandardNative {
     Arch,
     Arguments,
     ProcessRun,
+    OpenExternalUrl,
     ResourceReadBytes,
     ResourceReadText,
     ResourceList,

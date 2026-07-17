@@ -136,6 +136,57 @@ pub fn process_run(
     Err("PROCESS_UNSUPPORTED：WASI 不支持启动宿主进程".into())
 }
 
+fn external_http_url(address: &str) -> Result<Url, String> {
+    let address = address.trim();
+    let url = Url::parse(address).map_err(|error| format!("DESKTOP_URL：外部地址无效：{error}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("DESKTOP_URL：外部地址须为含主机的 HTTP(S) URL".into());
+    }
+    Ok(url)
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn open_external_http_url(address: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let url = external_http_url(address)?;
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("/usr/bin/open");
+        command.arg(url.as_str());
+        command
+    } else if cfg!(target_os = "windows") {
+        let mut command = Command::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler").arg(url.as_str());
+        command
+    } else if cfg!(target_os = "linux") {
+        let mut command = Command::new("xdg-open");
+        command.arg(url.as_str());
+        command
+    } else {
+        return Err("DESKTOP_UNSUPPORTED：当前系统不支持打开外部网页".into());
+    };
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("DESKTOP_OPEN：不能调用系统浏览器：{error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "DESKTOP_OPEN：系统浏览器启动器退出状态 {}",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub fn open_external_http_url(address: &str) -> Result<(), String> {
+    external_http_url(address)?;
+    Err("DESKTOP_UNSUPPORTED：WASI 不支持打开外部网页".into())
+}
+
 pub fn path_join(left: &str, right: &str) -> String {
     Path::new(left).join(right).to_string_lossy().into_owned()
 }
@@ -2590,6 +2641,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_web_urls_accept_public_and_local_http_hosts_only() {
+        assert_eq!(
+            external_http_url(" http://127.0.0.1:8080/admin ")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8080/admin"
+        );
+        assert!(external_http_url("https://sub2api.example").is_ok());
+        assert!(external_http_url("file:///tmp/private").is_err());
+        assert!(external_http_url("mailto:admin@example.com").is_err());
+        assert!(external_http_url("不是地址").is_err());
+    }
+
+    #[test]
     fn binary_primitives_preserve_arbitrary_bytes_and_security_properties() {
         let bytes = bytes_from_numbers(&[0.0, 0xff as f64, 0x80 as f64, 1.0]).unwrap();
         assert_eq!(bytes, [0, 255, 128, 1]);
@@ -3231,7 +3296,7 @@ mod tests {
         let manifest = api_manifest().unwrap();
         assert_eq!(manifest["schema_version"], API_MANIFEST_SCHEMA_VERSION);
         let modules = manifest["modules"].as_array().unwrap();
-        assert_eq!(modules.len(), 25);
+        assert_eq!(modules.len(), 26);
         let socket_module = modules
             .iter()
             .find(|module| module["name"] == "套接字")

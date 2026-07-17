@@ -1,5 +1,29 @@
 # 变更记录
 
+## 1.2.0
+
+### 桌面外部网页
+
+- 新增`标准:桌面.打开网页（地址）`，桌面应用可把运行时确定的 HTTP(S) 地址交给系统默认浏览器。
+- 调用前必须声明`打开外部地址 = true`；该能力不授予通用进程权限，也拒绝`file:`、`mailto:`等非 HTTP(S) scheme。
+- macOS、Windows 与 Linux 分别使用系统网页启动器；树解释器、字节码 VM、静态类型摘要与机器 API 清单保持一致。
+
+### 兼容与升级
+
+- 不改变语言规范版本、原生 ABI v1/v2、锁文件或 Bundle 格式；标准库只新增模块与成员。
+- 需要动态打开用户配置网页的应用应声明最低言序 1.2.0 并重新构建。
+
+### 安装
+
+macOS 与 Linux 可固定安装本版本：
+
+```sh
+curl -fsSL https://get.yanxu.dev | YANXU_VERSION=1.2.0 sh
+```
+
+Windows PowerShell 可先设置`$env:YANXU_VERSION = "1.2.0"`，再运行
+`irm https://get.yanxu.dev/windows | iex`。
+
 ## 1.1.15
 
 ### 显式本地网络权限

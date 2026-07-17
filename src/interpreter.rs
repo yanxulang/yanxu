@@ -78,6 +78,7 @@ enum GuardedNative {
     EnvExists,
     Arguments,
     ProcessRun,
+    OpenExternalUrl,
     ResourceReadBytes,
     ResourceReadText,
     ResourceList,
@@ -1785,6 +1786,18 @@ impl Interpreter {
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 native_process_run(arguments)
             }
+            GuardedNative::OpenExternalUrl => {
+                self.permissions
+                    .check_open_external_url()
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                crate::stdlib::open_external_http_url(string_argument(
+                    arguments,
+                    0,
+                    "桌面.打开网页",
+                )?)
+                .map(|()| Value::Nil)
+                .map_err(RuntimeError::new)
+            }
             GuardedNative::ResourceReadBytes | GuardedNative::ResourceReadText => {
                 let requested = string_argument(arguments, 0, "资源.读取")?;
                 let path = crate::application::resolve_declared_resource(
@@ -3037,6 +3050,15 @@ fn standard_module(name: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
                 "执行",
                 4,
                 NativeKind::Guarded(GuardedNative::ProcessRun),
+            );
+        }
+        "桌面" => {
+            define_export_intrinsic(
+                &environment,
+                &mut exports,
+                "打开网页",
+                1,
+                NativeKind::Guarded(GuardedNative::OpenExternalUrl),
             );
         }
         "资源" => {

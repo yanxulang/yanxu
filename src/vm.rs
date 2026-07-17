@@ -3338,6 +3338,18 @@ impl Vm {
                     ("标准错误", VmValue::String(output.stderr)),
                 ]))
             }
+            Std::OpenExternalUrl => {
+                self.permissions
+                    .check_open_external_url()
+                    .map_err(|permission| error(span, permission.to_string()))?;
+                crate::stdlib::open_external_http_url(vm_string(
+                    &arguments[0],
+                    "桌面.打开网页",
+                    span,
+                )?)
+                .map(|()| VmValue::Nil)
+                .map_err(|message| error(span, message))
+            }
             Std::ResourceReadBytes | Std::ResourceReadText => {
                 let requested = vm_string(&arguments[0], "资源.读取", span)?;
                 let bytes = if let Some(resources) = &self.application_resources {
@@ -4486,6 +4498,11 @@ impl Vm {
                 ("参数", 0, NativeKind::Standard(StandardNative::Arguments)),
             ],
             "进程" => &[("执行", 4, NativeKind::Standard(StandardNative::ProcessRun))],
+            "桌面" => &[(
+                "打开网页",
+                1,
+                NativeKind::Standard(StandardNative::OpenExternalUrl),
+            )],
             "资源" => &[
                 (
                     "读取字节",

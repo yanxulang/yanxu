@@ -115,8 +115,8 @@ jobs:
         run: |
           set -euo pipefail
           target/debug/yanxu 标准库 --json > "$RUNNER_TEMP/stdlib.json"
-          jq -e '.schema_version == 1 and (.modules | length) == 25' "$RUNNER_TEMP/stdlib.json" >/dev/null
-          cmp stdlib/api-v1.json stdlib/snapshots/1.1.7-api-v1.json
+          jq -e '.schema_version == 1 and (.modules | length) == 26' "$RUNNER_TEMP/stdlib.json" >/dev/null
+          cmp stdlib/api-v1.json stdlib/snapshots/1.2.0-api-v1.json
       - name: 校验版本与工程能力握手
         shell: bash
         run: |

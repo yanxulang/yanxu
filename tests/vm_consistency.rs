@@ -752,6 +752,30 @@ fn guarded_process_execution_matches_both_runtimes() {
 }
 
 #[test]
+fn guarded_external_web_opening_checks_permission_before_url() {
+    let source = "引「标准:桌面」为 桌面；桌面.打开网页（「不是地址」）；";
+    let statements = yanxu::parse(source).unwrap();
+    yanxu::type_checker::check(&statements).unwrap();
+    let chunk = bytecode::compile(&statements).unwrap();
+
+    let denied = yanxu::permissions::PermissionSet::sandboxed();
+    let mut interpreter = Interpreter::silent_with_permissions(denied.clone());
+    let tree_denial = interpreter.execute(&statements).unwrap_err().to_string();
+    let mut vm = Vm::silent_with_permissions(denied);
+    let vm_denial = vm.execute(&chunk).unwrap_err().to_string();
+    assert!(tree_denial.contains("打开外部地址"), "{tree_denial}");
+    assert!(vm_denial.contains("打开外部地址"), "{vm_denial}");
+
+    let allowed = yanxu::permissions::PermissionSet::sandboxed().allow_open_external_url();
+    let mut interpreter = Interpreter::silent_with_permissions(allowed.clone());
+    let tree_error = interpreter.execute(&statements).unwrap_err().to_string();
+    let mut vm = Vm::silent_with_permissions(allowed);
+    let vm_error = vm.execute(&chunk).unwrap_err().to_string();
+    assert!(tree_error.contains("DESKTOP_URL"), "{tree_error}");
+    assert!(vm_error.contains("DESKTOP_URL"), "{vm_error}");
+}
+
+#[test]
 fn async_tasks_cancellation_and_structured_join_match_both_runtimes() {
     let source = r#"
         异 法 倍增（值：数）：数 则 归 值 乘 2；终

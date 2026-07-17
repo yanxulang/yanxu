@@ -2529,6 +2529,14 @@ fn standard_module_shape(name: &str) -> Option<ObjectShape> {
                 )),
             );
         }
+        "桌面" => {
+            insert_std_function(
+                &mut shape,
+                "打开网页",
+                vec![TypeSet::named("文")],
+                TypeSet::named("空"),
+            );
+        }
         "资源" => {
             insert_std_function(
                 &mut shape,
