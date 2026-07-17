@@ -19188,7 +19188,7 @@ TS_PUBLIC const TSLanguage *tree_sitter_yanxu(void) {
     .metadata = {
       .major_version = 1,
       .minor_version = 1,
-      .patch_version = 12,
+      .patch_version = 13,
     },
   };
   return &language;
