@@ -1,5 +1,6 @@
 use crate::ast::{
-    Expr, ExprKind, FieldDecl, Literal, Parameter, Stmt, StmtKind, TypeKind, TypeRef, Visibility,
+    Expr, ExprKind, FieldDecl, Literal, Parameter, Stmt, StmtKind, TypeKind, TypePath,
+    TypePathSegment, TypeRef, Visibility,
 };
 use crate::source::Span;
 use crate::token::{Token, TokenKind};
@@ -22,12 +23,18 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 pub fn parse(tokens: Vec<Token>) -> Result<Vec<Stmt>, ParseError> {
-    Parser { tokens, current: 0 }.program()
+    Parser {
+        tokens,
+        current: 0,
+        scope_depth: 0,
+    }
+    .program()
 }
 
 struct Parser {
     tokens: Vec<Token>,
     current: usize,
+    scope_depth: usize,
 }
 
 impl Parser {
@@ -49,9 +56,18 @@ impl Parser {
                     | StmtKind::Function { .. }
                     | StmtKind::Class { .. }
                     | StmtKind::Protocol { .. }
+                    | StmtKind::Import { .. }
             ) {
                 return Err(ParseError {
-                    message: "“公”只可修饰变量、常量、法、类或协".into(),
+                    message: "“公”只可修饰变量、常量、法、类、协或顶层引入".into(),
+                    line: public_span.line,
+                    column: public_span.column,
+                    span: public_span,
+                });
+            }
+            if matches!(statement.kind, StmtKind::Import { .. }) && self.scope_depth > 0 {
+                return Err(ParseError {
+                    message: "“公 引”只可用于模块顶层".into(),
                     line: public_span.line,
                     column: public_span.column,
                     span: public_span,
@@ -156,14 +172,14 @@ impl Parser {
     fn class_statement(&mut self, start: Span) -> Result<Stmt, ParseError> {
         let (name, _) = self.identifier_token("“类”之后须有类名")?;
         let superclass = if self.matches(&TokenKind::Inherit) {
-            Some(self.identifier_token("“承”之后须有父类名")?.0)
+            Some(self.type_path("“承”之后须有父类路径")?)
         } else {
             None
         };
         let mut protocols = Vec::new();
         if self.matches(&TokenKind::Implements) {
             loop {
-                protocols.push(self.identifier_token("“纳”之后须有协名")?.0);
+                protocols.push(self.type_path("“纳”之后须有协路径")?);
                 if !self.matches(&TokenKind::Comma) {
                     break;
                 }
@@ -478,11 +494,16 @@ impl Parser {
     }
 
     fn block_until(&mut self, endings: &[TokenKind]) -> Result<Vec<Stmt>, ParseError> {
-        let mut statements = Vec::new();
-        while !self.check(&TokenKind::Eof) && !endings.iter().any(|kind| self.check(kind)) {
-            statements.push(self.declaration()?);
-        }
-        Ok(statements)
+        self.scope_depth += 1;
+        let result = (|| {
+            let mut statements = Vec::new();
+            while !self.check(&TokenKind::Eof) && !endings.iter().any(|kind| self.check(kind)) {
+                statements.push(self.declaration()?);
+            }
+            Ok(statements)
+        })();
+        self.scope_depth -= 1;
+        result
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
@@ -867,6 +888,7 @@ impl Parser {
         let token = self.advance().clone();
         let (mut kind, mut span) = match token.kind {
             TokenKind::Identifier(name) => {
+                let path = self.type_path_from_first(name, token.span.clone())?;
                 if self.matches(&TokenKind::Less) {
                     let mut arguments = Vec::new();
                     loop {
@@ -881,17 +903,24 @@ impl Parser {
                         .clone();
                     (
                         TypeKind::Generic {
-                            base: name,
+                            base: path,
                             arguments,
                         },
                         token.span.through(&close),
                     )
                 } else {
-                    (TypeKind::Named(name), token.span)
+                    let span = path.span.clone();
+                    (TypeKind::Named(path), span)
                 }
             }
-            TokenKind::Nil => (TypeKind::Named("空".into()), token.span),
-            TokenKind::Class => (TypeKind::Named("类".into()), token.span),
+            TokenKind::Nil => (
+                TypeKind::Named(TypePath::single("空", token.span.clone())),
+                token.span,
+            ),
+            TokenKind::Class => (
+                TypeKind::Named(TypePath::single("类", token.span.clone())),
+                token.span,
+            ),
             TokenKind::Function if self.matches(&TokenKind::LeftParen) => {
                 let mut parameters = Vec::new();
                 if !self.check(&TokenKind::RightParen) {
@@ -913,7 +942,10 @@ impl Parser {
                     token.span.through(&result_span),
                 )
             }
-            TokenKind::Function => (TypeKind::Named("法".into()), token.span),
+            TokenKind::Function => (
+                TypeKind::Named(TypePath::single("法", token.span.clone())),
+                token.span,
+            ),
             _ => {
                 return Err(ParseError {
                     message: "此处须有类型名、泛型类型或法类型".into(),
@@ -928,6 +960,20 @@ impl Parser {
             kind = TypeKind::Nullable(Box::new(kind));
         }
         Ok((kind, span))
+    }
+
+    fn type_path(&mut self, message: &str) -> Result<TypePath, ParseError> {
+        let (name, span) = self.identifier_token(message)?;
+        self.type_path_from_first(name, span)
+    }
+
+    fn type_path_from_first(&mut self, name: String, span: Span) -> Result<TypePath, ParseError> {
+        let mut segments = vec![TypePathSegment { name, span }];
+        while self.matches(&TokenKind::Dot) {
+            let (name, span) = self.identifier_token("类型路径的点号之后须有标识符")?;
+            segments.push(TypePathSegment { name, span });
+        }
+        Ok(TypePath::new(segments))
     }
 
     fn end_statement(&mut self) -> Result<(), ParseError> {
@@ -1106,8 +1152,89 @@ mod tests {
             matches!(&statements[0].kind, StmtKind::Protocol { fields, methods, .. } if fields.len() == 1 && methods.len() == 1)
         );
         assert!(
-            matches!(&statements[1].kind, StmtKind::Class { protocols, fields, methods, .. } if protocols == &["可命名"] && fields.len() == 2 && methods[0].is_static)
+            matches!(&statements[1].kind, StmtKind::Class { protocols, fields, methods, .. } if protocols.len() == 1 && protocols[0].is_single("可命名") && fields.len() == 2 && methods[0].is_static)
         );
+    }
+
+    #[test]
+    fn parses_qualified_types_in_every_recursive_position() {
+        let source = r#"
+            公 引「base.yx」为 基础；
+            公 类 按钮 承 基础.视图 纳 基础.可描述，协议库.可点击 则
+                公 域 内容：基础.视图?；
+                公 法 转换（输入：列<基础.视图|基础.窗口>，操作：法（基础.视图，列<基础.按钮>）：基础.窗口）：任务<基础.视图> 则
+                    若 此.内容 是 基础.按钮 则 归 操作（此.内容，输入）；终
+                    归 此.内容；
+                终
+            终
+        "#;
+        let statements = parse(lexer::scan(source).unwrap()).unwrap();
+        assert!(statements[0].public);
+        assert!(matches!(statements[0].kind, StmtKind::Import { .. }));
+        let StmtKind::Class {
+            superclass,
+            protocols,
+            fields,
+            methods,
+            ..
+        } = &statements[1].kind
+        else {
+            panic!("expected class")
+        };
+        assert_eq!(superclass.as_ref().unwrap().to_string(), "基础.视图");
+        assert_eq!(superclass.as_ref().unwrap().segments.len(), 2);
+        assert_eq!(protocols[0].to_string(), "基础.可描述");
+        assert_eq!(protocols[1].to_string(), "协议库.可点击");
+        assert_eq!(fields[0].type_ref.name, "基础.视图?");
+        let StmtKind::Function {
+            params,
+            return_type,
+            body,
+            ..
+        } = &methods[0].kind
+        else {
+            panic!("expected method")
+        };
+        assert_eq!(
+            params[0].type_ref.as_ref().unwrap().name,
+            "列<基础.视图|基础.窗口>"
+        );
+        assert_eq!(
+            params[1].type_ref.as_ref().unwrap().name,
+            "法（基础.视图，列<基础.按钮>）：基础.窗口"
+        );
+        assert_eq!(return_type.as_ref().unwrap().name, "任务<基础.视图>");
+        let StmtKind::If { condition, .. } = &body[0].kind else {
+            panic!("expected type-test branch")
+        };
+        let ExprKind::TypeTest { type_ref, .. } = &condition.kind else {
+            panic!("expected type test")
+        };
+        assert_eq!(type_ref.name, "基础.按钮");
+        assert_eq!(type_ref.span.source.name, "<文句>");
+    }
+
+    #[test]
+    fn qualified_type_errors_point_at_the_broken_segment() {
+        let error = parse(lexer::scan("定 根：基础. 为 空；").unwrap()).unwrap_err();
+        assert_eq!(error.message, "类型路径的点号之后须有标识符");
+        assert_eq!(error.span.column, 9);
+
+        let error = parse(lexer::scan("类 按钮 承 基础. 则 终").unwrap()).unwrap_err();
+        assert_eq!(error.message, "类型路径的点号之后须有标识符");
+        assert_eq!(error.span.column, 12);
+    }
+
+    #[test]
+    fn public_import_is_top_level_only() {
+        let statements = parse(lexer::scan("公 引「views.yx」为 视图；").unwrap()).unwrap();
+        assert!(statements[0].public);
+        assert!(matches!(statements[0].kind, StmtKind::Import { .. }));
+
+        let error =
+            parse(lexer::scan("若 真 则 公 引「views.yx」为 视图；终").unwrap()).unwrap_err();
+        assert_eq!(error.message, "“公 引”只可用于模块顶层");
+        assert_eq!(error.span.column, 7);
     }
 
     #[test]

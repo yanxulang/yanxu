@@ -551,7 +551,14 @@ fn document_file(path: &str, output: Option<&str>) -> ExitCode {
             .file_stem()
             .and_then(|name| name.to_str())
             .unwrap_or("无名模块");
-        yanxu::docgen::markdown(name, &statements)
+        match yanxu::docgen::markdown_in_directory(
+            name,
+            &statements,
+            canonical.parent().unwrap_or_else(|| Path::new(".")),
+        ) {
+            Ok(markdown) => markdown,
+            Err(error) => return fail(error),
+        }
     };
     if let Some(output) = output {
         match fs::write(output, markdown) {
@@ -580,11 +587,18 @@ fn document_json(path: &str, output: Option<&str>) -> ExitCode {
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or("无名模块");
-    let document =
-        match serde_json::to_string_pretty(&yanxu::docgen::api_manifest(name, &statements)) {
-            Ok(document) => document + "\n",
-            Err(error) => return fail(format!("不能生成 API JSON：{error}")),
-        };
+    let manifest = match yanxu::docgen::api_manifest_in_directory(
+        name,
+        &statements,
+        canonical.parent().unwrap_or_else(|| Path::new(".")),
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) => return fail(error),
+    };
+    let document = match serde_json::to_string_pretty(&manifest) {
+        Ok(document) => document + "\n",
+        Err(error) => return fail(format!("不能生成 API JSON：{error}")),
+    };
     if let Some(output) = output {
         match fs::write(output, document) {
             Ok(()) => {

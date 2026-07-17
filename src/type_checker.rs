@@ -4,12 +4,12 @@
 //! 运算符和法调用中能够确定的冲突。无法确定的动态成员会降级为 `任意`。
 
 use crate::ast::{
-    Expr, ExprKind, Literal, Parameter, Stmt, StmtKind, TypeKind, TypeRef, Visibility,
+    Expr, ExprKind, Literal, Parameter, Stmt, StmtKind, TypeKind, TypePath, TypeRef, Visibility,
 };
 use crate::source::Span;
 use crate::token::TokenKind;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use crate::type_model::{ModuleId, TypeDeclarationKind, TypeId};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,12 +29,18 @@ impl fmt::Display for TypeError {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum StaticType {
     Any,
-    Named(String),
+    Named(NamedType),
     List(Box<TypeSet>),
     Tuple(Vec<TypeSet>),
     Map(Box<TypeSet>, Box<TypeSet>),
     Function(Vec<TypeSet>, Box<TypeSet>),
     Task(Box<TypeSet>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum NamedType {
+    Builtin(String),
+    Declared(TypeId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,55 +55,19 @@ impl TypeSet {
             return Self::any();
         }
         Self {
-            variants: vec![StaticType::Named(name)],
+            variants: vec![StaticType::Named(NamedType::Builtin(name))],
+        }
+    }
+
+    fn declared(type_id: TypeId) -> Self {
+        Self {
+            variants: vec![StaticType::Named(NamedType::Declared(type_id))],
         }
     }
 
     fn any() -> Self {
         Self {
             variants: vec![StaticType::Any],
-        }
-    }
-
-    fn from_ref(type_ref: &TypeRef) -> Self {
-        Self::from_kind(&type_ref.kind)
-    }
-
-    fn from_kind(kind: &TypeKind) -> Self {
-        match kind {
-            TypeKind::Named(name) => Self::named(name),
-            TypeKind::Union(types) => {
-                Self::union(types.iter().map(Self::from_kind).collect::<Vec<_>>())
-            }
-            TypeKind::Nullable(ty) => Self::union(vec![Self::from_kind(ty), Self::named("空")]),
-            TypeKind::Generic { base, arguments } if base == "列" && arguments.len() == 1 => {
-                Self::single(StaticType::List(Box::new(Self::from_kind(&arguments[0]))))
-            }
-            TypeKind::Generic { base, arguments } if base == "典" && arguments.len() == 2 => {
-                Self::single(StaticType::Map(
-                    Box::new(Self::from_kind(&arguments[0])),
-                    Box::new(Self::from_kind(&arguments[1])),
-                ))
-            }
-            TypeKind::Generic { base, arguments } if base == "任务" && arguments.len() == 1 => {
-                Self::single(StaticType::Task(Box::new(Self::from_kind(&arguments[0]))))
-            }
-            TypeKind::Generic { base, arguments } if base == "元" => Self::single(
-                StaticType::Tuple(arguments.iter().map(Self::from_kind).collect()),
-            ),
-            TypeKind::Generic { base, arguments } => Self::named(format!(
-                "{}<{}>",
-                base,
-                arguments
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("，")
-            )),
-            TypeKind::Function { parameters, result } => Self::single(StaticType::Function(
-                parameters.iter().map(Self::from_kind).collect(),
-                Box::new(Self::from_kind(result)),
-            )),
         }
     }
 
@@ -134,7 +104,8 @@ impl TypeSet {
     fn contains(&self, name: &str) -> bool {
         self.variants.iter().any(|ty| match ty {
             StaticType::Any => true,
-            StaticType::Named(actual) => actual == name,
+            StaticType::Named(NamedType::Builtin(actual)) => actual == name,
+            StaticType::Named(NamedType::Declared(_)) => false,
             StaticType::List(_) => name == "列",
             StaticType::Tuple(_) => name == "元",
             StaticType::Map(_, _) => name == "典",
@@ -161,11 +132,15 @@ impl TypeSet {
                 StaticType::List(element) => elements.push(element.as_ref().clone()),
                 StaticType::Tuple(items) => elements.extend(items.iter().cloned()),
                 StaticType::Map(key, _) => elements.push(key.as_ref().clone()),
-                StaticType::Named(name) if name == "文" => elements.push(Self::named("文")),
-                StaticType::Named(name) if name == "列" || name == "元" || name == "典" => {
+                StaticType::Named(NamedType::Builtin(name)) if name == "文" => {
+                    elements.push(Self::named("文"));
+                }
+                StaticType::Named(NamedType::Builtin(name))
+                    if name == "列" || name == "元" || name == "典" =>
+                {
                     elements.push(Self::any())
                 }
-                StaticType::Named(name)
+                StaticType::Named(NamedType::Builtin(name))
                     if !matches!(
                         name.as_str(),
                         "数" | "理" | "空" | "法" | "类" | "模块" | "误"
@@ -173,6 +148,7 @@ impl TypeSet {
                 {
                     elements.push(Self::any())
                 }
+                StaticType::Named(NamedType::Declared(_)) => elements.push(Self::any()),
                 _ => {}
             }
         }
@@ -183,7 +159,26 @@ impl TypeSet {
         let variants = self
             .variants
             .iter()
-            .filter(|ty| !matches!(ty, StaticType::Named(name) if name == excluded))
+            .filter(|ty| {
+                !matches!(
+                    ty,
+                    StaticType::Named(NamedType::Builtin(name)) if name == excluded
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if variants.is_empty() {
+            Self::any()
+        } else {
+            Self { variants }
+        }
+    }
+
+    fn without(&self, excluded: &Self) -> Self {
+        let variants = self
+            .variants
+            .iter()
+            .filter(|ty| !excluded.variants.contains(ty))
             .cloned()
             .collect::<Vec<_>>();
         if variants.is_empty() {
@@ -212,16 +207,16 @@ fn accepts_one(expected: &StaticType, actual: &StaticType) -> bool {
     match (expected, actual) {
         (StaticType::Any, _) | (_, StaticType::Any) => true,
         (StaticType::Named(expected), StaticType::Named(actual)) => expected == actual,
-        (StaticType::Named(name), StaticType::List(_))
-        | (StaticType::List(_), StaticType::Named(name)) => name == "列",
-        (StaticType::Named(name), StaticType::Tuple(_))
-        | (StaticType::Tuple(_), StaticType::Named(name)) => name == "元",
-        (StaticType::Named(name), StaticType::Map(_, _))
-        | (StaticType::Map(_, _), StaticType::Named(name)) => name == "典",
-        (StaticType::Named(name), StaticType::Function(_, _))
-        | (StaticType::Function(_, _), StaticType::Named(name)) => name == "法",
-        (StaticType::Named(name), StaticType::Task(_))
-        | (StaticType::Task(_), StaticType::Named(name)) => name == "任务",
+        (StaticType::Named(NamedType::Builtin(name)), StaticType::List(_))
+        | (StaticType::List(_), StaticType::Named(NamedType::Builtin(name))) => name == "列",
+        (StaticType::Named(NamedType::Builtin(name)), StaticType::Tuple(_))
+        | (StaticType::Tuple(_), StaticType::Named(NamedType::Builtin(name))) => name == "元",
+        (StaticType::Named(NamedType::Builtin(name)), StaticType::Map(_, _))
+        | (StaticType::Map(_, _), StaticType::Named(NamedType::Builtin(name))) => name == "典",
+        (StaticType::Named(NamedType::Builtin(name)), StaticType::Function(_, _))
+        | (StaticType::Function(_, _), StaticType::Named(NamedType::Builtin(name))) => name == "法",
+        (StaticType::Named(NamedType::Builtin(name)), StaticType::Task(_))
+        | (StaticType::Task(_), StaticType::Named(NamedType::Builtin(name))) => name == "任务",
         (StaticType::List(expected), StaticType::List(actual)) => expected.accepts(actual),
         (
             StaticType::Map(expected_key, expected_value),
@@ -253,7 +248,8 @@ fn accepts_one(expected: &StaticType, actual: &StaticType) -> bool {
 fn static_type_name(ty: &StaticType) -> String {
     match ty {
         StaticType::Any => "任意".into(),
-        StaticType::Named(name) => name.clone(),
+        StaticType::Named(NamedType::Builtin(name)) => name.clone(),
+        StaticType::Named(NamedType::Declared(type_id)) => type_id.qualified_name(),
         StaticType::List(element) => format!("列<{element}>"),
         StaticType::Tuple(items) => format!(
             "元<{}>",
@@ -287,8 +283,8 @@ struct Binding {
     ty: TypeSet,
     mutable: bool,
     function: Option<FunctionType>,
-    class_name: Option<String>,
-    module: Option<ObjectShape>,
+    class_id: Option<TypeId>,
+    module: Option<ModuleSummary>,
 }
 
 #[derive(Clone)]
@@ -298,25 +294,67 @@ struct MemberType {
     is_static: bool,
     readonly: bool,
     visibility: Visibility,
-    owner: String,
+    owner: TypeId,
 }
 
 #[derive(Clone, Default)]
 struct ObjectShape {
-    fields: HashMap<String, MemberType>,
-    methods: HashMap<String, MemberType>,
+    fields: BTreeMap<String, MemberType>,
+    methods: BTreeMap<String, MemberType>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+enum ExportedSymbol {
+    Value {
+        binding: Binding,
+        declaration: Span,
+    },
+    Class {
+        type_id: TypeId,
+        constructor: FunctionType,
+        shape: ObjectShape,
+        superclass: Option<TypeId>,
+        protocols: Vec<TypeId>,
+        declaration: Span,
+    },
+    Protocol {
+        type_id: TypeId,
+        shape: ObjectShape,
+        declaration: Span,
+    },
+    Module {
+        summary: Box<ModuleSummary>,
+        declaration: Span,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct ModuleSummary {
+    pub(crate) module_id: ModuleId,
+    source_path: Option<PathBuf>,
+    exports: BTreeMap<String, ExportedSymbol>,
+}
+
+#[derive(Clone)]
+struct LocalType {
+    type_id: TypeId,
+    public: bool,
+}
+
+struct ModuleContext {
+    module_id: ModuleId,
+    local_types: BTreeMap<String, LocalType>,
+    imports: BTreeMap<String, ModuleSummary>,
 }
 
 type Scope = HashMap<String, Binding>;
 
 pub fn check(statements: &[Stmt]) -> Result<(), Vec<TypeError>> {
     let mut checker = Checker::new();
-    checker.check_scope(statements, Scope::new(), None);
-    if checker.errors.is_empty() {
-        Ok(())
-    } else {
-        Err(checker.errors)
-    }
+    checker.check_root_module(statements);
+    checker.finish()
 }
 
 pub fn check_in_directory(
@@ -330,12 +368,8 @@ pub fn check_in_directory(
         .ok()
         .flatten()
         .map(|manifest| manifest.root);
-    checker.check_scope(statements, Scope::new(), None);
-    if checker.errors.is_empty() {
-        Ok(())
-    } else {
-        Err(checker.errors)
-    }
+    checker.check_root_module(statements);
+    checker.finish()
 }
 
 pub fn check_in_directory_with_permissions(
@@ -351,27 +385,24 @@ pub fn check_in_directory_with_permissions(
         .flatten()
         .map(|manifest| manifest.root);
     checker.permissions = Some(permissions);
-    checker.check_scope(statements, Scope::new(), None);
-    if checker.errors.is_empty() {
-        Ok(())
-    } else {
-        Err(checker.errors)
-    }
+    checker.check_root_module(statements);
+    checker.finish()
 }
 
 struct Checker {
     errors: Vec<TypeError>,
-    protocols: HashMap<String, ObjectShape>,
-    classes: HashMap<String, ObjectShape>,
-    class_parents: HashMap<String, String>,
-    class_protocols: HashMap<String, HashSet<String>>,
-    current_class: Option<String>,
+    protocols: HashMap<TypeId, ObjectShape>,
+    classes: HashMap<TypeId, ObjectShape>,
+    class_parents: HashMap<TypeId, TypeId>,
+    class_protocols: HashMap<TypeId, BTreeSet<TypeId>>,
+    current_class: Option<TypeId>,
     current_method_static: bool,
     current_dir: Option<PathBuf>,
     package_root: Option<PathBuf>,
     package_module_roots: Vec<PathBuf>,
-    module_cache: HashMap<PathBuf, ObjectShape>,
+    module_cache: HashMap<PathBuf, ModuleSummary>,
     loading_modules: Vec<PathBuf>,
+    module_contexts: Vec<ModuleContext>,
     permissions: Option<crate::permissions::PermissionSet>,
 }
 
@@ -390,7 +421,547 @@ impl Checker {
             package_module_roots: Vec::new(),
             module_cache: HashMap::new(),
             loading_modules: Vec::new(),
+            module_contexts: Vec::new(),
             permissions: None,
+        }
+    }
+
+    fn finish(self) -> Result<(), Vec<TypeError>> {
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(self.errors)
+        }
+    }
+
+    fn check_root_module(&mut self, statements: &[Stmt]) {
+        let source_name = statements
+            .first()
+            .map(|statement| statement.span.source.name.as_str())
+            .unwrap_or("<空模块>");
+        let source_path = existing_source_path(source_name);
+        let module_id = source_path
+            .as_deref()
+            .map_or_else(|| ModuleId::for_source(source_name), ModuleId::for_path);
+        if let Some(path) = &source_path {
+            self.loading_modules.push(path.clone());
+        }
+        self.check_module(statements, module_id, source_path);
+        if !self.loading_modules.is_empty() {
+            self.loading_modules.pop();
+        }
+    }
+
+    fn check_module(
+        &mut self,
+        statements: &[Stmt],
+        module_id: ModuleId,
+        source_path: Option<PathBuf>,
+    ) -> ModuleSummary {
+        let mut imports = BTreeMap::new();
+        for statement in statements {
+            if let StmtKind::Import { alias, path } = &statement.kind
+                && let Some(summary) = self.load_module_summary(path, &statement.span)
+            {
+                imports.insert(alias.clone(), summary);
+            }
+        }
+        let local_types = statements
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                StmtKind::Class { name, .. } => Some((
+                    name.clone(),
+                    LocalType {
+                        type_id: TypeId::new(module_id.clone(), name, TypeDeclarationKind::Class),
+                        public: statement.public,
+                    },
+                )),
+                StmtKind::Protocol { name, .. } => Some((
+                    name.clone(),
+                    LocalType {
+                        type_id: TypeId::new(
+                            module_id.clone(),
+                            name,
+                            TypeDeclarationKind::Protocol,
+                        ),
+                        public: statement.public,
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        self.module_contexts.push(ModuleContext {
+            module_id: module_id.clone(),
+            local_types,
+            imports,
+        });
+        self.register_object_declarations(statements);
+        let module_scope = self.check_scope(statements, Scope::new(), None);
+        let summary = self.module_summary(statements, &module_scope, module_id, source_path);
+        self.module_contexts.pop();
+        summary
+    }
+
+    fn register_object_declarations(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            if let StmtKind::Protocol {
+                name,
+                fields,
+                methods,
+            } = &statement.kind
+                && let Some(type_id) = self.local_type_id(name)
+            {
+                let shape = self.object_shape(&type_id, fields, methods);
+                self.protocols.insert(type_id, shape);
+            }
+        }
+        for statement in statements {
+            if let StmtKind::Class {
+                name,
+                superclass,
+                protocols,
+                fields,
+                methods,
+            } = &statement.kind
+                && let Some(type_id) = self.local_type_id(name)
+            {
+                let shape = self.object_shape(&type_id, fields, methods);
+                self.classes.insert(type_id.clone(), shape);
+                let protocol_ids = protocols
+                    .iter()
+                    .filter_map(|path| {
+                        self.resolve_declared_type(path, Some(TypeDeclarationKind::Protocol))
+                    })
+                    .collect();
+                self.class_protocols.insert(type_id.clone(), protocol_ids);
+                if let Some(superclass) = superclass
+                    && let Some(parent) =
+                        self.resolve_declared_type(superclass, Some(TypeDeclarationKind::Class))
+                {
+                    self.class_parents.insert(type_id, parent);
+                }
+            }
+        }
+    }
+
+    fn local_type_id(&self, name: &str) -> Option<TypeId> {
+        self.module_contexts
+            .last()?
+            .local_types
+            .get(name)
+            .map(|local| local.type_id.clone())
+    }
+
+    fn type_set_from_ref(&mut self, type_ref: &TypeRef) -> TypeSet {
+        self.type_set_from_kind(&type_ref.kind)
+    }
+
+    fn type_set_from_kind(&mut self, kind: &TypeKind) -> TypeSet {
+        match kind {
+            TypeKind::Named(path) => {
+                if let Some(name) = path.single_name()
+                    && is_builtin_type(name)
+                {
+                    TypeSet::named(name)
+                } else {
+                    self.resolve_declared_type(path, None)
+                        .map_or_else(TypeSet::any, TypeSet::declared)
+                }
+            }
+            TypeKind::Union(types) => {
+                TypeSet::union(types.iter().map(|ty| self.type_set_from_kind(ty)).collect())
+            }
+            TypeKind::Nullable(ty) => {
+                TypeSet::union(vec![self.type_set_from_kind(ty), TypeSet::named("空")])
+            }
+            TypeKind::Generic { base, arguments }
+                if base.is_single("列") && arguments.len() == 1 =>
+            {
+                let element = self.type_set_from_kind(&arguments[0]);
+                TypeSet::single(StaticType::List(Box::new(element)))
+            }
+            TypeKind::Generic { base, arguments }
+                if base.is_single("典") && arguments.len() == 2 =>
+            {
+                let key = self.type_set_from_kind(&arguments[0]);
+                let value = self.type_set_from_kind(&arguments[1]);
+                TypeSet::single(StaticType::Map(Box::new(key), Box::new(value)))
+            }
+            TypeKind::Generic { base, arguments }
+                if base.is_single("任务") && arguments.len() == 1 =>
+            {
+                let result = self.type_set_from_kind(&arguments[0]);
+                TypeSet::single(StaticType::Task(Box::new(result)))
+            }
+            TypeKind::Generic { base, arguments } if base.is_single("元") => {
+                let items = arguments
+                    .iter()
+                    .map(|argument| self.type_set_from_kind(argument))
+                    .collect();
+                TypeSet::single(StaticType::Tuple(items))
+            }
+            TypeKind::Generic { base, arguments } => {
+                for argument in arguments {
+                    self.type_set_from_kind(argument);
+                }
+                self.resolve_declared_type(base, None)
+                    .map_or_else(TypeSet::any, TypeSet::declared)
+            }
+            TypeKind::Function { parameters, result } => {
+                let parameters = parameters
+                    .iter()
+                    .map(|parameter| self.type_set_from_kind(parameter))
+                    .collect();
+                let result = self.type_set_from_kind(result);
+                TypeSet::single(StaticType::Function(parameters, Box::new(result)))
+            }
+        }
+    }
+
+    fn parameter_type(&mut self, parameter: &Parameter) -> TypeSet {
+        parameter
+            .type_ref
+            .as_ref()
+            .map_or_else(TypeSet::any, |ty| self.type_set_from_ref(ty))
+    }
+
+    fn resolve_declared_type(
+        &mut self,
+        path: &TypePath,
+        expected: Option<TypeDeclarationKind>,
+    ) -> Option<TypeId> {
+        if let Some(name) = path.single_name() {
+            let local = self
+                .module_contexts
+                .last()
+                .and_then(|context| context.local_types.get(name))
+                .cloned();
+            if let Some(local) = local {
+                return self.require_declaration_kind(local.type_id, expected, &path.span);
+            }
+            let imported_owner = self.module_contexts.last().and_then(|context| {
+                context.imports.iter().find_map(|(alias, summary)| {
+                    matches!(
+                        summary.exports.get(name),
+                        Some(ExportedSymbol::Class { .. } | ExportedSymbol::Protocol { .. })
+                    )
+                    .then_some(alias.clone())
+                })
+            });
+            if let Some(alias) = imported_owner {
+                self.error(
+                    format!("导入类型“{name}”不可裸写；请使用“{alias}.{name}”"),
+                    path.span.clone(),
+                );
+            } else {
+                self.error(format!("本模块未声明类型“{name}”"), path.span.clone());
+            }
+            return None;
+        }
+
+        let first = &path.segments[0];
+        let mut summary = self
+            .module_contexts
+            .last()
+            .and_then(|context| context.imports.get(&first.name))
+            .cloned();
+        let Some(mut summary) = summary.take() else {
+            self.error(
+                format!("类型路径“{path}”的模块别名“{}”不存在", first.name),
+                first.span.clone(),
+            );
+            return None;
+        };
+        for (index, segment) in path.segments.iter().enumerate().skip(1) {
+            let Some(symbol) = summary.exports.get(&segment.name).cloned() else {
+                self.error(
+                    format!(
+                        "模块“{}”未公开成员“{}”（类型路径“{path}”）",
+                        summary.module_id, segment.name
+                    ),
+                    segment.span.clone(),
+                );
+                return None;
+            };
+            let last = index + 1 == path.segments.len();
+            if !last {
+                match symbol {
+                    ExportedSymbol::Module {
+                        summary: nested, ..
+                    } => summary = *nested,
+                    _ => {
+                        self.error(
+                            format!("类型路径“{path}”的中间段“{}”不是模块", segment.name),
+                            segment.span.clone(),
+                        );
+                        return None;
+                    }
+                }
+                continue;
+            }
+            let type_id = match symbol {
+                ExportedSymbol::Class { type_id, .. }
+                | ExportedSymbol::Protocol { type_id, .. } => type_id,
+                ExportedSymbol::Module { .. } => {
+                    self.error(
+                        format!("类型路径“{path}”最终指向模块而非类或协"),
+                        segment.span.clone(),
+                    );
+                    return None;
+                }
+                ExportedSymbol::Value { .. } => {
+                    self.error(
+                        format!("模块成员“{}”不是类或协", segment.name),
+                        segment.span.clone(),
+                    );
+                    return None;
+                }
+            };
+            return self.require_declaration_kind(type_id, expected, &segment.span);
+        }
+        None
+    }
+
+    fn require_declaration_kind(
+        &mut self,
+        type_id: TypeId,
+        expected: Option<TypeDeclarationKind>,
+        span: &Span,
+    ) -> Option<TypeId> {
+        if let Some(expected) = expected
+            && type_id.kind != expected
+        {
+            self.error(
+                format!(
+                    "“{}”声明为{}，不可用作{}",
+                    type_id.qualified_name(),
+                    type_id.kind,
+                    expected
+                ),
+                span.clone(),
+            );
+            None
+        } else {
+            Some(type_id)
+        }
+    }
+
+    fn object_shape(
+        &mut self,
+        owner: &TypeId,
+        fields: &[crate::ast::FieldDecl],
+        methods: &[Stmt],
+    ) -> ObjectShape {
+        let mut shape = ObjectShape::default();
+        for field in fields {
+            let ty = self.type_set_from_ref(&field.type_ref);
+            shape.fields.insert(
+                field.name.clone(),
+                MemberType {
+                    ty,
+                    function: None,
+                    is_static: field.is_static,
+                    readonly: field.readonly,
+                    visibility: field.visibility,
+                    owner: owner.clone(),
+                },
+            );
+        }
+        for method in methods {
+            let StmtKind::Function {
+                name,
+                params,
+                return_type,
+                is_async,
+                ..
+            } = &method.kind
+            else {
+                continue;
+            };
+            let mut result = return_type
+                .as_ref()
+                .map_or_else(TypeSet::any, |ty| self.type_set_from_ref(ty));
+            if *is_async {
+                result = TypeSet::single(StaticType::Task(Box::new(result)));
+            }
+            let function = FunctionType {
+                params: params
+                    .iter()
+                    .map(|parameter| self.parameter_type(parameter))
+                    .collect(),
+                result,
+            };
+            shape.methods.insert(
+                name.clone(),
+                MemberType {
+                    ty: TypeSet::named("法"),
+                    function: Some(function),
+                    is_static: method.is_static,
+                    readonly: true,
+                    visibility: method.member_visibility,
+                    owner: owner.clone(),
+                },
+            );
+        }
+        shape
+    }
+
+    fn module_summary(
+        &mut self,
+        statements: &[Stmt],
+        scope: &Scope,
+        module_id: ModuleId,
+        source_path: Option<PathBuf>,
+    ) -> ModuleSummary {
+        let mut exports = BTreeMap::new();
+        for statement in statements.iter().filter(|statement| statement.public) {
+            match &statement.kind {
+                StmtKind::Let { name, .. } | StmtKind::Function { name, .. } => {
+                    if let Some(binding) = scope.get(name).cloned() {
+                        self.validate_public_binding(name, &binding, &statement.span);
+                        exports.insert(
+                            name.clone(),
+                            ExportedSymbol::Value {
+                                binding,
+                                declaration: statement.span.clone(),
+                            },
+                        );
+                    }
+                }
+                StmtKind::Class { name, .. } => {
+                    let Some(type_id) = self.local_type_id(name) else {
+                        continue;
+                    };
+                    let Some(class_binding) = scope.get(name) else {
+                        continue;
+                    };
+                    let constructor = class_binding.function.clone().unwrap_or(FunctionType {
+                        params: Vec::new(),
+                        result: TypeSet::declared(type_id.clone()),
+                    });
+                    let shape = self.classes.get(&type_id).cloned().unwrap_or_default();
+                    let superclass = self.class_parents.get(&type_id).cloned();
+                    let mut protocols = self
+                        .class_protocols
+                        .get(&type_id)
+                        .map(|items| items.iter().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    protocols.sort();
+                    for (member_name, member) in shape
+                        .fields
+                        .iter()
+                        .chain(&shape.methods)
+                        .filter(|(_, member)| member.visibility == Visibility::Public)
+                    {
+                        self.validate_public_binding(
+                            &format!("{name}.{member_name}"),
+                            &Binding {
+                                ty: member.ty.clone(),
+                                mutable: false,
+                                function: member.function.clone(),
+                                class_id: None,
+                                module: None,
+                            },
+                            &statement.span,
+                        );
+                    }
+                    for exposed_type in superclass.iter().chain(&protocols) {
+                        self.validate_public_binding(
+                            name,
+                            &binding(TypeSet::declared(exposed_type.clone()), false),
+                            &statement.span,
+                        );
+                    }
+                    exports.insert(
+                        name.clone(),
+                        ExportedSymbol::Class {
+                            type_id,
+                            constructor,
+                            shape,
+                            superclass,
+                            protocols,
+                            declaration: statement.span.clone(),
+                        },
+                    );
+                }
+                StmtKind::Protocol { name, .. } => {
+                    let Some(type_id) = self.local_type_id(name) else {
+                        continue;
+                    };
+                    let shape = self.protocols.get(&type_id).cloned().unwrap_or_default();
+                    for (member_name, member) in shape.fields.iter().chain(&shape.methods) {
+                        self.validate_public_binding(
+                            &format!("{name}.{member_name}"),
+                            &Binding {
+                                ty: member.ty.clone(),
+                                mutable: false,
+                                function: member.function.clone(),
+                                class_id: None,
+                                module: None,
+                            },
+                            &statement.span,
+                        );
+                    }
+                    exports.insert(
+                        name.clone(),
+                        ExportedSymbol::Protocol {
+                            type_id,
+                            shape,
+                            declaration: statement.span.clone(),
+                        },
+                    );
+                }
+                StmtKind::Import { alias, .. } => {
+                    if let Some(summary) = self
+                        .module_contexts
+                        .last()
+                        .and_then(|context| context.imports.get(alias))
+                        .cloned()
+                    {
+                        exports.insert(
+                            alias.clone(),
+                            ExportedSymbol::Module {
+                                summary: Box::new(summary),
+                                declaration: statement.span.clone(),
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        ModuleSummary {
+            module_id,
+            source_path,
+            exports,
+        }
+    }
+
+    fn validate_public_binding(&mut self, name: &str, binding: &Binding, span: &Span) {
+        let mut referenced = Vec::new();
+        collect_declared_types(&binding.ty, &mut referenced);
+        if let Some(function) = &binding.function {
+            for parameter in &function.params {
+                collect_declared_types(parameter, &mut referenced);
+            }
+            collect_declared_types(&function.result, &mut referenced);
+        }
+        for type_id in referenced {
+            let private_local = self
+                .module_contexts
+                .last()
+                .filter(|context| context.module_id == type_id.module)
+                .and_then(|context| context.local_types.get(&type_id.name))
+                .is_some_and(|local| !local.public);
+            if private_local {
+                self.error(
+                    format!(
+                        "公开声明“{name}”泄漏不可访问的私有类型“{}”",
+                        type_id.qualified_name()
+                    ),
+                    span.clone(),
+                );
+            }
         }
     }
 
@@ -409,43 +980,17 @@ impl Checker {
 
     fn predeclare(&mut self, statements: &[Stmt], scope: &mut Scope) {
         for statement in statements {
-            if let StmtKind::Protocol {
-                name,
-                fields,
-                methods,
-            } = &statement.kind
-            {
-                self.protocols
-                    .insert(name.clone(), object_shape(name, fields, methods));
+            if let StmtKind::Protocol { name, .. } = &statement.kind {
                 scope.insert(
                     name.clone(),
                     Binding {
                         ty: TypeSet::named("协"),
                         mutable: false,
                         function: None,
-                        class_name: None,
+                        class_id: None,
                         module: None,
                     },
                 );
-            }
-        }
-        for statement in statements {
-            if let StmtKind::Class {
-                name,
-                superclass,
-                protocols,
-                fields,
-                methods,
-                ..
-            } = &statement.kind
-            {
-                self.classes
-                    .insert(name.clone(), object_shape(name, fields, methods));
-                self.class_protocols
-                    .insert(name.clone(), protocols.iter().cloned().collect());
-                if let Some(superclass) = superclass {
-                    self.class_parents.insert(name.clone(), superclass.clone());
-                }
             }
         }
         for statement in statements {
@@ -459,9 +1004,12 @@ impl Checker {
                 } => {
                     let result = return_type
                         .as_ref()
-                        .map_or_else(TypeSet::any, TypeSet::from_ref);
+                        .map_or_else(TypeSet::any, |ty| self.type_set_from_ref(ty));
                     let function = FunctionType {
-                        params: params.iter().map(parameter_type).collect(),
+                        params: params
+                            .iter()
+                            .map(|parameter| self.parameter_type(parameter))
+                            .collect(),
                         result: if *is_async {
                             TypeSet::single(StaticType::Task(Box::new(result)))
                         } else {
@@ -474,16 +1022,22 @@ impl Checker {
                             ty: TypeSet::named("法"),
                             mutable: false,
                             function: Some(function),
-                            class_name: None,
+                            class_id: None,
                             module: None,
                         },
                     );
                 }
                 StmtKind::Class { name, methods, .. } => {
+                    let Some(type_id) = self.local_type_id(name) else {
+                        continue;
+                    };
                     let initializer = methods.iter().find_map(|method| match &method.kind {
-                        StmtKind::Function { name, params, .. } if name == "初始化" => {
-                            Some(params.iter().map(parameter_type).collect())
-                        }
+                        StmtKind::Function { name, params, .. } if name == "初始化" => Some(
+                            params
+                                .iter()
+                                .map(|parameter| self.parameter_type(parameter))
+                                .collect(),
+                        ),
                         _ => None,
                     });
                     scope.insert(
@@ -493,15 +1047,19 @@ impl Checker {
                             mutable: false,
                             function: Some(FunctionType {
                                 params: initializer.unwrap_or_default(),
-                                result: TypeSet::named(name),
+                                result: TypeSet::declared(type_id.clone()),
                             }),
-                            class_name: Some(name.clone()),
+                            class_id: Some(type_id),
                             module: None,
                         },
                     );
                 }
-                StmtKind::Import { alias, path } => {
-                    let module = self.load_module_summary(path, &statement.span);
+                StmtKind::Import { alias, .. } => {
+                    let module = self
+                        .module_contexts
+                        .last()
+                        .and_then(|context| context.imports.get(alias))
+                        .cloned();
                     let mut imported = binding(TypeSet::named("模块"), false);
                     imported.module = module;
                     scope.insert(alias.clone(), imported);
@@ -526,7 +1084,7 @@ impl Checker {
                 mutable,
             } => {
                 let actual = self.expression(value, scope);
-                let declared = type_ref.as_ref().map(TypeSet::from_ref);
+                let declared = type_ref.as_ref().map(|ty| self.type_set_from_ref(ty));
                 if let Some(expected) = &declared {
                     self.require(expected, &actual, &value.span, format!("变量“{name}”"));
                 }
@@ -550,7 +1108,7 @@ impl Checker {
                     if let ExprKind::Get { object, name } = &target.kind
                         && let Some(member) = self.direct_member(object, name, scope)
                         && member.readonly
-                        && self.current_class.as_deref() != Some(member.owner.as_str())
+                        && self.current_class.as_ref() != Some(&member.owner)
                     {
                         self.error(format!("只读成员“{name}”不可改写"), target.span.clone());
                     }
@@ -569,8 +1127,8 @@ impl Checker {
                 self.expression(condition, scope);
                 let mut then_scope = scope.clone();
                 let mut else_scope = scope.clone();
-                narrow_condition(condition, &mut then_scope, true);
-                narrow_condition(condition, &mut else_scope, false);
+                self.narrow_condition(condition, &mut then_scope, true);
+                self.narrow_condition(condition, &mut else_scope, false);
                 self.check_scope(then_branch, then_scope, expected_return);
                 self.check_scope(else_branch, else_scope, expected_return);
             }
@@ -590,7 +1148,7 @@ impl Checker {
                     self.error(format!("{}不可遍历", iterable_type), iterable.span.clone());
                 }
                 let inferred = inferred.unwrap_or_else(TypeSet::any);
-                let declared = type_ref.as_ref().map(TypeSet::from_ref);
+                let declared = type_ref.as_ref().map(|ty| self.type_set_from_ref(ty));
                 if let Some(expected) = &declared {
                     self.require(expected, &inferred, &iterable.span, format!("逐值“{name}”"));
                 }
@@ -613,45 +1171,41 @@ impl Checker {
                 for parameter in params {
                     child.insert(
                         parameter.name.clone(),
-                        binding(parameter_type(parameter), true),
+                        binding(self.parameter_type(parameter), true),
                     );
                 }
-                let result = return_type.as_ref().map(TypeSet::from_ref);
+                let result = return_type.as_ref().map(|ty| self.type_set_from_ref(ty));
                 self.check_scope(body, child, result.as_ref());
             }
             StmtKind::Class {
                 name,
-                superclass,
-                protocols,
                 fields,
                 methods,
+                ..
             } => {
-                if let Some(superclass) = superclass
-                    && !scope
-                        .get(superclass)
-                        .is_some_and(|item| item.ty.contains("类"))
-                {
-                    self.error(
-                        format!("父类“{superclass}”未声明为类"),
-                        statement.span.clone(),
-                    );
-                }
                 for field in fields {
                     if let Some(initial) = &field.initial {
                         let actual = self.expression(initial, scope);
+                        let expected = self.type_set_from_ref(&field.type_ref);
                         self.require(
-                            &TypeSet::from_ref(&field.type_ref),
+                            &expected,
                             &actual,
                             &initial.span,
                             format!("域“{}”", field.name),
                         );
                     }
                 }
-                let previous_class = self.current_class.replace(name.clone());
+                let Some(class_id) = self.local_type_id(name) else {
+                    return;
+                };
+                let previous_class = self.current_class.replace(class_id.clone());
                 for method in methods {
                     let mut child = scope.clone();
                     if !method.is_static {
-                        child.insert("此".into(), binding(TypeSet::named(name), false));
+                        child.insert(
+                            "此".into(),
+                            binding(TypeSet::declared(class_id.clone()), false),
+                        );
                     }
                     let previous_static =
                         std::mem::replace(&mut self.current_method_static, method.is_static);
@@ -659,10 +1213,15 @@ impl Checker {
                     self.current_method_static = previous_static;
                 }
                 self.current_class = previous_class;
-                if let Some(superclass) = superclass {
-                    self.verify_overrides(name, superclass, &statement.span);
+                if let Some(superclass) = self.class_parents.get(&class_id).cloned() {
+                    self.verify_overrides(&class_id, &superclass, &statement.span);
                 }
-                self.verify_protocols(name, protocols, &statement.span);
+                let protocol_ids = self
+                    .class_protocols
+                    .get(&class_id)
+                    .map(|items| items.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                self.verify_protocols(&class_id, &protocol_ids, &statement.span);
             }
             StmtKind::Protocol { .. } => {}
             StmtKind::Import { .. } => {}
@@ -812,8 +1371,9 @@ impl Checker {
                     _ => TypeSet::named("理"),
                 }
             }
-            ExprKind::TypeTest { value, .. } => {
+            ExprKind::TypeTest { value, type_ref } => {
                 self.expression(value, scope);
+                self.type_set_from_ref(type_ref);
                 TypeSet::named("理")
             }
             ExprKind::Call { callee, arguments } => {
@@ -886,44 +1446,36 @@ impl Checker {
                 }
             }
             ExprKind::Get { object, name } => {
-                if let ExprKind::Variable(object_name) = &object.kind
-                    && let Some(module) = scope
-                        .get(object_name)
-                        .and_then(|binding| binding.module.as_ref())
-                {
+                if let Some(module) = self.module_summary_for_expr(object, scope) {
                     self.expression(object, scope);
-                    if let Some(member) = module.fields.get(name) {
-                        return member_type(member);
+                    if let Some(symbol) = module.exports.get(name) {
+                        return exported_symbol_type(symbol);
                     }
                     self.error(
-                        format!("模块“{object_name}”未公开“{name}”"),
+                        format!("模块“{}”未公开“{name}”", module.module_id),
                         expression.span.clone(),
                     );
                     return TypeSet::any();
                 }
                 let object_type = self.expression(object, scope);
-                let static_class = if let ExprKind::Variable(object_name) = &object.kind {
-                    scope
-                        .get(object_name)
-                        .and_then(|binding| binding.class_name.clone())
-                } else {
-                    None
-                };
+                let static_class = self.class_id_for_expr(object, scope);
                 let mut results = Vec::new();
-                let class_names = if let Some(class_name) = &static_class {
-                    vec![class_name.clone()]
+                let class_ids = if let Some(class_id) = &static_class {
+                    vec![class_id.clone()]
                 } else {
                     object_type
                         .variants
                         .iter()
                         .filter_map(|ty| match ty {
-                            StaticType::Named(name) => Some(name.clone()),
+                            StaticType::Named(NamedType::Declared(type_id)) => {
+                                Some(type_id.clone())
+                            }
                             _ => None,
                         })
                         .collect()
                 };
-                for class_name in class_names {
-                    if let Some(member) = self.member(&class_name, name).cloned() {
+                for class_id in class_ids {
+                    if let Some(member) = self.member(&class_id, name).cloned() {
                         let wants_static = static_class.is_some();
                         if member.is_static != wants_static {
                             self.error(
@@ -935,7 +1487,7 @@ impl Checker {
                             );
                         }
                         if member.visibility == Visibility::Private
-                            && self.current_class.as_deref() != Some(member.owner.as_str())
+                            && self.current_class.as_ref() != Some(&member.owner)
                         {
                             self.error(
                                 format!("私成员“{name}”不可从类外访问"),
@@ -971,7 +1523,7 @@ impl Checker {
                             }
                         }
                         StaticType::Map(_, value) => results.push(value.as_ref().clone()),
-                        StaticType::Named(name) if name == "文" => {
+                        StaticType::Named(NamedType::Builtin(name)) if name == "文" => {
                             results.push(TypeSet::named("文"));
                         }
                         _ => results.push(TypeSet::any()),
@@ -992,12 +1544,46 @@ impl Checker {
         }
     }
 
-    fn load_module_summary(&mut self, requested: &str, import_span: &Span) -> Option<ObjectShape> {
+    fn module_summary_for_expr(&self, expression: &Expr, scope: &Scope) -> Option<ModuleSummary> {
+        match &expression.kind {
+            ExprKind::Variable(name) => scope.get(name)?.module.clone(),
+            ExprKind::Get { object, name } => {
+                let module = self.module_summary_for_expr(object, scope)?;
+                match module.exports.get(name)? {
+                    ExportedSymbol::Module { summary, .. } => Some(summary.as_ref().clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn class_id_for_expr(&self, expression: &Expr, scope: &Scope) -> Option<TypeId> {
+        match &expression.kind {
+            ExprKind::Variable(name) => scope.get(name)?.class_id.clone(),
+            ExprKind::Get { object, name } => {
+                let module = self.module_summary_for_expr(object, scope)?;
+                match module.exports.get(name)? {
+                    ExportedSymbol::Class { type_id, .. } => Some(type_id.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn load_module_summary(
+        &mut self,
+        requested: &str,
+        import_span: &Span,
+    ) -> Option<ModuleSummary> {
         if let Some(name) = requested.strip_prefix("标准:") {
-            return standard_module_shape(name).or_else(|| {
-                self.error(format!("未有标准模块“{name}”"), import_span.clone());
-                None
-            });
+            return standard_module_shape(name)
+                .map(|shape| standard_summary(name, shape, import_span))
+                .or_else(|| {
+                    self.error(format!("未有标准模块“{name}”"), import_span.clone());
+                    None
+                });
         }
         let current_dir = self.current_dir.clone()?;
         let joined = if let Some(name) = requested.strip_prefix("包:") {
@@ -1100,39 +1686,19 @@ impl Checker {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf(),
         );
-        let module_scope = self.check_scope(&statements, Scope::new(), None);
+        let summary = self.check_module(
+            &statements,
+            ModuleId::for_path(&canonical),
+            Some(canonical.clone()),
+        );
         self.current_dir = previous_dir;
         self.loading_modules.pop();
-
-        let mut summary = ObjectShape::default();
-        for statement in statements.iter().filter(|statement| statement.public) {
-            let name = match &statement.kind {
-                StmtKind::Let { name, .. }
-                | StmtKind::Function { name, .. }
-                | StmtKind::Class { name, .. }
-                | StmtKind::Protocol { name, .. } => name,
-                _ => continue,
-            };
-            if let Some(binding) = module_scope.get(name) {
-                summary.fields.insert(
-                    name.clone(),
-                    MemberType {
-                        ty: binding.ty.clone(),
-                        function: binding.function.clone(),
-                        is_static: false,
-                        readonly: !binding.mutable,
-                        visibility: Visibility::Public,
-                        owner: canonical.display().to_string(),
-                    },
-                );
-            }
-        }
         self.module_cache.insert(canonical, summary.clone());
         Some(summary)
     }
 
-    fn member(&self, type_name: &str, member_name: &str) -> Option<&MemberType> {
-        if let Some(shape) = self.classes.get(type_name)
+    fn member(&self, type_id: &TypeId, member_name: &str) -> Option<&MemberType> {
+        if let Some(shape) = self.classes.get(type_id)
             && let Some(member) = shape
                 .fields
                 .get(member_name)
@@ -1140,12 +1706,12 @@ impl Checker {
         {
             return Some(member);
         }
-        if let Some(parent) = self.class_parents.get(type_name)
+        if let Some(parent) = self.class_parents.get(type_id)
             && let Some(member) = self.member(parent, member_name)
         {
             return Some(member);
         }
-        self.protocols.get(type_name).and_then(|shape| {
+        self.protocols.get(type_id).and_then(|shape| {
             shape
                 .fields
                 .get(member_name)
@@ -1155,27 +1721,27 @@ impl Checker {
 
     fn direct_member(&self, object: &Expr, name: &str, scope: &Scope) -> Option<MemberType> {
         if let ExprKind::Variable(object_name) = &object.kind
-            && let Some(class_name) = scope
+            && let Some(class_id) = scope
                 .get(object_name)
-                .and_then(|binding| binding.class_name.as_deref())
+                .and_then(|binding| binding.class_id.as_ref())
         {
-            return self.member(class_name, name).cloned();
+            return self.member(class_id, name).cloned();
         }
-        let type_name = match &object.kind {
+        let type_id = match &object.kind {
             ExprKind::Variable(object_name) => scope.get(object_name).and_then(|binding| {
                 binding.ty.variants.iter().find_map(|ty| match ty {
-                    StaticType::Named(name) => Some(name.as_str()),
+                    StaticType::Named(NamedType::Declared(type_id)) => Some(type_id.clone()),
                     _ => None,
                 })
             }),
-            ExprKind::This => self.current_class.as_deref(),
+            ExprKind::This => self.current_class.clone(),
             _ => None,
         }?;
-        self.member(type_name, name).cloned()
+        self.member(&type_id, name).cloned()
     }
 
-    fn inherited_member(&self, type_name: &str, name: &str) -> Option<(bool, MemberType)> {
-        if let Some(shape) = self.classes.get(type_name) {
+    fn inherited_member(&self, type_id: &TypeId, name: &str) -> Option<(bool, MemberType)> {
+        if let Some(shape) = self.classes.get(type_id) {
             if let Some(field) = shape.fields.get(name) {
                 return Some((false, field.clone()));
             }
@@ -1184,18 +1750,18 @@ impl Checker {
             }
         }
         self.class_parents
-            .get(type_name)
+            .get(type_id)
             .and_then(|parent| self.inherited_member(parent, name))
     }
 
-    fn verify_overrides(&mut self, class_name: &str, superclass: &str, span: &Span) {
-        let Some(class) = self.classes.get(class_name).cloned() else {
+    fn verify_overrides(&mut self, class_id: &TypeId, superclass: &TypeId, span: &Span) {
+        let Some(class) = self.classes.get(class_id).cloned() else {
             return;
         };
         for name in class.fields.keys() {
             if self.inherited_member(superclass, name).is_some() {
                 self.error(
-                    format!("类“{class_name}”不可重声明继承成员“{name}”为域"),
+                    format!("类“{}”不可重声明继承成员“{name}”为域", class_id.name),
                     span.clone(),
                 );
             }
@@ -1207,7 +1773,7 @@ impl Checker {
             };
             if !parent_is_method {
                 self.error(
-                    format!("类“{class_name}”不可将继承域“{name}”覆写为法"),
+                    format!("类“{}”不可将继承域“{name}”覆写为法", class_id.name),
                     span.clone(),
                 );
                 continue;
@@ -1232,13 +1798,13 @@ impl Checker {
         }
     }
 
-    fn verify_protocols(&mut self, class_name: &str, protocols: &[String], span: &Span) {
-        let Some(class) = self.classes.get(class_name).cloned() else {
+    fn verify_protocols(&mut self, class_id: &TypeId, protocols: &[TypeId], span: &Span) {
+        let Some(class) = self.classes.get(class_id).cloned() else {
             return;
         };
-        for protocol_name in protocols {
-            let Some(protocol) = self.protocols.get(protocol_name).cloned() else {
-                self.error(format!("未声明协“{protocol_name}”"), span.clone());
+        for protocol_id in protocols {
+            let Some(protocol) = self.protocols.get(protocol_id).cloned() else {
+                self.error(format!("未声明协“{protocol_id}”"), span.clone());
                 continue;
             };
             for (name, required) in protocol.fields.iter().chain(&protocol.methods) {
@@ -1249,12 +1815,12 @@ impl Checker {
                     .cloned()
                     .or_else(|| {
                         self.class_parents
-                            .get(class_name)
+                            .get(class_id)
                             .and_then(|parent| self.member(parent, name).cloned())
                     });
                 let Some(actual) = actual else {
                     self.error(
-                        format!("类“{class_name}”纳协“{protocol_name}”却缺少成员“{name}”"),
+                        format!("类“{}”纳协“{protocol_id}”却缺少成员“{name}”", class_id.name),
                         span.clone(),
                     );
                     continue;
@@ -1265,7 +1831,8 @@ impl Checker {
                 if !type_matches || actual.is_static || actual.visibility == Visibility::Private {
                     self.error(
                         format!(
-                            "类“{class_name}”之成员“{name}”不符合协“{protocol_name}”的公开实例签名"
+                            "类“{}”之成员“{name}”不符合协“{protocol_id}”的公开实例签名",
+                            class_id.name
                         ),
                         span.clone(),
                     );
@@ -1285,35 +1852,53 @@ impl Checker {
 
     fn named_assignable(&self, expected: &TypeSet, actual: &TypeSet) -> bool {
         actual.variants.iter().all(|actual| {
-            let StaticType::Named(class_name) = actual else {
+            let StaticType::Named(NamedType::Declared(class_id)) = actual else {
                 return false;
             };
             expected.variants.iter().any(|expected| {
-                let StaticType::Named(expected_name) = expected else {
+                let StaticType::Named(NamedType::Declared(expected_id)) = expected else {
                     return false;
                 };
-                self.class_is_a(class_name, expected_name)
+                self.class_is_a(class_id, expected_id)
             })
         })
     }
 
-    fn class_is_a(&self, class_name: &str, expected_name: &str) -> bool {
-        class_name == expected_name
-            || self.class_conforms(class_name, expected_name)
+    fn class_is_a(&self, class_id: &TypeId, expected_id: &TypeId) -> bool {
+        class_id == expected_id
+            || self.class_conforms(class_id, expected_id)
             || self
                 .class_parents
-                .get(class_name)
-                .is_some_and(|parent| self.class_is_a(parent, expected_name))
+                .get(class_id)
+                .is_some_and(|parent| self.class_is_a(parent, expected_id))
     }
 
-    fn class_conforms(&self, class_name: &str, protocol_name: &str) -> bool {
+    fn class_conforms(&self, class_id: &TypeId, protocol_id: &TypeId) -> bool {
         self.class_protocols
-            .get(class_name)
-            .is_some_and(|protocols| protocols.contains(protocol_name))
+            .get(class_id)
+            .is_some_and(|protocols| protocols.contains(protocol_id))
             || self
                 .class_parents
-                .get(class_name)
-                .is_some_and(|parent| self.class_conforms(parent, protocol_name))
+                .get(class_id)
+                .is_some_and(|parent| self.class_conforms(parent, protocol_id))
+    }
+
+    fn narrow_condition(&mut self, condition: &Expr, scope: &mut Scope, truthy: bool) {
+        if let ExprKind::TypeTest { value, type_ref } = &condition.kind
+            && let ExprKind::Variable(name) = &value.kind
+        {
+            let expected = self.type_set_from_ref(type_ref);
+            if let Some(binding) = scope.get_mut(name) {
+                binding.ty = if truthy {
+                    expected
+                } else {
+                    binding.ty.without(&expected)
+                };
+                binding.function = binding.ty.function();
+            }
+            return;
+        }
+        narrow_value_condition(condition, scope, truthy);
     }
 
     fn error(&mut self, message: impl Into<String>, span: Span) {
@@ -1322,71 +1907,6 @@ impl Checker {
             span,
         });
     }
-}
-
-fn parameter_type(parameter: &Parameter) -> TypeSet {
-    parameter
-        .type_ref
-        .as_ref()
-        .map_or_else(TypeSet::any, TypeSet::from_ref)
-}
-
-fn object_shape(owner: &str, fields: &[crate::ast::FieldDecl], methods: &[Stmt]) -> ObjectShape {
-    let fields = fields
-        .iter()
-        .map(|field| {
-            (
-                field.name.clone(),
-                MemberType {
-                    ty: TypeSet::from_ref(&field.type_ref),
-                    function: None,
-                    is_static: field.is_static,
-                    readonly: field.readonly,
-                    visibility: field.visibility,
-                    owner: owner.into(),
-                },
-            )
-        })
-        .collect();
-    let methods = methods
-        .iter()
-        .filter_map(|method| {
-            let StmtKind::Function {
-                name,
-                params,
-                return_type,
-                is_async,
-                ..
-            } = &method.kind
-            else {
-                return None;
-            };
-            Some((
-                name.clone(),
-                MemberType {
-                    ty: TypeSet::named("法"),
-                    function: Some(FunctionType {
-                        params: params.iter().map(parameter_type).collect(),
-                        result: {
-                            let result = return_type
-                                .as_ref()
-                                .map_or_else(TypeSet::any, TypeSet::from_ref);
-                            if *is_async {
-                                TypeSet::single(StaticType::Task(Box::new(result)))
-                            } else {
-                                result
-                            }
-                        },
-                    }),
-                    is_static: method.is_static,
-                    readonly: true,
-                    visibility: method.member_visibility,
-                    owner: owner.into(),
-                },
-            ))
-        })
-        .collect();
-    ObjectShape { fields, methods }
 }
 
 fn member_type(member: &MemberType) -> TypeSet {
@@ -1398,6 +1918,115 @@ fn member_type(member: &MemberType) -> TypeSet {
                 Box::new(function.result.clone()),
             ))
         },
+    )
+}
+
+fn binding_type(binding: &Binding) -> TypeSet {
+    binding.function.as_ref().map_or_else(
+        || binding.ty.clone(),
+        |function| {
+            TypeSet::single(StaticType::Function(
+                function.params.clone(),
+                Box::new(function.result.clone()),
+            ))
+        },
+    )
+}
+
+fn exported_symbol_type(symbol: &ExportedSymbol) -> TypeSet {
+    match symbol {
+        ExportedSymbol::Value { binding, .. } => binding_type(binding),
+        ExportedSymbol::Class { constructor, .. } => TypeSet::single(StaticType::Function(
+            constructor.params.clone(),
+            Box::new(constructor.result.clone()),
+        )),
+        ExportedSymbol::Protocol { .. } => TypeSet::named("协"),
+        ExportedSymbol::Module { .. } => TypeSet::named("模块"),
+    }
+}
+
+fn standard_summary(name: &str, shape: ObjectShape, declaration: &Span) -> ModuleSummary {
+    let exports = shape
+        .fields
+        .into_iter()
+        .map(|(name, member)| {
+            (
+                name,
+                ExportedSymbol::Value {
+                    binding: Binding {
+                        ty: member.ty,
+                        mutable: false,
+                        function: member.function,
+                        class_id: None,
+                        module: None,
+                    },
+                    declaration: declaration.clone(),
+                },
+            )
+        })
+        .collect();
+    ModuleSummary {
+        module_id: ModuleId::standard(name),
+        source_path: None,
+        exports,
+    }
+}
+
+fn collect_declared_types(types: &TypeSet, output: &mut Vec<TypeId>) {
+    for ty in &types.variants {
+        match ty {
+            StaticType::Named(NamedType::Declared(type_id)) => output.push(type_id.clone()),
+            StaticType::List(element) | StaticType::Task(element) => {
+                collect_declared_types(element, output);
+            }
+            StaticType::Tuple(items) => {
+                for item in items {
+                    collect_declared_types(item, output);
+                }
+            }
+            StaticType::Map(key, value) => {
+                collect_declared_types(key, output);
+                collect_declared_types(value, output);
+            }
+            StaticType::Function(parameters, result) => {
+                for parameter in parameters {
+                    collect_declared_types(parameter, output);
+                }
+                collect_declared_types(result, output);
+            }
+            StaticType::Any | StaticType::Named(NamedType::Builtin(_)) => {}
+        }
+    }
+}
+
+fn existing_source_path(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    path.exists().then(|| fs::canonicalize(path).ok()).flatten()
+}
+
+fn is_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        "任意"
+            | "数"
+            | "文"
+            | "字节串"
+            | "理"
+            | "空"
+            | "列"
+            | "元"
+            | "典"
+            | "遍器"
+            | "任务"
+            | "法"
+            | "类"
+            | "协"
+            | "模块"
+            | "误"
+            | "对象"
+            | "套接字"
+            | "原生模块"
+            | "原生资源"
     )
 }
 
@@ -2237,7 +2866,11 @@ fn insert_module_member(
             is_static: false,
             readonly: true,
             visibility: Visibility::Public,
-            owner: name.into(),
+            owner: TypeId::new(
+                ModuleId::standard("内建摘要"),
+                name,
+                TypeDeclarationKind::Protocol,
+            ),
         },
     );
 }
@@ -2248,36 +2881,12 @@ fn binding(ty: TypeSet, mutable: bool) -> Binding {
         ty,
         mutable,
         function,
-        class_name: None,
+        class_id: None,
         module: None,
     }
 }
 
-fn narrow_condition(condition: &Expr, scope: &mut Scope, truthy: bool) {
-    if let ExprKind::TypeTest { value, type_ref } = &condition.kind
-        && let ExprKind::Variable(name) = &value.kind
-    {
-        let expected = TypeSet::from_ref(type_ref);
-        if let Some(binding) = scope.get_mut(name) {
-            binding.ty = if truthy {
-                expected
-            } else {
-                let excluded = expected
-                    .variants
-                    .iter()
-                    .filter_map(|variant| match variant {
-                        StaticType::Named(name) => Some(name.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                excluded
-                    .into_iter()
-                    .fold(binding.ty.clone(), |ty, name| ty.without_named(name))
-            };
-            binding.function = binding.ty.function();
-        }
-        return;
-    }
+fn narrow_value_condition(condition: &Expr, scope: &mut Scope, truthy: bool) {
     let ExprKind::Binary {
         left,
         operator,
@@ -2389,7 +2998,7 @@ fn builtin(name: &str) -> Option<Binding> {
             params,
             result: TypeSet::named(result),
         }),
-        class_name: None,
+        class_id: None,
         module: None,
     })
 }
@@ -2397,6 +3006,29 @@ fn builtin(name: &str) -> Option<Binding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn check_project(
+        name: &str,
+        modules: &[(&str, &str)],
+        entry: &str,
+    ) -> Result<(), Vec<TypeError>> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yanxu-types-{name}-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        for (path, source) in modules {
+            fs::write(root.join(path), source).unwrap();
+        }
+        let entry_path = root.join("main.yx");
+        fs::write(&entry_path, entry).unwrap();
+        let statements = crate::parse_named(entry, entry_path.display().to_string()).unwrap();
+        let result = check_in_directory(&statements, &root);
+        fs::remove_dir_all(root).unwrap();
+        result
+    }
 
     #[test]
     fn accepts_union_and_rejects_certain_mismatch() {
@@ -2556,5 +3188,216 @@ mod tests {
             定 总分：数 为 折叠（【1，2，3】，0，相加）；
         "#;
         check(&crate::parse(source).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checks_cross_module_inheritance_protocols_and_nested_types() {
+        let base = r#"
+            公 协 可描述 则 法 描述（）：文；终
+            公 类 视图 纳 可描述 则
+                公 域 标题：文；
+                公 法 描述（）：文 则 归 此.标题；终
+                公 静 法 种类（）：文 则 归「视图」；终
+            终
+        "#;
+        let entry = r#"
+            引「base.yx」为 基础；
+            公 类 按钮 承 基础.视图 纳 基础.可描述 则
+                公 域 子项：列<基础.视图>；
+                公 域 候选：基础.视图?；
+                公 法 描述（）：文 则 归 父.描述（）加「按钮」；终
+            终
+            公 法 包装（内容：基础.视图）：基础.视图 则 归 内容；终
+            定 父值：基础.视图 为 按钮（）；
+            定 协值：基础.可描述 为 按钮（）；
+            定 嵌套：典<文，元<基础.视图，任务<基础.视图>>> 为 {}；
+            定 转换：法（基础.视图）：基础.视图 为 包装；
+            令 待判：基础.视图|文 为 按钮（）；
+            若 待判 是 按钮 则
+                定 已窄：按钮 为 待判；
+                定 类名：文 为 基础.视图.种类（）；
+            终
+            若 父值 是 基础.视图 则 定 仍为父：基础.视图 为 父值；终
+        "#;
+        check_project("cross-module", &[("base.yx", base)], entry).unwrap();
+    }
+
+    #[test]
+    fn reports_cross_module_override_and_protocol_failures() {
+        let base = r#"
+            公 协 可描述 则 法 描述（值：文）：文；终
+            公 类 视图 则 公 法 描述（值：文）：文 则 归 值；终 终
+        "#;
+        let entry = r#"
+            引「base.yx」为 基础；
+            类 坏覆写 承 基础.视图 则
+                法 描述（值：数）：文 则 归「坏」；终
+            终
+            类 坏协议 纳 基础.可描述 则
+                法 描述（值：数）：文 则 归「坏」；终
+            终
+        "#;
+        let errors = check_project("bad-oop", &[("base.yx", base)], entry).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("参数或归值须与父类签名一致"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("不符合协"))
+        );
+    }
+
+    #[test]
+    fn canonical_ids_separate_same_names_and_ignore_import_aliases() {
+        let module = "公 类 节点 则 终";
+        let entry = r#"
+            引「a.yx」为 甲；
+            引「b.yx」为 乙；
+            引「a.yx」为 核心；
+            定 左：甲.节点 为 甲.节点（）；
+            定 同一：核心.节点 为 左；
+            定 右：乙.节点 为 乙.节点（）；
+            若 左 是 核心.节点 则 定 仍同一：甲.节点 为 左；终
+        "#;
+        check_project("same-name", &[("a.yx", module), ("b.yx", module)], entry).unwrap();
+
+        let bad = r#"
+            引「a.yx」为 甲；引「b.yx」为 乙；
+            定 左：甲.节点 为 甲.节点（）；
+            定 错：乙.节点 为 左；
+        "#;
+        let errors =
+            check_project("same-name-bad", &[("a.yx", module), ("b.yx", module)], bad).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("变量“错”应为"))
+        );
+    }
+
+    #[test]
+    fn diagnoses_private_bare_and_wrong_kind_qualified_paths() {
+        let base = r#"
+            类 私类 则 终
+            协 私协 则 终
+            公 协 可协议 则 终
+            公 类 公开类 则 终
+            公 定 值：数 为 1；
+        "#;
+        let entry = r#"
+            引「base.yx」为 基础；
+            定 裸：公开类 为 基础.公开类（）；
+            定 私类值：基础.私类 为 基础.公开类（）；
+            定 私协值：基础.私协 为 基础.公开类（）；
+            定 非类型：基础.值 为 1；
+            定 坏中段：基础.值.内部 为 1；
+            定 无别名：未知.公开类 为 基础.公开类（）；
+            定 缺成员：基础.不存在 为 基础.公开类（）；
+            类 错父 承 基础.可协议 则 终
+            类 错纳 纳 基础.公开类 则 终
+        "#;
+        let errors = check_project("path-errors", &[("base.yx", base)], entry).unwrap_err();
+        let messages = errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| message.contains("不可裸写")));
+        assert!(
+            messages
+                .iter()
+                .filter(|message| message.contains("未公开成员"))
+                .count()
+                >= 2
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("不是类或协"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("中间段“值”不是模块"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("模块别名“未知”不存在"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("未公开成员“不存在”"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("不可用作类"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("不可用作协"))
+        );
+    }
+
+    #[test]
+    fn follows_three_level_public_module_reexports() {
+        let leaf = "公 类 按钮 则 公 法 名称（）：文 则 归「按钮」；终 终";
+        let middle = "公 引「leaf.yx」为 组件；";
+        let facade = "公 引「middle.yx」为 场景；";
+        let entry = r#"
+            引「facade.yx」为 界面；
+            类 特殊按钮 承 界面.场景.组件.按钮 则
+                法 名称（）：文 则 归 父.名称（）加「特别」；终
+            终
+            定 根：界面.场景.组件.按钮 为 特殊按钮（）；
+        "#;
+        check_project(
+            "facade",
+            &[
+                ("leaf.yx", leaf),
+                ("middle.yx", middle),
+                ("facade.yx", facade),
+            ],
+            entry,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_public_api_leaks_and_reports_reexport_cycles() {
+        let leaking = r#"
+            类 私密 则 终
+            公 法 泄漏（值：私密）：私密 则 归 值；终
+            公 类 容器 则 公 域 内容：私密；终
+        "#;
+        let errors = check_project("leak", &[], leaking).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .filter(|error| error.message.contains("泄漏不可访问的私有类型"))
+                .count()
+                >= 2
+        );
+
+        let errors = check_project(
+            "cycle",
+            &[
+                ("a.yx", "公 引「b.yx」为 乙；"),
+                ("b.yx", "公 引「a.yx」为 甲；"),
+            ],
+            "引「a.yx」为 甲；",
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("模块类型检查循环相引")
+                    && error.message.contains('→'))
+        );
     }
 }

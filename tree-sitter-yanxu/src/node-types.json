@@ -78,7 +78,7 @@
         "required": false,
         "types": [
           {
-            "type": "identifier",
+            "type": "type_path",
             "named": true
           }
         ]
@@ -88,7 +88,7 @@
         "required": false,
         "types": [
           {
-            "type": "identifier",
+            "type": "type_path",
             "named": true
           }
         ]
@@ -452,11 +452,11 @@
       "required": true,
       "types": [
         {
-          "type": "identifier",
+          "type": "type",
           "named": true
         },
         {
-          "type": "type",
+          "type": "type_path",
           "named": true
         }
       ]
@@ -720,7 +720,7 @@
       "required": false,
       "types": [
         {
-          "type": "identifier",
+          "type": "type_path",
           "named": true
         }
       ]
@@ -870,6 +870,25 @@
     }
   },
   {
+    "type": "public_import_statement",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "return_statement",
     "named": true,
     "fields": {},
@@ -931,6 +950,10 @@
         },
         {
           "type": "protocol_declaration",
+          "named": true
+        },
+        {
+          "type": "public_import_statement",
           "named": true
         },
         {
@@ -1109,6 +1132,21 @@
       "types": [
         {
           "type": "type",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "type_path",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
           "named": true
         }
       ]

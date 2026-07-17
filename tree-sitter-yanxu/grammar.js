@@ -5,7 +5,7 @@ module.exports = grammar({
   word: $ => $.identifier,
 
   rules: {
-    source_file: $ => repeat($._statement),
+    source_file: $ => repeat(choice($._statement, $.public_import_statement)),
 
     comment: _ => token(choice(seq('#', /.*/), seq('//', /.*/))),
 
@@ -22,13 +22,14 @@ module.exports = grammar({
     print_statement: $ => seq('言', $.expression, '；'),
     return_statement: $ => seq('归', optional($.expression), '；'),
     import_statement: $ => seq('引', $.string, choice('为', '作'), $.identifier, '；'),
+    public_import_statement: $ => seq('公', '引', $.string, choice('为', '作'), $.identifier, '；'),
     function_declaration: $ => seq(optional('公'), optional('异'), '法', field('name', $.identifier), '（',
       optional(commaSep1($.parameter)), '）', optional($.type_annotation), '则',
       repeat($._statement), '终'),
     parameter: $ => seq($.identifier, optional($.type_annotation)),
     class_declaration: $ => seq(optional('公'), '类', field('name', $.identifier),
-      optional(seq('承', field('superclass', $.identifier))),
-      optional(seq('纳', commaSep1(field('protocol', $.identifier)))),
+      optional(seq('承', field('superclass', $.type_path))),
+      optional(seq('纳', commaSep1(field('protocol', $.type_path)))),
       '则', repeat($.class_member), '终'),
     class_member: $ => choice($.field_declaration, $.method_declaration),
     member_modifiers: _ => repeat1(choice('公', '私', '只', '静')),
@@ -58,9 +59,10 @@ module.exports = grammar({
     union_type: $ => prec.left(1, seq($._type_primary, repeat1(seq('|', $._type_primary)))),
     _type_primary: $ => choice($.nullable_type, $.generic_type, $.function_type, $.named_type),
     nullable_type: $ => prec(3, seq(choice($.generic_type, $.function_type, $.named_type), '?')),
-    generic_type: $ => prec(2, seq($.identifier, '<', commaSep1($.type), '>')),
+    generic_type: $ => prec(2, seq($.type_path, '<', commaSep1($.type), '>')),
     function_type: $ => prec(4, seq('法', '（', optional(commaSep1($.type)), '）', '：', $.type)),
-    named_type: $ => choice($.identifier, '法', '类', '空'),
+    named_type: $ => choice($.type_path, '法', '类', '空'),
+    type_path: $ => prec.right(10, seq($.identifier, repeat(seq('.', $.identifier)))),
 
     expression: $ => choice(
       $.identifier, $.number, $.string, '真', '假', '空', '此', $.super_expression,

@@ -1,5 +1,19 @@
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use yanxu::{interpreter::Interpreter, run_file_with, run_with};
+
+fn multi_file_project(name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("yanxu-runtime-{name}-{unique}"));
+    std::fs::create_dir_all(&root).unwrap();
+    for (path, source) in files {
+        std::fs::write(root.join(path), source).unwrap();
+    }
+    root
+}
 
 #[test]
 fn executes_a_complete_program() {
@@ -216,4 +230,120 @@ fn static_checker_reads_module_api_without_executing_module() {
             .iter()
             .any(|error| error.message.contains("未公开“私值”"))
     );
+}
+
+#[test]
+fn tree_interpreter_executes_cross_module_oop_and_facades() {
+    let helper = "公 法 前缀（）：文 则 归「基础-」；终";
+    let base = r#"
+        引「helper.yx」为 辅助；
+        公 协 可描述 则 法 描述（）：文；终
+        公 类 视图 纳 可描述 则
+            公 域 名称：文；
+            法 初始化（名称：文）则 置 此.名称 为 名称；终
+            公 法 描述（）：文 则 归 辅助.前缀（）加 此.名称；终
+            私 法 秘密（）：文 则 归「秘密」；终
+            公 静 法 种类（）：文 则 归「视图」；终
+        终
+    "#;
+    let controls = r#"
+        引「base.yx」为 基础；
+        公 类 按钮 承 基础.视图 纳 基础.可描述 则
+            公 域 点击数：数 为 0；
+            公 域 所属视图：基础.视图；
+            法 初始化（名称：文）则
+                父.初始化（名称）；
+                置 此.所属视图 为 此；
+            终
+            公 法 描述（）：文 则 归 父.描述（）加「-按钮」；终
+            公 静 法 新建（名称：文）：按钮 则 归 按钮（名称）；终
+        终
+        公 法 包装（内容：基础.视图）：基础.视图 则 归 内容；终
+    "#;
+    let facade = "公 引「controls.yx」为 控件；";
+    let main = r#"
+        引「base.yx」为 基础；
+        引「facade.yx」为 界面；
+        定 根：基础.视图 为 界面.控件.按钮.新建（「确定」）；
+        定 协议值：基础.可描述 为 根；
+        定 包装后：基础.视图 为 界面.控件.包装（根）；
+        言 根.描述（）；
+        言 根 是 基础.视图；
+        言 根 是 基础.可描述；
+        言 根 是 界面.控件.按钮；
+        言 包装后 是 基础.视图；
+        言 根.点击数；
+        言 根.所属视图 是 基础.视图；
+        言 基础.视图.种类（）；
+    "#;
+    let root = multi_file_project(
+        "oop",
+        &[
+            ("helper.yx", helper),
+            ("base.yx", base),
+            ("controls.yx", controls),
+            ("facade.yx", facade),
+            ("main.yx", main),
+        ],
+    );
+    let main_path = root.join("main.yx");
+    let source = std::fs::read_to_string(&main_path).unwrap();
+    let statements = yanxu::parse_named(&source, main_path.display().to_string()).unwrap();
+    yanxu::type_checker::check_in_directory(&statements, &root).unwrap();
+    let mut interpreter = Interpreter::silent();
+    run_file_with(&mut interpreter, &main_path).unwrap();
+    assert_eq!(
+        interpreter.output(),
+        &["基础-确定-按钮", "真", "真", "真", "真", "0", "真", "视图"]
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tree_interpreter_keeps_same_short_names_isolated_by_module() {
+    let class = r#"
+        公 类 节点 则
+            公 域 标签：文；
+            法 初始化（标签：文）则 置 此.标签 为 标签；终
+        终
+    "#;
+    let main = r#"
+        引「a.yx」为 甲；引「b.yx」为 乙；引「a.yx」为 核心；
+        定 左：甲.节点 为 甲.节点（「左」）；
+        定 右：乙.节点 为 乙.节点（「右」）；
+        定 同一：核心.节点 为 左；
+        言 左 是 甲.节点；
+        言 左 是 核心.节点；
+        言 左 是 乙.节点；
+        言 右 是 乙.节点；
+        言 左.标签 加 右.标签；
+    "#;
+    let root = multi_file_project(
+        "same-name",
+        &[("a.yx", class), ("b.yx", class), ("main.yx", main)],
+    );
+    let main_path = root.join("main.yx");
+    let mut interpreter = Interpreter::silent();
+    run_file_with(&mut interpreter, &main_path).unwrap();
+    assert_eq!(interpreter.output(), &["真", "真", "假", "真", "左右"]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tree_interpreter_rejects_private_cross_module_super_calls() {
+    let base = r#"
+        公 类 基类 则 私 法 秘密（）：文 则 归「秘密」；终 终
+    "#;
+    let main = r#"
+        引「base.yx」为 基础；
+        类 子类 承 基础.基类 则 法 读取（）：文 则 归 父.秘密（）；终 终
+        言 子类（）.读取（）；
+    "#;
+    let root = multi_file_project("private-super", &[("base.yx", base), ("main.yx", main)]);
+    let mut interpreter = Interpreter::silent();
+    let error = run_file_with(&mut interpreter, root.join("main.yx"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("父类私法“秘密”不可由子类调用"));
+    std::fs::remove_dir_all(root).unwrap();
 }

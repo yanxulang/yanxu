@@ -1,14 +1,81 @@
 use crate::source::Span;
 use crate::token::TokenKind;
 use std::fmt;
+use std::hash::{Hash, Hasher};
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TypePathSegment {
+    pub name: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TypePath {
+    pub segments: Vec<TypePathSegment>,
+    pub span: Span,
+}
+
+impl TypePath {
+    pub fn single(name: impl Into<String>, span: Span) -> Self {
+        Self::new(vec![TypePathSegment {
+            name: name.into(),
+            span,
+        }])
+    }
+
+    pub fn new(segments: Vec<TypePathSegment>) -> Self {
+        debug_assert!(!segments.is_empty());
+        let span = segments
+            .first()
+            .expect("type path has a first segment")
+            .span
+            .through(&segments.last().expect("type path has a last segment").span);
+        Self { segments, span }
+    }
+
+    pub fn is_single(&self, name: &str) -> bool {
+        matches!(self.segments.as_slice(), [segment] if segment.name == name)
+    }
+
+    pub fn single_name(&self) -> Option<&str> {
+        match self.segments.as_slice() {
+            [segment] => Some(&segment.name),
+            _ => None,
+        }
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.segments.iter().map(|segment| segment.name.as_str())
+    }
+}
+
+impl fmt::Display for TypePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, segment) in self.segments.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(".")?;
+            }
+            formatter.write_str(&segment.name)?;
+        }
+        Ok(())
+    }
+}
+
+impl Hash for TypePath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for segment in &self.segments {
+            segment.name.hash(state);
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
-    Named(String),
+    Named(TypePath),
     Union(Vec<TypeKind>),
     Nullable(Box<TypeKind>),
     Generic {
-        base: String,
+        base: TypePath,
         arguments: Vec<TypeKind>,
     },
     Function {
@@ -20,7 +87,7 @@ pub enum TypeKind {
 impl fmt::Display for TypeKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Named(name) => formatter.write_str(name),
+            Self::Named(path) => write!(formatter, "{path}"),
             Self::Union(types) => {
                 for (index, ty) in types.iter().enumerate() {
                     if index > 0 {
@@ -222,8 +289,8 @@ pub enum StmtKind {
     },
     Class {
         name: String,
-        superclass: Option<String>,
-        protocols: Vec<String>,
+        superclass: Option<TypePath>,
+        protocols: Vec<TypePath>,
         fields: Vec<FieldDecl>,
         methods: Vec<Stmt>,
     },

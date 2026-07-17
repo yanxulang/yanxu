@@ -88,7 +88,7 @@ yanbao bundle --manifest-path 我的窗口
 言序提供：
 
 - 中文关键字、标识符、全角或半角标点与源码级诊断；
-- 可选类型标注、联合类型、分支收窄、继承与协议；
+- 可选类型标注、联合类型、分支收窄、模块限定类型、跨模块继承与协议；
 - 闭包、结构化错误、惰性迭代和确定性协作任务；
 - 显式模块导出、格式 2 项目清单和完整依赖锁图；
 - 树解释器与独立字节码 VM 的共享语言语义；
@@ -127,6 +127,9 @@ yanbao bundle --manifest-path 我的窗口
 - [兼容政策](COMPATIBILITY.md)
 - [原生 ABI v1](reference/native-abi-v1.md)
 - [原生 ABI v2](reference/native-abi-v2.md)
+- [模块限定类型迁移](reference/migration-module-qualified-types.md)
+- [字节码格式 2](reference/bytecode-v2.md)
+- [模块 API 清单 v2](reference/module-api-v2.md)
 - [GUI 架构](reference/gui-architecture.md)
 - [GUI Bundle](reference/gui-bundle.md)
 - [安全政策](SECURITY.md)

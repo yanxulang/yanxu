@@ -135,11 +135,17 @@ impl Formatter {
                 self.output.push_str(name);
                 if let Some(superclass) = superclass {
                     self.output.push_str(" 承 ");
-                    self.output.push_str(superclass);
+                    self.output.push_str(&superclass.to_string());
                 }
                 if !protocols.is_empty() {
                     self.output.push_str(" 纳 ");
-                    self.output.push_str(&protocols.join("，"));
+                    self.output.push_str(
+                        &protocols
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("，"),
+                    );
                 }
                 self.output.push_str(" 则\n");
                 for field in fields {
@@ -472,5 +478,27 @@ mod tests {
         assert!(formatted.contains("数据：字节串"));
         assert!(formatted.contains("字节.从数列"));
         assert_eq!(formatted, format(&crate::parse(&formatted).unwrap()));
+    }
+
+    #[test]
+    fn qualified_types_inheritance_and_reexports_are_idempotent() {
+        let source = r#"
+            公 引「base.yx」为 基础；
+            公 类 按钮 承 基础.视图 纳 基础.可描述，协议.可点击 则
+                公 域 内容：列<基础.视图|基础.窗口?>；
+                公 法 包装（值：法（基础.视图）：基础.窗口）：任务<基础.视图> 则
+                    若 此.内容 是 基础.按钮 则 归 此.内容；终
+                    归 此.内容；
+                终
+            终
+        "#;
+        let first = format(&crate::parse(source).unwrap());
+        let second = format(&crate::parse(&first).unwrap());
+        assert_eq!(first, second);
+        assert!(first.contains("公 引「base.yx」为 基础；"));
+        assert!(first.contains("承 基础.视图 纳 基础.可描述，协议.可点击"));
+        assert!(first.contains("列<基础.视图|基础.窗口?>"));
+        assert!(first.contains("法（基础.视图）：基础.窗口"));
+        assert!(!first.contains("基础 . 视图"));
     }
 }

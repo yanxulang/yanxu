@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yanxu.dev/schemas/module-api-v2.json",
+  "title": "Yanxu module API manifest v2",
+  "type": "object",
+  "required": ["$schema", "format_version", "language", "module", "module_id", "declarations"],
+  "properties": {
+    "$schema": { "const": "https://yanxu.dev/schemas/module-api-v2.json" },
+    "format_version": { "const": 2 },
+    "language": { "const": "yanxu" },
+    "module": { "type": "string", "minLength": 1 },
+    "module_id": { "$ref": "#/$defs/module_id" },
+    "declarations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/declaration" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "module_id": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["namespace", "name"],
+          "properties": {
+            "namespace": { "const": "standard" },
+            "name": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["namespace", "package", "module"],
+          "properties": {
+            "namespace": { "const": "package" },
+            "package": { "type": "string", "minLength": 1 },
+            "module": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["namespace", "module"],
+          "properties": {
+            "namespace": { "const": "archive" },
+            "module": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["namespace", "canonical_path"],
+          "properties": {
+            "namespace": { "const": "file" },
+            "canonical_path": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["namespace", "name"],
+          "properties": {
+            "namespace": { "const": "memory" },
+            "name": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "type_id": {
+      "type": "object",
+      "required": ["module", "name", "kind"],
+      "properties": {
+        "module": { "$ref": "#/$defs/module_id" },
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["class", "protocol"] }
+      },
+      "additionalProperties": false
+    },
+    "type_path": {
+      "type": "object",
+      "required": ["segments"],
+      "properties": {
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "type_link": {
+      "type": "object",
+      "required": ["source", "target"],
+      "properties": {
+        "source": { "$ref": "#/$defs/type_path" },
+        "target": {
+          "oneOf": [
+            { "$ref": "#/$defs/type_id" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtime_type": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "link"],
+          "properties": {
+            "kind": { "const": "named" },
+            "link": { "$ref": "#/$defs/type_link" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "variants"],
+          "properties": {
+            "kind": { "const": "union" },
+            "variants": {
+              "type": "array",
+              "minItems": 2,
+              "items": { "$ref": "#/$defs/runtime_type" }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "inner"],
+          "properties": {
+            "kind": { "const": "nullable" },
+            "inner": { "$ref": "#/$defs/runtime_type" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "base", "arguments"],
+          "properties": {
+            "kind": { "const": "generic" },
+            "base": { "$ref": "#/$defs/type_link" },
+            "arguments": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/runtime_type" }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "parameters", "result"],
+          "properties": {
+            "kind": { "const": "function" },
+            "parameters": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/runtime_type" }
+            },
+            "result": { "$ref": "#/$defs/runtime_type" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "declaration": {
+      "type": "object",
+      "required": ["kind", "declaration_kind", "name", "owner_module", "qualified_name", "exposed_path"],
+      "properties": {
+        "kind": {
+          "enum": ["constant", "variable", "function", "class", "protocol", "method", "module_reexport"]
+        },
+        "declaration_kind": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "owner_module": { "$ref": "#/$defs/module_id" },
+        "original_module": {
+          "oneOf": [
+            { "$ref": "#/$defs/module_id" },
+            { "type": "null" }
+          ]
+        },
+        "qualified_name": { "type": "string", "minLength": 1 },
+        "exposed_path": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "type_id": { "$ref": "#/$defs/type_id" },
+        "type": { "$ref": "#/$defs/runtime_type" },
+        "superclass": {
+          "oneOf": [
+            { "$ref": "#/$defs/type_link" },
+            { "type": "null" }
+          ]
+        },
+        "protocols": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/type_link" }
+        },
+        "parameters": { "type": "array" },
+        "result": { "$ref": "#/$defs/runtime_type" },
+        "fields": { "type": "array" },
+        "methods": { "type": "array" },
+        "exports": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/declaration" }
+        },
+        "source": { "type": "string" },
+        "signature": { "type": "string" },
+        "documentation": { "type": "string" },
+        "display_type": { "type": "string" },
+        "display_result": { "type": "string" },
+        "async": { "type": "boolean" },
+        "static": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

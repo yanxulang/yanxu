@@ -103,7 +103,10 @@ impl Resolver {
                 methods,
                 ..
             } => {
-                if superclass.as_ref() == Some(name) {
+                if superclass
+                    .as_ref()
+                    .is_some_and(|superclass| superclass.is_single(name))
+                {
                     return Err(self.error("类不可承自身", statement.span.clone()));
                 }
                 let mut member_names = HashSet::new();
@@ -296,5 +299,12 @@ mod tests {
     fn permits_this_in_nested_method_function() {
         let source = "类 人 则 法 取（）则 法 内（）则 归 此.姓名；终 归 内；终 终";
         resolve(&statements(source)).unwrap();
+    }
+
+    #[test]
+    fn rejects_conflicting_public_module_reexports() {
+        let source = "公 引「views.yx」为 组件；公 引「controls.yx」为 组件；";
+        let error = resolve(&statements(source)).unwrap_err();
+        assert_eq!(error.message, "同一作用域重复声明“组件”");
     }
 }
