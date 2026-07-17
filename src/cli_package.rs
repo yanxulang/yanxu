@@ -61,6 +61,14 @@ pub(crate) fn package_info(path: &str) -> ExitCode {
             for host in manifest.permissions.network_hosts() {
                 println!("权限：网络 {host}");
             }
+            println!(
+                "权限：本地网络 {}",
+                if manifest.permissions.local_network_allowed() {
+                    "允许"
+                } else {
+                    "拒绝"
+                }
+            );
             for host in manifest.permissions.tcp_listen_hosts() {
                 println!("权限：TCP监听 {host}");
             }

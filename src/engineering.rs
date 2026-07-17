@@ -614,6 +614,7 @@ fn manifest_json(manifest: &Manifest) -> Value {
         "permissions": {
             "files": manifest.permissions.file_roots(),
             "network": manifest.permissions.network_hosts().collect::<Vec<_>>(),
+            "local_network": manifest.permissions.local_network_allowed(),
             "tcp_listen": manifest.permissions.tcp_listen_hosts().collect::<Vec<_>>(),
             "udp_bind": manifest.permissions.udp_bind_hosts().collect::<Vec<_>>(),
             "environment": manifest.permissions.environment_variables().collect::<Vec<_>>(),
