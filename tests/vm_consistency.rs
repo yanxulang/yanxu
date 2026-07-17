@@ -655,7 +655,7 @@ fn network_standard_module_matches_both_runtimes() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        for _ in 0..2 {
+        for _ in 0..4 {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).unwrap();
@@ -669,12 +669,14 @@ fn network_standard_module_matches_both_runtimes() {
         引「标准:网络」为 网络；
         定 应：典<文,任意> 为 网络.请求（「GET」，「http://{address}/问」，「」，1000，64）；
         言 应【「正文」】；言 应【「状态」】；
+        定 字节应：典<文,任意> 为 网络.请求字节（「GET」，「http://{address}/问」，{{}}，空，1000，8388608）；
+        言 字节应【「状态」】；
         试 则 网络.请求（「GET」，「ftp://example.com」，「」，1000，64）；
         救 错 则 言 错.代码；言 错.类别；终
         "#
     );
     let (tree, vm) = execute_both(&source, Path::new("."));
-    assert_eq!(tree, ["善哉", "200", "NET_URL", "网络"]);
+    assert_eq!(tree, ["善哉", "200", "200", "NET_URL", "网络"]);
     assert_eq!(tree, vm);
     server.join().unwrap();
 }

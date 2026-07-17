@@ -1,5 +1,29 @@
 # 变更记录
 
+## 1.1.14
+
+### HTTP 二进制响应预算
+
+- `网络.请求字节`的最大响应字节参数改用 HTTP 响应预算校验，不再错误套用套接字 4 MiB 单次接收上限。
+- 树解释器与 VM 保持一致；超过 4 MiB 的合法预算现在交由 HTTP 传输按累计响应大小执行，并继续以`NET_LIMIT`报告实际超限。
+- `套接字.接收`、`套接字.接收字节`、`套接字.精确读取`和 UDP 接收函数仍保留 4 MiB 单次接收硬上限。
+
+### 兼容与升级
+
+- 不改变语言规范 1、标准库签名、原生 ABI v1/v2、清单、锁文件、YXB 或 Bundle 格式。
+- 使用超过 4 MiB 二进制 HTTP 响应预算的应用应升级运行时并重新构建 Bundle；既有源码与锁文件无需迁移。
+
+### 安装
+
+macOS 与 Linux 可固定安装本版本：
+
+```sh
+curl -fsSL https://get.yanxu.dev | YANXU_VERSION=1.1.14 sh
+```
+
+Windows PowerShell 可先设置`$env:YANXU_VERSION = "1.1.14"`，再运行
+`irm https://get.yanxu.dev/windows | iex`。
+
 ## 1.1.13
 
 ### 模块限定类型与跨模块对象
