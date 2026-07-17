@@ -398,7 +398,12 @@ fn build_macos(
     )?;
     writer.write(
         "Contents/Info.plist",
-        macos_info_plist(metadata, &executable_name).as_bytes(),
+        macos_info_plist(
+            metadata,
+            &executable_name,
+            archive.permissions.unrestricted || archive.permissions.local_network,
+        )
+        .as_bytes(),
         "platform-metadata",
     )?;
     Ok(Layout {
@@ -803,8 +808,17 @@ fn encode_icns(icon: &DynamicImage) -> Result<Vec<u8>, BundleError> {
     Ok(icns)
 }
 
-fn macos_info_plist(metadata: &ApplicationMetadata, executable: &str) -> String {
+fn macos_info_plist(
+    metadata: &ApplicationMetadata,
+    executable: &str,
+    local_network: bool,
+) -> String {
     let minimum = metadata.minimum_system_version.as_deref().unwrap_or("11.0");
+    let local_network_usage = if local_network {
+        "<key>NSLocalNetworkUsageDescription</key><string>用于连接您配置的本地网络服务。</string>\n"
+    } else {
+        ""
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -821,7 +835,7 @@ fn macos_info_plist(metadata: &ApplicationMetadata, executable: &str) -> String 
 <key>CFBundleVersion</key><string>{version}</string>
 <key>LSMinimumSystemVersion</key><string>{minimum}</string>
 <key>NSHighResolutionCapable</key><true/>
-<key>NSPrincipalClass</key><string>NSApplication</string>
+{local_network_usage}<key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 </dict></plist>
 "#,
@@ -830,6 +844,7 @@ fn macos_info_plist(metadata: &ApplicationMetadata, executable: &str) -> String 
         identifier = xml_escape(&metadata.identifier),
         version = xml_escape(&metadata.version),
         minimum = xml_escape(minimum),
+        local_network_usage = local_network_usage,
     )
 }
 
@@ -1202,6 +1217,37 @@ mod tests {
         let icon = default_icon();
         assert!(encode_ico(&icon).unwrap().starts_with(&[0, 0, 1, 0]));
         assert!(encode_icns(&icon).unwrap().starts_with(b"icns"));
+    }
+
+    #[test]
+    fn macos_plist_declares_local_network_usage_only_when_granted() {
+        let metadata = ApplicationMetadata {
+            kind: "图形".into(),
+            name: "网络应用".into(),
+            identifier: "dev.yanxu.network-test".into(),
+            version: "1.0.0".into(),
+            icon: None,
+            company: None,
+            minimum_system_version: None,
+            window: application::ApplicationWindowMetadata {
+                width: 800,
+                height: 600,
+                minimum_width: 480,
+                minimum_height: 320,
+                maximum_width: None,
+                maximum_height: None,
+                resizable: true,
+                high_dpi: true,
+            },
+        };
+        assert!(
+            macos_info_plist(&metadata, "网络应用", true)
+                .contains("NSLocalNetworkUsageDescription")
+        );
+        assert!(
+            !macos_info_plist(&metadata, "网络应用", false)
+                .contains("NSLocalNetworkUsageDescription")
+        );
     }
 
     #[test]

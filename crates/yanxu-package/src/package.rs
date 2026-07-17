@@ -661,7 +661,7 @@ pub fn validate_lock(manifest: &Manifest) -> Result<LockFile, ManifestError> {
 pub fn manifest_template(name: &str) -> Result<String, String> {
     validate_package_name(name)?;
     Ok(format!(
-        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.7\"\n入口 = \"src/主.yx\"\n\n[依赖]\n\n[权限]\n文件 = []\n网络 = []\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n图形界面 = false\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
+        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.7\"\n入口 = \"src/主.yx\"\n\n[依赖]\n\n[权限]\n文件 = []\n网络 = []\n本地网络 = false\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n图形界面 = false\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
     ))
 }
 
@@ -681,7 +681,7 @@ pub fn gui_manifest_template(name: &str, gui_path: Option<&Path>) -> Result<Stri
         },
     );
     Ok(format!(
-        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.14\"\n入口 = \"src/主.yx\"\n\n[依赖]\n{dependency}\n\n[应用]\n类型 = \"图形\"\n名称 = {name:?}\n标识 = {identifier:?}\n版本 = \"0.1.0\"\n\n[应用.窗口]\n宽 = 800\n高 = 600\n最小宽 = 480\n最小高 = 320\n可缩放 = true\n高分屏 = true\n\n[权限]\n文件 = []\n网络 = []\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n图形界面 = true\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
+        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.15\"\n入口 = \"src/主.yx\"\n\n[依赖]\n{dependency}\n\n[应用]\n类型 = \"图形\"\n名称 = {name:?}\n标识 = {identifier:?}\n版本 = \"0.1.0\"\n\n[应用.窗口]\n宽 = 800\n高 = 600\n最小宽 = 480\n最小高 = 320\n可缩放 = true\n高分屏 = true\n\n[权限]\n文件 = []\n网络 = []\n本地网络 = false\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n图形界面 = true\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
     ))
 }
 
@@ -1060,7 +1060,7 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         return Err(manifest_error(
             &path,
             None,
-            format!("1.1.14 仅支持“字节码”构建目标，不支持“{}”", build.target),
+            format!("1.1.15 仅支持“字节码”构建目标，不支持“{}”", build.target),
         ));
     }
 
@@ -1084,6 +1084,9 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         }
         for host in array_alias(table, &["网络", "network"]).unwrap_or_default() {
             permissions = permissions.allow_network(host);
+        }
+        if bool_alias(table, &["本地网络", "local_network"]).unwrap_or(false) {
+            permissions = permissions.allow_local_network();
         }
         for host in array_alias(table, &["TCP监听", "tcp_listen"]).unwrap_or_default() {
             permissions = permissions.allow_tcp_listen(host);
@@ -1299,7 +1302,7 @@ fn parse_native_package(
         return Err(manifest_error(
             manifest_path,
             None,
-            format!("不支持原生扩展 ABI {abi_version}，1.1.14 支持 ABI 1、2"),
+            format!("不支持原生扩展 ABI {abi_version}，1.1.15 支持 ABI 1、2"),
         ));
     }
     let mut artifacts = BTreeMap::new();
@@ -3238,6 +3241,7 @@ mod tests {
             [权限]
             文件 = ["data"]
             网络 = ["api.example.com"]
+            本地网络 = true
             TCP监听 = ["127.0.0.1"]
             UDP绑定 = ["127.0.0.1"]
             环境 = ["YANXU_HOME"]
@@ -3261,6 +3265,12 @@ mod tests {
             manifest
                 .permissions
                 .check_network("http://api.example.com/v1")
+                .is_ok()
+        );
+        assert!(
+            manifest
+                .permissions
+                .check_resolved_network("api.example.com:80", "10.0.0.1:80".parse().unwrap())
                 .is_ok()
         );
         assert!(manifest.permissions.check_tcp_listen("127.0.0.1:0").is_ok());
@@ -3298,7 +3308,7 @@ mod tests {
         let application = manifest.application.as_ref().unwrap();
         assert_eq!(
             manifest.minimum_yanxu.as_ref().unwrap().to_string(),
-            ">=1.1.14"
+            ">=1.1.15"
         );
         assert_eq!(application.kind, ApplicationKind::Graphical);
         assert_eq!(application.name, "窗口应用");

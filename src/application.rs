@@ -129,6 +129,8 @@ pub struct PermissionSummary {
     pub unrestricted: bool,
     pub files: Vec<String>,
     pub network: Vec<String>,
+    #[serde(default)]
+    pub local_network: bool,
     pub tcp_listen: Vec<String>,
     pub udp_bind: Vec<String>,
     pub environment: Vec<String>,
@@ -165,6 +167,7 @@ impl PermissionSummary {
                 })
                 .collect(),
             network: permissions.network_hosts().map(str::to_owned).collect(),
+            local_network: permissions.local_network_allowed(),
             tcp_listen: permissions.tcp_listen_hosts().map(str::to_owned).collect(),
             udp_bind: permissions.udp_bind_hosts().map(str::to_owned).collect(),
             environment: permissions
@@ -193,6 +196,9 @@ impl PermissionSummary {
         }
         for host in &self.network {
             permissions = permissions.allow_network(host);
+        }
+        if self.local_network {
+            permissions = permissions.allow_local_network();
         }
         for host in &self.tcp_listen {
             permissions = permissions.allow_tcp_listen(host);

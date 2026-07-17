@@ -2945,11 +2945,11 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn rejects_sensitive_http_dns_results_without_an_exact_ip_grant() {
+    fn rejects_local_http_dns_results_without_local_network_permission() {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let permissions = crate::permissions::PermissionSet::sandboxed().allow_network("localhost");
+        let permissions = crate::permissions::PermissionSet::sandboxed().allow_network("*");
         let error = http_request_with_options_guarded(
             "GET",
             &format!(
@@ -2963,6 +2963,39 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "NET_PERMISSION");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn allows_local_http_dns_results_with_local_network_permission() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let permissions = crate::permissions::PermissionSet::sandboxed()
+            .allow_network("*")
+            .allow_local_network();
+        let response = http_request_with_options_guarded(
+            "GET",
+            &format!("http://localhost:{port}/"),
+            None,
+            1_000,
+            64,
+            &permissions,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "ok");
     }
 
     #[cfg(not(target_family = "wasm"))]

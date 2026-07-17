@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub const PERMISSION_CAPABILITIES: &[&str] = &[
     "文件",
     "网络",
+    "本地网络",
     "TCP监听",
     "UDP绑定",
     "环境",
@@ -32,6 +33,7 @@ pub struct PermissionSet {
     allow_all: bool,
     file_roots: Vec<PathBuf>,
     network_hosts: BTreeSet<String>,
+    local_network: bool,
     tcp_listen_hosts: BTreeSet<String>,
     udp_bind_hosts: BTreeSet<String>,
     environment_variables: BTreeSet<String>,
@@ -52,6 +54,7 @@ impl PermissionSet {
             allow_all: true,
             file_roots: Vec::new(),
             network_hosts: BTreeSet::new(),
+            local_network: true,
             tcp_listen_hosts: BTreeSet::new(),
             udp_bind_hosts: BTreeSet::new(),
             environment_variables: BTreeSet::new(),
@@ -72,6 +75,7 @@ impl PermissionSet {
             allow_all: false,
             file_roots: Vec::new(),
             network_hosts: BTreeSet::new(),
+            local_network: false,
             tcp_listen_hosts: BTreeSet::new(),
             udp_bind_hosts: BTreeSet::new(),
             environment_variables: BTreeSet::new(),
@@ -98,6 +102,11 @@ impl PermissionSet {
 
     pub fn allow_network(mut self, host: impl Into<String>) -> Self {
         self.network_hosts.insert(normalize_grant(&host.into()));
+        self
+    }
+
+    pub fn allow_local_network(mut self) -> Self {
+        self.local_network = true;
         self
     }
 
@@ -194,6 +203,7 @@ impl PermissionSet {
             allow_all: false,
             file_roots,
             network_hosts: intersect_network_grants(&self.network_hosts, &requested.network_hosts),
+            local_network: self.local_network && requested.local_network,
             tcp_listen_hosts: intersect_network_grants(
                 &self.tcp_listen_hosts,
                 &requested.tcp_listen_hosts,
@@ -268,12 +278,20 @@ impl PermissionSet {
         } else {
             format!("{ip}:{}", address.port())
         };
-        if self.network_hosts.contains(&ip) || self.network_hosts.contains(&endpoint) {
+        if self.network_hosts.contains(&ip)
+            || self.network_hosts.contains(&endpoint)
+            || (self.local_network && is_local_network_ip(address.ip()))
+        {
             Ok(())
         } else {
+            let guidance = if is_local_network_ip(address.ip()) {
+                "本地网络地址须精确授权或申请“本地网络”能力"
+            } else {
+                "特殊地址须精确授权"
+            };
             Err(PermissionError::new(
                 "网络地址",
-                format!("{resource} → {ip}（回环、私网或特殊地址须精确授权）"),
+                format!("{resource} → {ip}（{guidance}）"),
             ))
         }
     }
@@ -434,6 +452,10 @@ impl PermissionSet {
 
     pub fn network_hosts(&self) -> impl Iterator<Item = &str> {
         self.network_hosts.iter().map(String::as_str)
+    }
+
+    pub fn local_network_allowed(&self) -> bool {
+        self.allow_all || self.local_network
     }
 
     pub fn tcp_listen_hosts(&self) -> impl Iterator<Item = &str> {
@@ -687,6 +709,27 @@ pub fn is_sensitive_ip(ip: IpAddr) -> bool {
     }
 }
 
+pub fn is_local_network_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [first, second, _, _] = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || (first == 100 && (64..=127).contains(&second))
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            ip.is_loopback()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|ipv4| is_local_network_ip(IpAddr::V4(ipv4)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +804,32 @@ mod tests {
                 .check_resolved_network("example.com:443", "127.0.0.1:443".parse().unwrap())
                 .is_err()
         );
+        let local_network = wildcard.clone().allow_local_network();
+        for address in [
+            "127.0.0.1:443",
+            "10.0.0.1:443",
+            "172.16.0.1:443",
+            "192.168.1.1:443",
+            "100.64.0.1:443",
+            "169.254.1.1:443",
+            "[fd00::1]:443",
+            "[fe80::1]:443",
+        ] {
+            assert!(
+                local_network
+                    .check_resolved_network("configured-service:443", address.parse().unwrap())
+                    .is_ok(),
+                "本地网络能力应允许 {address}"
+            );
+        }
+        for address in ["0.0.0.0:443", "192.0.2.1:443", "224.0.0.1:443"] {
+            assert!(
+                local_network
+                    .check_resolved_network("configured-service:443", address.parse().unwrap())
+                    .is_err(),
+                "本地网络能力不应允许特殊地址 {address}"
+            );
+        }
         assert!(
             PermissionSet::sandboxed()
                 .allow_network("127.0.0.1")
@@ -784,6 +853,29 @@ mod tests {
                 .allow_network("127.0.0.1")
                 .check_tcp_listen("127.0.0.1:0")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn local_network_capability_is_explicit_and_intersects_with_host_limits() {
+        let requested = PermissionSet::sandboxed()
+            .allow_network("*")
+            .allow_local_network();
+        let restrictive_host = PermissionSet::sandboxed().allow_network("*");
+        let denied = restrictive_host.intersect(&requested);
+        assert!(
+            denied
+                .check_resolved_network("service:8080", "10.0.0.1:8080".parse().unwrap())
+                .is_err()
+        );
+
+        let local_host = restrictive_host.allow_local_network();
+        let allowed = local_host.intersect(&requested);
+        assert!(allowed.local_network_allowed());
+        assert!(
+            allowed
+                .check_resolved_network("service:8080", "10.0.0.1:8080".parse().unwrap())
+                .is_ok()
         );
     }
 
