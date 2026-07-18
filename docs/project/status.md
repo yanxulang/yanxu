@@ -2,9 +2,9 @@
 
 本文件是核心仓库当前版本、公开格式和兼容基线的唯一状态真源。语言语义仍以[`../../spec/language/v1/`](../../spec/language/v1/)和可执行兼容语料为规范；历史台账只保存已经完成阶段的验收证据。
 
-## 当前发行
+## 当前版本
 
-- 当前源码版本：`1.1.15`
+- 当前源码版本：`1.1.16`
 - 正式语言规范：版本 `1`
 - 最早受兼容语料持续验证的源码版本：`0.3`
 - Rust 最低支持版本：尚未声明；发布前不得据此推断任意旧工具链受支持
@@ -27,7 +27,7 @@
 ```json
 {
   "status_schema": 1,
-  "current_version": "1.1.15",
+  "current_version": "1.1.16",
   "language_spec_version": 1,
   "manifest_format": { "current": 2, "readable": [1, 2] },
   "lock_format": { "current": 2, "readable": [1, 2] },
