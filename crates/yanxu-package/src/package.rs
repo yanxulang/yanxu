@@ -13,7 +13,7 @@ use archive::{extract_archive_safely, find_manifest_root};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -37,6 +37,11 @@ pub const ARCHIVE_MAX_PATH_BYTES: usize = 512;
 pub const NATIVE_ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 pub const NATIVE_ARTIFACT_MAX_COUNT: usize = 32;
 pub const NATIVE_ARTIFACT_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const REGISTRY_INDEX_MAX_VERSIONS: usize = 10_000;
+const REGISTRY_RELEASE_URL_MAX_BYTES: usize = 4_096;
+const REGISTRY_VULNERABILITY_MAX_COUNT: usize = 1_024;
+const REGISTRY_VULNERABILITY_ID_MAX_BYTES: usize = 256;
+const REGISTRY_VULNERABILITY_SUMMARY_MAX_BYTES: usize = 8_192;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2427,8 +2432,177 @@ fn local_registry_path(registry: &str) -> Option<PathBuf> {
 fn read_registry_index(path: &Path) -> Result<RegistryIndex, ManifestError> {
     let index_text = fs::read_to_string(path)
         .map_err(|error| manifest_error(path, None, format!("不能读取索引元数据：{error}")))?;
-    serde_json::from_str(&index_text)
+    reject_duplicate_registry_json_keys(path, index_text.as_bytes())?;
+    let index: RegistryIndex = serde_json::from_str(&index_text)
+        .map_err(|error| manifest_error(path, None, format!("索引元数据无效：{error}")))?;
+    validate_registry_index(path, &index)?;
+    Ok(index)
+}
+
+fn reject_duplicate_registry_json_keys(path: &Path, payload: &[u8]) -> Result<(), ManifestError> {
+    use serde::de::{MapAccess, SeqAccess, Visitor};
+
+    struct UniqueJson;
+    struct UniqueVisitor;
+
+    impl<'de> Deserialize<'de> for UniqueJson {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(UniqueVisitor)
+        }
+    }
+
+    impl<'de> Visitor<'de> for UniqueVisitor {
+        type Value = UniqueJson;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("无重复对象键的 JSON")
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(UniqueJson)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while sequence.next_element::<UniqueJson>()?.is_some() {}
+            Ok(UniqueJson)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut keys = BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !keys.insert(key.clone()) {
+                    return Err(serde::de::Error::custom(format!("JSON 对象键重复：{key}")));
+                }
+                map.next_value::<UniqueJson>()?;
+            }
+            Ok(UniqueJson)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(payload);
+    UniqueJson::deserialize(&mut deserializer)
+        .and_then(|_| deserializer.end())
         .map_err(|error| manifest_error(path, None, format!("索引元数据无效：{error}")))
+}
+
+fn validate_registry_index(path: &Path, index: &RegistryIndex) -> Result<(), ManifestError> {
+    if index.versions.len() > REGISTRY_INDEX_MAX_VERSIONS {
+        return Err(manifest_error(
+            path,
+            None,
+            format!(
+                "索引版本数量 {} 超过上限 {REGISTRY_INDEX_MAX_VERSIONS}",
+                index.versions.len()
+            ),
+        ));
+    }
+    let mut versions = BTreeSet::new();
+    for release in &index.versions {
+        Version::parse(&release.version).map_err(|error| {
+            manifest_error(
+                path,
+                None,
+                format!("索引版本“{}”无效：{error}", release.version),
+            )
+        })?;
+        if !versions.insert(release.version.as_str()) {
+            return Err(manifest_error(
+                path,
+                None,
+                format!("索引版本重复：{}", release.version),
+            ));
+        }
+        if release.url.is_empty()
+            || release.checksum.is_empty()
+            || release.version.len() > 128
+            || release.url.len() > REGISTRY_RELEASE_URL_MAX_BYTES
+            || release.checksum.len() > 128
+            || release
+                .version
+                .chars()
+                .chain(release.url.chars())
+                .chain(release.checksum.chars())
+                .any(char::is_control)
+        {
+            return Err(manifest_error(
+                path,
+                None,
+                "索引版本字段为空、过长或包含控制字符",
+            ));
+        }
+        let Some(vulnerabilities) = &release.vulnerabilities else {
+            continue;
+        };
+        if vulnerabilities.len() > REGISTRY_VULNERABILITY_MAX_COUNT {
+            return Err(manifest_error(
+                path,
+                None,
+                format!(
+                    "版本 {} 的漏洞数量超过上限 {REGISTRY_VULNERABILITY_MAX_COUNT}",
+                    release.version
+                ),
+            ));
+        }
+        for vulnerability in vulnerabilities {
+            let reference = vulnerability.url.as_deref().unwrap_or("");
+            if vulnerability.id.len() > REGISTRY_VULNERABILITY_ID_MAX_BYTES
+                || vulnerability.severity.len() > 32
+                || vulnerability.summary.len() > REGISTRY_VULNERABILITY_SUMMARY_MAX_BYTES
+                || reference.len() > REGISTRY_RELEASE_URL_MAX_BYTES
+                || vulnerability
+                    .id
+                    .chars()
+                    .chain(vulnerability.severity.chars())
+                    .chain(vulnerability.summary.chars())
+                    .chain(reference.chars())
+                    .any(char::is_control)
+            {
+                return Err(manifest_error(
+                    path,
+                    None,
+                    format!("版本 {} 的漏洞元数据过长或包含控制字符", release.version),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -3936,6 +4110,50 @@ mod tests {
             .unwrap()
             .is_none()
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn registry_indexes_reject_ambiguous_and_unbounded_metadata() {
+        let root = temp("registry-index-validation");
+        let path = root.join("index.json");
+        let checksum = "a".repeat(64);
+
+        write(
+            &path,
+            &format!(
+                r#"{{"versions":[{{"version":"1.0.0","url":"https://example.invalid/package.tar.gz","checksum":"{checksum}","yanked":false,"yanked":true}}]}}"#
+            ),
+        );
+        let duplicate_key = read_registry_index(&path).unwrap_err();
+        assert!(duplicate_key.message.contains("JSON 对象键重复：yanked"));
+
+        let release = format!(
+            r#"{{"version":"1.0.0","url":"https://example.invalid/package.tar.gz","checksum":"{checksum}"}}"#
+        );
+        write(&path, &format!(r#"{{"versions":[{release},{release}]}}"#));
+        let duplicate_version = read_registry_index(&path).unwrap_err();
+        assert!(duplicate_version.message.contains("索引版本重复：1.0.0"));
+
+        write(
+            &path,
+            &format!(
+                r#"{{"versions":[{{"version":"not-semver","url":"https://example.invalid/package.tar.gz","checksum":"{checksum}"}}]}}"#
+            ),
+        );
+        let invalid_version = read_registry_index(&path).unwrap_err();
+        assert!(invalid_version.message.contains("索引版本“not-semver”无效"));
+
+        let oversized_id = "x".repeat(REGISTRY_VULNERABILITY_ID_MAX_BYTES + 1);
+        write(
+            &path,
+            &format!(
+                r#"{{"versions":[{{"version":"1.0.0","url":"https://example.invalid/package.tar.gz","checksum":"{checksum}","vulnerabilities":[{{"id":"{oversized_id}","severity":"high","summary":"test"}}]}}]}}"#
+            ),
+        );
+        let oversized = read_registry_index(&path).unwrap_err();
+        assert!(oversized.message.contains("漏洞元数据过长"));
+
         fs::remove_dir_all(root).ok();
     }
 
