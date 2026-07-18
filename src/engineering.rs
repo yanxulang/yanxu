@@ -777,5 +777,38 @@ mod tests {
         assert_eq!(inspected["name"], "协议工程");
         assert_eq!(response(&json!({"operation":"unknown"}))["ok"], false);
         fs::remove_dir_all(root).ok();
+
+        let gui_root = std::env::temp_dir().join(format!(
+            "yanxu-engineering-gui-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(gui_root.join("src")).unwrap();
+        let template = handle(&json!({
+            "operation": "template",
+            "name": "协议窗口工程",
+            "gui": true,
+        }))
+        .unwrap();
+        fs::write(
+            gui_root.join(package::MANIFEST_NAME),
+            template["manifest"].as_str().unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gui_root.join("src/主.yx"),
+            template["entry"].as_str().unwrap(),
+        )
+        .unwrap();
+        let inspected = handle(&json!({"operation":"inspect", "path":gui_root})).unwrap();
+        assert_eq!(inspected["dependencies"]["言窗"]["source"], "registry");
+        assert_eq!(
+            inspected["dependencies"]["言窗"]["source_value"],
+            package::DEFAULT_REGISTRY
+        );
+        assert_eq!(inspected["dependencies"]["言窗"]["version"], "^1.0");
+        fs::remove_dir_all(gui_root).ok();
     }
 }

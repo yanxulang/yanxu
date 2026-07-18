@@ -28,7 +28,7 @@ pub const MANIFEST_FORMAT_VERSION: u32 = 2;
 pub const LOCK_FORMAT_VERSION: u32 = 2;
 pub const SUPPORTED_MANIFEST_FORMATS: &[u32] = &[1, 2];
 pub const SUPPORTED_LOCK_FORMATS: &[u32] = &[1, 2];
-pub const DEFAULT_REGISTRY: &str = "https://packages.yanxu.dev/v1";
+pub const DEFAULT_REGISTRY: &str = "https://get.yanxu.dev/packages/v1";
 pub const ARCHIVE_MAX_COMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
 pub const ARCHIVE_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 pub const ARCHIVE_MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
@@ -672,10 +672,10 @@ pub fn gui_manifest_template(name: &str, gui_path: Option<&Path>) -> Result<Stri
     validate_package_name(name)?;
     let identifier = format!("dev.yanxu.app-{}", &short_hash(name)[..12]);
     let dependency = gui_path.map_or_else(
-        || "言窗 = { 包 = \"yanxu-gui\", 版 = \"^0.1\" }".to_string(),
+        || "言窗 = { 包 = \"yanxu-gui\", 版 = \"^1.0\" }".to_string(),
         |path| {
             format!(
-                "言窗 = {{ 包 = \"yanxu-gui\", 路径 = {:?}, 版 = \"^0.1\" }}",
+                "言窗 = {{ 包 = \"yanxu-gui\", 路径 = {:?}, 版 = \"^1.0\" }}",
                 path.to_string_lossy()
             )
         },
@@ -3354,7 +3354,7 @@ mod tests {
         assert!(matches!(
             manifest.dependencies.get("言窗"),
             Some(Dependency::Path { requirement: Some(requirement), .. })
-                if requirement.to_string() == "^0.1"
+                if requirement.to_string() == "^1.0"
         ));
         fs::remove_dir_all(root).ok();
     }
