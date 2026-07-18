@@ -295,6 +295,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: read
     steps:
       - name: 确认全部制品成功后公开 Release
         shell: bash
