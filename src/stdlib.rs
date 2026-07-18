@@ -1018,7 +1018,6 @@ pub fn csv_stringify(rows: &[Vec<String>]) -> String {
 
 pub const HTTP_DEFAULT_TIMEOUT_MILLIS: u64 = 10_000;
 pub const HTTP_DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024;
-pub const HTTP_MAX_RESPONSE_BYTES: u64 = crate::budget::MAX_HTTP_RESPONSE_BYTES;
 pub const HTTP_MAX_REDIRECTS: usize = 10;
 
 #[derive(Debug, Clone, Copy)]
