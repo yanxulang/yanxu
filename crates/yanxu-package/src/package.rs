@@ -2295,24 +2295,16 @@ fn resolve_registry(
         &index_path,
     )?;
     let index = read_registry_index(&index_path)?;
-    let mut candidates = index
-        .versions
-        .into_iter()
-        .filter_map(|release| {
-            let version = Version::parse(&release.version).ok()?;
-            (requirement.matches(&version)
-                && locked.as_ref().is_none_or(|locked| locked == &version))
-            .then_some((version, release))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.0.cmp(&right.0));
-    let (version, release) = candidates.pop().ok_or_else(|| {
-        manifest_error(
-            &index_path,
-            None,
-            format!("远程索引中没有满足 {requirement} 的“{name}”版本"),
-        )
-    })?;
+    let (version, release) =
+        select_remote_registry_release(index.versions, requirement, locked.as_ref()).ok_or_else(
+            || {
+                manifest_error(
+                    &index_path,
+                    None,
+                    format!("远程索引中没有满足 {requirement} 的“{name}”版本"),
+                )
+            },
+        )?;
     if !valid_sha256(&release.checksum) {
         return Err(manifest_error(
             &index_path,
@@ -2601,6 +2593,25 @@ fn validate_registry_index(path: &Path, index: &RegistryIndex) -> Result<(), Man
         }
     }
     Ok(())
+}
+
+fn select_remote_registry_release(
+    releases: Vec<RegistryRelease>,
+    requirement: &VersionReq,
+    locked: Option<&Version>,
+) -> Option<(Version, RegistryRelease)> {
+    let mut candidates = releases
+        .into_iter()
+        .filter_map(|release| {
+            let version = Version::parse(&release.version).ok()?;
+            (requirement.matches(&version)
+                && locked.is_none_or(|locked| locked == &version)
+                && (locked.is_some() || release.yanked != Some(true)))
+            .then_some((version, release))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates.pop()
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -4153,6 +4164,37 @@ mod tests {
         assert!(oversized.message.contains("漏洞元数据过长"));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn new_registry_resolution_skips_yanked_versions_but_locks_remain_reproducible() {
+        let release = |version: &str, yanked| RegistryRelease {
+            version: version.into(),
+            url: format!("https://example.invalid/{version}.tar.gz"),
+            checksum: "a".repeat(64),
+            yanked,
+            vulnerabilities: Some(Vec::new()),
+        };
+        let releases = vec![release("1.0.0", Some(false)), release("1.1.0", Some(true))];
+
+        let (selected, _) =
+            select_remote_registry_release(releases.clone(), &VersionReq::STAR, None).unwrap();
+        assert_eq!(selected, Version::new(1, 0, 0));
+
+        let locked = Version::new(1, 1, 0);
+        let (selected, metadata) =
+            select_remote_registry_release(releases, &VersionReq::STAR, Some(&locked)).unwrap();
+        assert_eq!(selected, locked);
+        assert_eq!(metadata.yanked, Some(true));
+
+        assert!(
+            select_remote_registry_release(
+                vec![release("2.0.0", Some(true))],
+                &VersionReq::STAR,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
