@@ -719,7 +719,7 @@ fn audit_registry_dependency(
             ));
             continue;
         };
-        if vulnerability.id.trim().is_empty() || vulnerability.summary.trim().is_empty() {
+        if !valid_vulnerability_id(&vulnerability.id) || vulnerability.summary.trim().is_empty() {
             findings.push(AuditFinding::new(
                 "error",
                 "AUDIT_VULNERABILITY_METADATA_INVALID",
@@ -761,7 +761,7 @@ fn vulnerability_code(id: &str) -> String {
     let normalized = id
         .chars()
         .map(|character| {
-            if character.is_alphanumeric() {
+            if character.is_ascii_alphanumeric() {
                 character.to_ascii_uppercase()
             } else {
                 '_'
@@ -769,6 +769,14 @@ fn vulnerability_code(id: &str) -> String {
         })
         .collect::<String>();
     format!("AUDIT_VULNERABILITY_{normalized}")
+}
+
+fn valid_vulnerability_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 96
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn exact_git_revision(revision: &str) -> bool {
@@ -1249,6 +1257,11 @@ mod tests {
                             "severity": "critical",
                             "summary": "已撤回记录",
                             "withdrawn": true
+                        },
+                        {
+                            "id": "不安全公告",
+                            "severity": "high",
+                            "summary": "无效标识"
                         }
                     ]
                 }]
@@ -1279,6 +1292,7 @@ mod tests {
         assert!(codes.contains("AUDIT_YANKED"));
         assert!(codes.contains("AUDIT_VULNERABILITY_YXSA_2026_0001"));
         assert!(!codes.contains("AUDIT_VULNERABILITY_YXSA_2026_0000"));
+        assert!(codes.contains("AUDIT_VULNERABILITY_METADATA_INVALID"));
         assert!(!codes.contains("AUDIT_VULNERABILITY_METADATA_MISSING"));
         fs::remove_dir_all(root).ok();
     }
