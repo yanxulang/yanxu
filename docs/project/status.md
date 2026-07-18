@@ -7,7 +7,7 @@
 - 当前源码版本：`1.1.17`
 - 正式语言规范：版本 `1`
 - 最早受兼容语料持续验证的源码版本：`0.3`
-- Rust 最低支持版本：尚未声明；发布前不得据此推断任意旧工具链受支持
+- Rust 最低支持版本：`1.89`；六个原生目标与 WASI 均在最低版本工具链执行构建门禁
 
 ## 公开契约
 
@@ -40,7 +40,7 @@
   "compatibility_report_schema": 1,
   "compatibility_cases": 13,
   "minimum_supported_source_version": "0.3",
-  "rust_msrv": null
+  "rust_msrv": "1.89"
 }
 ```
 

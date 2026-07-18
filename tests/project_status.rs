@@ -90,6 +90,25 @@ fn project_status_matches_implemented_contracts() {
                 value.as_str().unwrap().into()
             ))
     );
+    let rust_msrv = metadata["rust_msrv"].as_str().unwrap();
+    for manifest in [
+        "crates/yanxu-package/Cargo.toml",
+        "examples/native-extension-rust/Cargo.toml",
+        "examples/native-extension-v2-rust/Cargo.toml",
+        "examples/embedding/rust-host/Cargo.toml",
+        "examples/embedding/wasi-host/Cargo.toml",
+        "fuzz/Cargo.toml",
+    ] {
+        let cargo: toml::Value = fs::read_to_string(root.join(manifest))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            cargo["package"]["rust-version"].as_str(),
+            Some(rust_msrv),
+            "{manifest} must use the project MSRV"
+        );
+    }
 
     assert_human_status(
         &status,
