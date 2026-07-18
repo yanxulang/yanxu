@@ -26,6 +26,133 @@ pub(super) fn extract_archive_safely(
     extract_archive_with_limits(archive, destination, ARCHIVE_LIMITS)
 }
 
+/// 只读验证既有文件是否为本生产器可安全覆盖的 YXP 制品。
+///
+/// 源树内允许调用方选择任意输出文件名；但再次打包时不能仅凭扩展名覆盖
+/// 一个普通源码或资源文件。这里完整消费 gzip/tar，在既有消费端限额内确认
+/// 所有条目均为 `package/` 下的普通文件，并且恰含根清单。
+pub(super) fn validate_existing_package_archive(
+    archive: &Path,
+    limits: ArchiveLimits,
+) -> Result<(), ManifestError> {
+    let compressed_bytes = fs::metadata(archive)
+        .map_err(|error| manifest_error(archive, None, format!("不能检查既有打包输出：{error}")))?
+        .len();
+    if compressed_bytes > limits.compressed_bytes {
+        return Err(manifest_error(
+            archive,
+            None,
+            format!("既有打包输出超过 {} 字节上限", limits.compressed_bytes),
+        ));
+    }
+
+    let file = fs::File::open(archive)
+        .map_err(|error| manifest_error(archive, None, format!("不能打开既有打包输出：{error}")))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let entries = tar.entries().map_err(|error| {
+        manifest_error(
+            archive,
+            None,
+            format!("源树内既有输出不是有效 YXP：{error}"),
+        )
+    })?;
+    let mut entry_count = 0_usize;
+    let mut expanded_bytes = 0_u64;
+    let mut manifest_count = 0_usize;
+    let mut paths = BTreeSet::new();
+    for entry in entries {
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > limits.entries {
+            return Err(manifest_error(
+                archive,
+                None,
+                format!("既有 YXP 条目超过 {} 项上限", limits.entries),
+            ));
+        }
+        let mut entry = entry.map_err(|error| {
+            manifest_error(archive, None, format!("不能读取既有 YXP 条目：{error}"))
+        })?;
+        let relative = entry
+            .path()
+            .map_err(|error| manifest_error(archive, None, format!("既有 YXP 路径无效：{error}")))?
+            .into_owned();
+        validate_archive_relative_path(&relative, limits.path_bytes)
+            .map_err(|message| manifest_error(archive, None, message))?;
+        if !paths.insert(relative.clone()) {
+            return Err(manifest_error(
+                archive,
+                None,
+                format!("源树内既有 YXP 含重复路径“{}”", relative.display()),
+            ));
+        }
+        if !entry.header().entry_type().is_file()
+            || relative
+                .components()
+                .next()
+                .is_none_or(|component| component.as_os_str() != "package")
+        {
+            return Err(manifest_error(
+                archive,
+                None,
+                "源树内既有输出不是本工具生成的 YXP，拒绝覆盖",
+            ));
+        }
+        if relative == Path::new("package").join(MANIFEST_NAME) {
+            manifest_count = manifest_count.saturating_add(1);
+        } else if relative
+            .file_name()
+            .is_some_and(|name| name == MANIFEST_NAME)
+        {
+            return Err(manifest_error(
+                archive,
+                None,
+                "源树内既有 YXP 含嵌套包清单，拒绝覆盖",
+            ));
+        }
+        let file_bytes = entry.size();
+        if file_bytes > limits.file_bytes {
+            return Err(manifest_error(
+                archive,
+                None,
+                format!("既有 YXP 单文件超过 {} 字节上限", limits.file_bytes),
+            ));
+        }
+        expanded_bytes = expanded_bytes
+            .checked_add(file_bytes)
+            .filter(|total| *total <= limits.expanded_bytes)
+            .ok_or_else(|| {
+                manifest_error(
+                    archive,
+                    None,
+                    format!("既有 YXP 展开后超过 {} 字节上限", limits.expanded_bytes),
+                )
+            })?;
+        let copied = io::copy(&mut entry, &mut io::sink()).map_err(|error| {
+            manifest_error(archive, None, format!("不能完整读取既有 YXP 条目：{error}"))
+        })?;
+        if copied != file_bytes {
+            return Err(manifest_error(
+                archive,
+                None,
+                "既有 YXP 条目声明大小与实际内容不符",
+            ));
+        }
+    }
+    if manifest_count != 1 || entry_count < 2 {
+        return Err(manifest_error(
+            archive,
+            None,
+            format!("既有 YXP 应恰含一个根清单，实有 {manifest_count} 个"),
+        ));
+    }
+    let mut decoder = tar.into_inner();
+    io::copy(&mut decoder, &mut io::sink()).map_err(|error| {
+        manifest_error(archive, None, format!("既有 YXP gzip 数据不完整：{error}"))
+    })?;
+    Ok(())
+}
+
 pub(super) fn extract_archive_with_limits(
     archive: &Path,
     destination: &Path,
@@ -163,7 +290,7 @@ pub(super) fn validate_archive_relative_path(path: &Path, max_bytes: usize) -> R
             )
         })
     {
-        Err(format!("索引制品含越界或过长路径“{}”", path.display()))
+        Err(format!("制品含越界或过长路径“{}”", path.display()))
     } else {
         Ok(())
     }
