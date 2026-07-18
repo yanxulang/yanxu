@@ -17,7 +17,7 @@ pub const API_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const BYTES_MAX_VALUE_BYTES: usize = crate::budget::MAX_BYTE_VALUE_BYTES as usize;
 pub const SECURE_RANDOM_MAX_BYTES: usize = 1024 * 1024;
 pub const PROCESS_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-pub const PROCESS_MAX_TIMEOUT_MILLIS: u64 = 300_000;
+pub const PROCESS_MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessOutput {
@@ -2750,6 +2750,25 @@ mod tests {
         );
         assert!(format_http_date(253_402_300_800_000).is_err());
         assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn process_timeout_budget_accepts_long_operations_and_rejects_outside_the_hard_limit() {
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.to_string_lossy();
+        let arguments = vec!["--list".to_owned()];
+        let output =
+            process_run(&executable, &arguments, None, PROCESS_MAX_TIMEOUT_MILLIS).unwrap();
+        assert!(output.success);
+        assert_eq!(PROCESS_MAX_TIMEOUT_MILLIS, 86_400_000);
+        for timeout in [0, PROCESS_MAX_TIMEOUT_MILLIS + 1] {
+            let error = process_run(&executable, &arguments, None, timeout).unwrap_err();
+            assert_eq!(
+                error,
+                format!("PROCESS_TIMEOUT：超时须在 1..={PROCESS_MAX_TIMEOUT_MILLIS} 毫秒之间")
+            );
+        }
     }
 
     #[cfg(not(target_family = "wasm"))]

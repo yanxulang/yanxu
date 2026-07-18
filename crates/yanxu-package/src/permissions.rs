@@ -252,10 +252,10 @@ impl PermissionSet {
             return Ok(());
         }
         let authority = normalize_grant(url);
-        let host = normalize_host(&authority);
-        if self.network_hosts.contains("*")
-            || self.network_hosts.contains(&authority)
-            || self.network_hosts.contains(host)
+        if self
+            .network_hosts
+            .iter()
+            .any(|grant| network_grant_allows_authority(grant, &authority))
         {
             Ok(())
         } else {
@@ -273,13 +273,10 @@ impl PermissionSet {
             return Ok(());
         }
         let ip = address.ip().to_string();
-        let endpoint = if address.is_ipv6() {
-            format!("[{ip}]:{}", address.port())
-        } else {
-            format!("{ip}:{}", address.port())
-        };
-        if self.network_hosts.contains(&ip)
-            || self.network_hosts.contains(&endpoint)
+        if self
+            .network_hosts
+            .iter()
+            .any(|grant| network_grant_allows_resolved_address(grant, address))
             || (self.local_network && is_local_network_ip(address.ip()))
         {
             Ok(())
@@ -641,28 +638,120 @@ fn intersect_network_grants(
     let mut effective = BTreeSet::new();
     for host_grant in host {
         for requested_grant in requested {
-            if host_grant == requested_grant {
-                effective.insert(host_grant.clone());
-                continue;
-            }
-            if normalize_host(host_grant) != normalize_host(requested_grant) {
-                continue;
-            }
-            match (explicit_port(host_grant), explicit_port(requested_grant)) {
-                (Some(host_port), Some(requested_port)) if host_port != requested_port => {}
-                (Some(_), _) => {
-                    effective.insert(host_grant.clone());
-                }
-                (_, Some(_)) => {
-                    effective.insert(requested_grant.clone());
-                }
-                _ => {
-                    effective.insert(host_grant.clone());
-                }
+            if let Some(grant) = intersect_network_grant(host_grant, requested_grant) {
+                effective.insert(grant);
             }
         }
     }
     effective
+}
+
+fn intersect_network_grant(host: &str, requested: &str) -> Option<String> {
+    if host == requested {
+        return Some(host.to_owned());
+    }
+    match (parse_network_cidr(host), parse_network_cidr(requested)) {
+        (Some(host_cidr), Some(requested_cidr)) => {
+            if cidr_contains_cidr(host_cidr, requested_cidr) {
+                return Some(requested.to_owned());
+            }
+            if cidr_contains_cidr(requested_cidr, host_cidr) {
+                return Some(host.to_owned());
+            }
+            return None;
+        }
+        (Some(cidr), None) => {
+            return grant_ip(requested)
+                .filter(|ip| cidr_contains(cidr, *ip))
+                .map(|_| requested.to_owned());
+        }
+        (None, Some(cidr)) => {
+            return grant_ip(host)
+                .filter(|ip| cidr_contains(cidr, *ip))
+                .map(|_| host.to_owned());
+        }
+        (None, None) => {}
+    }
+    if normalize_host(host) != normalize_host(requested) {
+        return None;
+    }
+    match (explicit_port(host), explicit_port(requested)) {
+        (Some(host_port), Some(requested_port)) if host_port != requested_port => None,
+        (Some(_), _) => Some(host.to_owned()),
+        (_, Some(_)) => Some(requested.to_owned()),
+        _ => Some(host.to_owned()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NetworkCidr {
+    address: IpAddr,
+    prefix: u8,
+}
+
+fn parse_network_cidr(grant: &str) -> Option<NetworkCidr> {
+    let (address, prefix) = grant.rsplit_once('/')?;
+    let address = address.parse::<IpAddr>().ok()?;
+    let prefix = prefix.parse::<u8>().ok()?;
+    let maximum = if address.is_ipv4() { 32 } else { 128 };
+    (prefix <= maximum).then_some(NetworkCidr { address, prefix })
+}
+
+fn grant_ip(grant: &str) -> Option<IpAddr> {
+    normalize_host(grant).parse().ok()
+}
+
+fn network_grant_allows_authority(grant: &str, authority: &str) -> bool {
+    if grant == "*" || grant == authority || grant == normalize_host(authority) {
+        return true;
+    }
+    parse_network_cidr(grant)
+        .zip(grant_ip(authority))
+        .is_some_and(|(cidr, ip)| cidr_contains(cidr, ip))
+}
+
+fn network_grant_allows_resolved_address(grant: &str, address: SocketAddr) -> bool {
+    let ip = address.ip().to_string();
+    let endpoint = if address.is_ipv6() {
+        format!("[{ip}]:{}", address.port())
+    } else {
+        format!("{ip}:{}", address.port())
+    };
+    grant == ip
+        || grant == endpoint
+        || parse_network_cidr(grant).is_some_and(|cidr| cidr_contains(cidr, address.ip()))
+}
+
+fn cidr_contains(cidr: NetworkCidr, address: IpAddr) -> bool {
+    match (cidr.address, address) {
+        (IpAddr::V4(network), IpAddr::V4(address)) => {
+            let network = u32::from_be_bytes(network.octets());
+            let address = u32::from_be_bytes(address.octets());
+            let mask = if cidr.prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - cidr.prefix)
+            };
+            network & mask == address & mask
+        }
+        (IpAddr::V6(network), IpAddr::V6(address)) => {
+            let network = u128::from_be_bytes(network.octets());
+            let address = u128::from_be_bytes(address.octets());
+            let mask = if cidr.prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - cidr.prefix)
+            };
+            network & mask == address & mask
+        }
+        _ => false,
+    }
+}
+
+fn cidr_contains_cidr(outer: NetworkCidr, inner: NetworkCidr) -> bool {
+    outer.address.is_ipv4() == inner.address.is_ipv4()
+        && outer.prefix <= inner.prefix
+        && cidr_contains(outer, inner.address)
 }
 
 fn explicit_port(authority: &str) -> Option<u16> {
@@ -854,6 +943,84 @@ mod tests {
                 .check_tcp_listen("127.0.0.1:0")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cidr_grants_allow_only_the_declared_network_after_resolution() {
+        let permissions = PermissionSet::sandboxed()
+            .allow_network("*")
+            .allow_network("198.18.0.0/15");
+        for address in ["198.18.0.1:443", "198.19.255.254:8080"] {
+            assert!(
+                permissions
+                    .check_resolved_network("configured-service:443", address.parse().unwrap())
+                    .is_ok(),
+                "CIDR 授权应允许 {address}"
+            );
+        }
+        for address in ["192.0.2.1:443", "0.0.0.0:443", "224.0.0.1:443"] {
+            assert!(
+                permissions
+                    .check_resolved_network("configured-service:443", address.parse().unwrap())
+                    .is_err(),
+                "CIDR 授权不应允许 {address}"
+            );
+        }
+        assert!(
+            PermissionSet::sandboxed()
+                .allow_network("198.18.0.0/15")
+                .check_network("http://198.18.42.1:8080/api")
+                .is_ok()
+        );
+        assert!(
+            PermissionSet::sandboxed()
+                .allow_network("198.18.0.0/15")
+                .check_network("http://example.com/api")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cidr_grants_intersect_to_the_narrower_network_or_endpoint() {
+        let host = PermissionSet::sandboxed().allow_network("198.18.0.0/15");
+        let requested = PermissionSet::sandboxed().allow_network("198.19.0.0/16");
+        let effective = host.intersect(&requested);
+        assert_eq!(
+            effective.network_hosts().collect::<Vec<_>>(),
+            ["198.19.0.0/16"]
+        );
+        assert!(
+            effective
+                .check_resolved_network("198.19.1.1", "198.19.1.1:443".parse().unwrap())
+                .is_ok()
+        );
+        assert!(
+            effective
+                .check_resolved_network("198.18.1.1", "198.18.1.1:443".parse().unwrap())
+                .is_err()
+        );
+
+        let endpoint = host.intersect(&PermissionSet::sandboxed().allow_network("198.18.9.7:8443"));
+        assert_eq!(
+            endpoint.network_hosts().collect::<Vec<_>>(),
+            ["198.18.9.7:8443"]
+        );
+        assert!(endpoint.check_network("198.18.9.7:8443").is_ok());
+        assert!(endpoint.check_network("198.18.9.7:443").is_err());
+
+        let disjoint = host.intersect(&PermissionSet::sandboxed().allow_network("198.20.0.0/16"));
+        assert_eq!(disjoint.network_hosts().count(), 0);
+    }
+
+    #[test]
+    fn ipv6_cidr_grants_are_supported_without_expanding_ipv4_access() {
+        let permissions = PermissionSet::sandboxed().allow_network("fd00::/8");
+        assert!(
+            permissions
+                .check_network("http://[fd12::34]:8080/api")
+                .is_ok()
+        );
+        assert!(permissions.check_network("http://198.18.1.1/api").is_err());
     }
 
     #[test]
