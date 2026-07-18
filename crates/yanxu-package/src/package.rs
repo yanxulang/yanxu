@@ -6,12 +6,12 @@
 
 mod archive;
 
-#[cfg(test)]
-use archive::extract_archive_with_limits;
 use archive::{
-    ARCHIVE_LIMITS, ArchiveLimits, extract_archive_safely, find_manifest_root,
+    ARCHIVE_LIMITS, ArchiveLimits, extract_archive_bytes_safely, find_manifest_root,
     validate_archive_relative_path, validate_existing_package_archive,
 };
+#[cfg(test)]
+use archive::{extract_archive_safely, extract_archive_with_limits};
 
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -2062,7 +2062,7 @@ fn resolve_one(
                 .map_err(|error| {
                     manifest_error(&manifest.path, None, format!("锁定版本无效：{error}"))
                 })?;
-            let (root, version) = resolve_registry(
+            let resolved = resolve_registry(
                 package_name,
                 requirement,
                 registry,
@@ -2070,21 +2070,7 @@ fn resolve_one(
                 locked.map(|locked| locked.checksum.as_str()),
                 offline,
             )?;
-            let resolved = lock_local(
-                package_name,
-                &root,
-                &format!("registry:{registry}"),
-                None,
-                Some(requirement),
-            )?;
-            if resolved.locked.version != version.to_string() {
-                return Err(manifest_error(
-                    &root,
-                    None,
-                    "索引目录版本与包清单版本不一致",
-                ));
-            }
-            verify_locked(alias, &root, &resolved, locked)?;
+            verify_locked(alias, &resolved.root, &resolved, locked)?;
             Ok(resolved)
         }
     }
@@ -2291,11 +2277,21 @@ fn resolve_registry(
     locked: Option<Version>,
     locked_checksum: Option<&str>,
     offline: bool,
-) -> Result<(PathBuf, Version), ManifestError> {
+) -> Result<ResolvedDependency, ManifestError> {
+    let source = format!("registry:{registry}");
     if let Some(registry_path) = local_registry_path(registry) {
         let package_root = registry_path.join(name);
         let version = select_registry_version(&package_root, requirement, locked.as_ref())?;
-        return Ok((package_root.join(version.to_string()), version));
+        let root = package_root.join(version.to_string());
+        let resolved = lock_local(name, &root, &source, None, Some(requirement))?;
+        if resolved.locked.version != version.to_string() {
+            return Err(manifest_error(
+                &root,
+                None,
+                "索引目录版本与包清单版本不一致",
+            ));
+        }
+        return Ok(resolved);
     }
     if !registry.starts_with("https://") {
         return Err(manifest_error(
@@ -2313,9 +2309,48 @@ fn resolve_registry(
     }
     let registry_cache = cache_root().join("registry").join(short_hash(registry));
     if let Some(version) = &locked {
-        let cached = registry_cache.join(name).join(version.to_string());
-        if reusable_registry_cache(&cached, locked_checksum, offline)? {
-            return Ok((cached, version.clone()));
+        let expected_checksum = locked_checksum.ok_or_else(|| {
+            manifest_error(
+                &registry_cache,
+                None,
+                format!("锁定索引依赖“{name}”缺少内容 SHA-256"),
+            )
+        })?;
+        if !valid_sha256(expected_checksum) {
+            return Err(manifest_error(
+                &registry_cache,
+                None,
+                format!("锁定索引依赖“{name}”的内容 SHA-256 无效"),
+            ));
+        }
+        let key = RegistryPackageKey {
+            registry_cache: &registry_cache,
+            registry,
+            name,
+            version,
+            requirement,
+        };
+        let _cache_lock = acquire_registry_package_lock(&key)?;
+        let lookup = find_cached_registry_package_locked(&key, expected_checksum, true)?;
+        if let Some(resolved) = lookup.resolved {
+            return Ok(resolved);
+        }
+        if offline {
+            if let Some(error) = lookup.invalid {
+                return Err(manifest_error(
+                    error.path,
+                    None,
+                    format!(
+                        "离线索引缓存损坏或与锁文件校验和不一致：{}；请联网重新安装",
+                        error.message
+                    ),
+                ));
+            }
+            return Err(manifest_error(
+                &registry_cache,
+                None,
+                format!("离线模式下未缓存索引依赖“{name}”"),
+            ));
         }
     }
     if offline {
@@ -2328,12 +2363,7 @@ fn resolve_registry(
     fs::create_dir_all(&registry_cache).map_err(|error| {
         manifest_error(&registry_cache, None, format!("不能创建索引缓存：{error}"))
     })?;
-    let index_path = registry_cache.join(format!("{}-index.json", short_hash(name)));
-    download(
-        &format!("{}/{name}/index.json", registry.trim_end_matches('/')),
-        &index_path,
-    )?;
-    let index = read_registry_index(&index_path)?;
+    let (index, index_path) = download_registry_index(&registry_cache, registry, name)?;
     let (version, release) =
         select_remote_registry_release(index.versions, requirement, locked.as_ref()).ok_or_else(
             || {
@@ -2358,48 +2388,670 @@ fn resolve_registry(
             format!("索引版本 {version} 的制品地址须使用 HTTPS"),
         ));
     }
-    let destination = registry_cache.join(name).join(version.to_string());
-    let archive = registry_cache.join(format!("{name}-{version}.tar.gz"));
+    let key = RegistryPackageKey {
+        registry_cache: &registry_cache,
+        registry,
+        name,
+        version: &version,
+        requirement,
+    };
+    let staged = stage_registry_release(&key, &release, locked_checksum)?;
+    publish_registry_snapshot(&key, staged)
+}
+
+const REGISTRY_SNAPSHOT_LAYOUT: &str = "tree-v1";
+
+struct RegistryPackageKey<'a> {
+    registry_cache: &'a Path,
+    registry: &'a str,
+    name: &'a str,
+    version: &'a Version,
+    requirement: &'a VersionReq,
+}
+
+struct RegistryCacheLookup {
+    resolved: Option<ResolvedDependency>,
+    invalid: Option<ManifestError>,
+}
+
+#[derive(Debug)]
+struct RegistryTemporaryDirectory {
+    path: PathBuf,
+    retained: bool,
+}
+
+impl RegistryTemporaryDirectory {
+    fn create(parent: &Path, purpose: &str) -> Result<Self, ManifestError> {
+        fs::create_dir_all(parent).map_err(|error| {
+            manifest_error(parent, None, format!("不能创建索引临时目录：{error}"))
+        })?;
+        for _ in 0..1_024 {
+            let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".{purpose}-{}-{sequence}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        retained: false,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(manifest_error(
+                        &path,
+                        None,
+                        format!("不能创建唯一索引临时目录：{error}"),
+                    ));
+                }
+            }
+        }
+        Err(manifest_error(parent, None, "不能分配唯一索引临时目录"))
+    }
+
+    fn create_within(boundary: &Path, parent: &Path, purpose: &str) -> Result<Self, ManifestError> {
+        let temporary = Self::create(parent, purpose)?;
+        let canonical_boundary = fs::canonicalize(boundary).map_err(|error| {
+            manifest_error(boundary, None, format!("不能定位索引缓存根目录：{error}"))
+        })?;
+        let canonical_temporary = fs::canonicalize(temporary.path()).map_err(|error| {
+            manifest_error(
+                temporary.path(),
+                None,
+                format!("不能定位索引临时目录：{error}"),
+            )
+        })?;
+        if !canonical_temporary.starts_with(canonical_boundary) {
+            return Err(manifest_error(
+                temporary.path(),
+                None,
+                "索引临时目录越出缓存根目录",
+            ));
+        }
+        Ok(temporary)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish(mut self, destination: &Path) -> Result<(), ManifestError> {
+        rename_registry_directory(&self.path, destination).map_err(|error| {
+            manifest_error(destination, None, format!("不能原子发布索引缓存：{error}"))
+        })?;
+        self.retained = true;
+        Ok(())
+    }
+}
+
+impl Drop for RegistryTemporaryDirectory {
+    fn drop(&mut self) {
+        if !self.retained {
+            fs::remove_dir_all(&self.path).ok();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_registry_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn rename_registry_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if encoded.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains an interior NUL",
+            ));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    }
+
+    let source = wide(source)?;
+    let destination = wide(destination)?;
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[derive(Debug)]
+struct StagedRegistryPackage {
+    _temporary: RegistryTemporaryDirectory,
+    root: PathBuf,
+    tree_checksum: String,
+    artifact_checksum: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryInstallCheckpoint {
+    BeforeCopyEntry,
+    CandidateCopied,
+    BeforePublish,
+}
+
+fn download_registry_index(
+    registry_cache: &Path,
+    registry: &str,
+    name: &str,
+) -> Result<(RegistryIndex, PathBuf), ManifestError> {
+    let temporary = RegistryTemporaryDirectory::create_within(
+        registry_cache,
+        &registry_cache.join(".staging"),
+        "index-download",
+    )?;
+    let downloaded = temporary.path().join("index.json");
+    download(
+        &format!("{}/{name}/index.json", registry.trim_end_matches('/')),
+        &downloaded,
+    )?;
+    let index = read_registry_index(&downloaded)?;
+    let bytes = fs::read(&downloaded).map_err(|error| {
+        manifest_error(&downloaded, None, format!("不能读取索引下载结果：{error}"))
+    })?;
+    let cached = registry_cache.join(format!("{}-index.json", short_hash(name)));
+    crate::storage::atomic_write(&cached, &bytes).map_err(|error| {
+        manifest_error(&cached, None, format!("不能原子保存索引下载结果：{error}"))
+    })?;
+    Ok((index, cached))
+}
+
+fn stage_registry_release(
+    key: &RegistryPackageKey<'_>,
+    release: &RegistryRelease,
+    expected_tree_checksum: Option<&str>,
+) -> Result<StagedRegistryPackage, ManifestError> {
+    let temporary = RegistryTemporaryDirectory::create_within(
+        key.registry_cache,
+        &key.registry_cache.join(".staging"),
+        "package-download",
+    )?;
+    let archive = temporary.path().join("package.tar.gz");
     download(&release.url, &archive)?;
-    let actual_checksum = file_checksum(&archive)?;
-    if !actual_checksum.eq_ignore_ascii_case(&release.checksum) {
+    prepare_staged_registry_package(
+        key,
+        temporary,
+        &archive,
+        &release.checksum,
+        expected_tree_checksum,
+    )
+}
+
+fn prepare_staged_registry_package(
+    key: &RegistryPackageKey<'_>,
+    temporary: RegistryTemporaryDirectory,
+    archive: &Path,
+    expected_artifact_checksum: &str,
+    expected_tree_checksum: Option<&str>,
+) -> Result<StagedRegistryPackage, ManifestError> {
+    prepare_staged_registry_package_with_hook(
+        key,
+        temporary,
+        archive,
+        expected_artifact_checksum,
+        expected_tree_checksum,
+        |_| Ok(()),
+    )
+}
+
+fn prepare_staged_registry_package_with_hook(
+    key: &RegistryPackageKey<'_>,
+    temporary: RegistryTemporaryDirectory,
+    archive: &Path,
+    expected_artifact_checksum: &str,
+    expected_tree_checksum: Option<&str>,
+    after_archive_snapshot: impl FnOnce(&Path) -> Result<(), ManifestError>,
+) -> Result<StagedRegistryPackage, ManifestError> {
+    if !valid_sha256(expected_artifact_checksum) {
+        return Err(manifest_error(archive, None, "索引制品 SHA-256 无效"));
+    }
+    let archive_bytes = read_registry_archive_snapshot(archive)?;
+    let actual_checksum = format!("{:x}", Sha256::digest(&archive_bytes));
+    if !actual_checksum.eq_ignore_ascii_case(expected_artifact_checksum) {
         return Err(manifest_error(
-            &archive,
+            archive,
+            None,
+            format!("索引制品校验不符：应为 {expected_artifact_checksum}，实为 {actual_checksum}"),
+        ));
+    }
+    after_archive_snapshot(archive)?;
+    let unpacked = temporary.path().join("unpacked");
+    fs::create_dir(&unpacked).map_err(|error| {
+        manifest_error(&unpacked, None, format!("不能创建制品展开目录：{error}"))
+    })?;
+    extract_archive_bytes_safely(&archive_bytes, archive, &unpacked)?;
+    let root = find_manifest_root(&unpacked)?;
+    let resolved = validate_registry_root(key, &root, expected_tree_checksum)?;
+    Ok(StagedRegistryPackage {
+        _temporary: temporary,
+        root,
+        tree_checksum: resolved.locked.checksum,
+        artifact_checksum: expected_artifact_checksum.to_ascii_lowercase(),
+    })
+}
+
+fn read_registry_archive_snapshot(archive: &Path) -> Result<Vec<u8>, ManifestError> {
+    let metadata = fs::symlink_metadata(archive)
+        .map_err(|error| manifest_error(archive, None, format!("不能检查索引制品：{error}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(manifest_error(
+            archive,
+            None,
+            "索引制品必须是普通文件，不得为符号链接或特殊文件",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .open(archive)
+        .map_err(|error| manifest_error(archive, None, format!("不能打开索引制品：{error}")))?;
+    let opened = file.metadata().map_err(|error| {
+        manifest_error(archive, None, format!("不能检查已打开的索引制品：{error}"))
+    })?;
+    if !opened.is_file() || opened.len() > ARCHIVE_MAX_COMPRESSED_BYTES {
+        return Err(manifest_error(
+            archive,
             None,
             format!(
-                "索引制品校验不符：应为 {}，实为 {actual_checksum}",
-                release.checksum
+                "索引制品压缩后为 {} 字节，超过 {} 字节上限或不是普通文件",
+                opened.len(),
+                ARCHIVE_MAX_COMPRESSED_BYTES
             ),
         ));
     }
-    let temporary = registry_cache.join(format!("unpack-{}", short_hash(&release.url)));
-    if temporary.exists() {
-        fs::remove_dir_all(&temporary).map_err(|error| {
-            manifest_error(&temporary, None, format!("不能清理临时目录：{error}"))
+    let capacity = usize::try_from(opened.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(ARCHIVE_MAX_COMPRESSED_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| manifest_error(archive, None, format!("不能读取索引制品：{error}")))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > ARCHIVE_MAX_COMPRESSED_BYTES {
+        return Err(manifest_error(
+            archive,
+            None,
+            format!("索引制品压缩后超过 {ARCHIVE_MAX_COMPRESSED_BYTES} 字节上限"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn acquire_registry_package_lock(
+    key: &RegistryPackageKey<'_>,
+) -> Result<crate::storage::ProjectLock, ManifestError> {
+    let identity = format!("{}\0{}", key.name, key.version);
+    #[cfg(any(windows, target_os = "macos"))]
+    let identity = identity.to_ascii_lowercase();
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    let lock_root = key.registry_cache.join(".locks").join(digest);
+    let lock = crate::storage::ProjectLock::acquire(&lock_root).map_err(|error| {
+        manifest_error(&lock_root, None, format!("不能取得索引版本缓存锁：{error}"))
+    })?;
+    let canonical_cache = fs::canonicalize(key.registry_cache).map_err(|error| {
+        manifest_error(
+            key.registry_cache,
+            None,
+            format!("不能定位索引缓存根目录：{error}"),
+        )
+    })?;
+    let canonical_lock = fs::canonicalize(&lock_root).map_err(|error| {
+        manifest_error(&lock_root, None, format!("不能定位索引版本缓存锁：{error}"))
+    })?;
+    if !canonical_lock.starts_with(canonical_cache) {
+        return Err(manifest_error(
+            &lock_root,
+            None,
+            "索引版本缓存锁越出缓存根目录",
+        ));
+    }
+    Ok(lock)
+}
+
+fn registry_snapshot_checksum_root(key: &RegistryPackageKey<'_>, checksum: &str) -> PathBuf {
+    key.registry_cache
+        .join(key.name)
+        .join(".snapshots")
+        .join(REGISTRY_SNAPSHOT_LAYOUT)
+        .join(key.version.to_string())
+        .join(checksum.to_ascii_lowercase())
+}
+
+fn create_registry_snapshot_checksum_root(
+    key: &RegistryPackageKey<'_>,
+    checksum: &str,
+) -> Result<PathBuf, ManifestError> {
+    let mut directory = key.registry_cache.to_path_buf();
+    for component in [
+        key.name.to_owned(),
+        ".snapshots".to_owned(),
+        REGISTRY_SNAPSHOT_LAYOUT.to_owned(),
+        key.version.to_string(),
+        checksum.to_ascii_lowercase(),
+    ] {
+        directory.push(component);
+        let created = match fs::create_dir(&directory) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(manifest_error(
+                    &directory,
+                    None,
+                    format!("不能创建索引快照目录：{error}"),
+                ));
+            }
+        };
+        let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            manifest_error(&directory, None, format!("不能检查索引快照目录：{error}"))
         })?;
-    }
-    fs::create_dir_all(&temporary)
-        .map_err(|error| manifest_error(&temporary, None, format!("不能创建临时目录：{error}")))?;
-    let extraction = (|| {
-        extract_archive_safely(&archive, &temporary)?;
-        let unpacked_root = find_manifest_root(&temporary)?;
-        let unpacked_manifest = load(unpacked_root.join(MANIFEST_NAME))?;
-        validate_package_root(&unpacked_manifest)?;
-        if destination.exists() {
-            fs::remove_dir_all(&destination).map_err(|error| {
-                manifest_error(&destination, None, format!("不能替换旧缓存：{error}"))
-            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(manifest_error(
+                &directory,
+                None,
+                "索引快照目录必须是普通目录",
+            ));
         }
-        copy_tree(&unpacked_root, &destination)
-    })();
-    if let Err(error) = extraction {
-        fs::remove_dir_all(&temporary).ok();
-        fs::remove_file(&archive).ok();
-        return Err(error);
+        if created {
+            sync_registry_directory_parent(&directory)?;
+        }
     }
-    fs::remove_dir_all(&temporary).ok();
-    fs::remove_file(&archive).ok();
-    Ok((destination, version))
+    let canonical_cache = fs::canonicalize(key.registry_cache).map_err(|error| {
+        manifest_error(
+            key.registry_cache,
+            None,
+            format!("不能定位索引缓存根目录：{error}"),
+        )
+    })?;
+    let canonical_directory = fs::canonicalize(&directory).map_err(|error| {
+        manifest_error(&directory, None, format!("不能定位索引快照目录：{error}"))
+    })?;
+    if !canonical_directory.starts_with(canonical_cache) {
+        return Err(manifest_error(
+            &directory,
+            None,
+            "索引快照目录越出缓存根目录",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn sync_registry_directory_parent(path: &Path) -> Result<(), ManifestError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| manifest_error(path, None, "索引快照目录没有可同步的父目录"))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| manifest_error(parent, None, format!("不能同步索引快照父目录：{error}")))
+}
+
+#[cfg(not(unix))]
+fn sync_registry_directory_parent(_path: &Path) -> Result<(), ManifestError> {
+    Ok(())
+}
+
+fn registry_legacy_root(key: &RegistryPackageKey<'_>) -> PathBuf {
+    key.registry_cache
+        .join(key.name)
+        .join(key.version.to_string())
+}
+
+fn registry_generation_destination(
+    checksum_root: &Path,
+    artifact_checksum: &str,
+) -> Result<PathBuf, ManifestError> {
+    let primary = checksum_root.join(artifact_checksum);
+    match fs::symlink_metadata(&primary) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(primary),
+        Ok(_) => {}
+        Err(error) => {
+            return Err(manifest_error(
+                &primary,
+                None,
+                format!("不能检查索引快照发布位置：{error}"),
+            ));
+        }
+    }
+    for _ in 0..1_024 {
+        let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let repair = checksum_root.join(format!(
+            "{artifact_checksum}-repair-{}-{sequence}",
+            std::process::id()
+        ));
+        match fs::symlink_metadata(&repair) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(repair),
+            Ok(_) => continue,
+            Err(error) => {
+                return Err(manifest_error(
+                    &repair,
+                    None,
+                    format!("不能检查索引快照修复位置：{error}"),
+                ));
+            }
+        }
+    }
+    Err(manifest_error(
+        checksum_root,
+        None,
+        "不能分配唯一索引快照发布位置",
+    ))
+}
+
+fn validate_registry_root(
+    key: &RegistryPackageKey<'_>,
+    root: &Path,
+    expected_tree_checksum: Option<&str>,
+) -> Result<ResolvedDependency, ManifestError> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| manifest_error(root, None, format!("不能检查索引包缓存：{error}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(manifest_error(root, None, "索引包缓存根必须是普通目录"));
+    }
+    if let Some(expected) = expected_tree_checksum
+        && !valid_sha256(expected)
+    {
+        return Err(manifest_error(root, None, "索引包内容 SHA-256 无效"));
+    }
+    let source = format!("registry:{}", key.registry);
+    let resolved = lock_local(key.name, root, &source, None, Some(key.requirement))?;
+    if resolved.locked.version != key.version.to_string() {
+        return Err(manifest_error(
+            &resolved.root,
+            None,
+            format!(
+                "索引选择版本 {}，包清单却声明 {}",
+                key.version, resolved.locked.version
+            ),
+        ));
+    }
+    if let Some(expected) = expected_tree_checksum
+        && resolved.locked.checksum != expected
+    {
+        return Err(manifest_error(
+            &resolved.root,
+            None,
+            format!(
+                "索引包内容校验不符：应为 {expected}，实为 {}",
+                resolved.locked.checksum
+            ),
+        ));
+    }
+    let canonical_cache = fs::canonicalize(key.registry_cache).map_err(|error| {
+        manifest_error(
+            key.registry_cache,
+            None,
+            format!("不能定位索引缓存根目录：{error}"),
+        )
+    })?;
+    if !resolved.root.starts_with(&canonical_cache) {
+        return Err(manifest_error(
+            &resolved.root,
+            None,
+            "索引包缓存越出缓存根目录",
+        ));
+    }
+    Ok(resolved)
+}
+
+fn find_cached_registry_package_locked(
+    key: &RegistryPackageKey<'_>,
+    expected_tree_checksum: &str,
+    include_legacy: bool,
+) -> Result<RegistryCacheLookup, ManifestError> {
+    if !valid_sha256(expected_tree_checksum) {
+        return Err(manifest_error(
+            key.registry_cache,
+            None,
+            "索引包内容 SHA-256 无效",
+        ));
+    }
+    let checksum_root = registry_snapshot_checksum_root(key, expected_tree_checksum);
+    let mut invalid = None;
+    match fs::symlink_metadata(&checksum_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            invalid = Some(manifest_error(&checksum_root, None, "索引快照目录类型无效"));
+        }
+        Ok(_) => {
+            let mut generations = fs::read_dir(&checksum_root)
+                .map_err(|error| {
+                    manifest_error(
+                        &checksum_root,
+                        None,
+                        format!("不能读取索引快照目录：{error}"),
+                    )
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    manifest_error(&checksum_root, None, format!("不能读取索引快照项：{error}"))
+                })?;
+            generations.sort_by_key(std::fs::DirEntry::file_name);
+            for generation in generations {
+                if generation.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let path = generation.path();
+                match generation.file_type() {
+                    Ok(file_type) if file_type.is_dir() && !file_type.is_symlink() => {
+                        match validate_registry_root(key, &path, Some(expected_tree_checksum)) {
+                            Ok(resolved) => {
+                                return Ok(RegistryCacheLookup {
+                                    resolved: Some(resolved),
+                                    invalid,
+                                });
+                            }
+                            Err(error) => {
+                                invalid.get_or_insert(error);
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        invalid.get_or_insert_with(|| {
+                            manifest_error(&path, None, "索引快照项类型无效")
+                        });
+                    }
+                    Err(error) => {
+                        invalid.get_or_insert_with(|| {
+                            manifest_error(&path, None, format!("不能检查索引快照项：{error}"))
+                        });
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(manifest_error(
+                &checksum_root,
+                None,
+                format!("不能检查索引快照目录：{error}"),
+            ));
+        }
+    }
+    if include_legacy {
+        let legacy = registry_legacy_root(key);
+        match fs::symlink_metadata(&legacy) {
+            Ok(_) => match validate_registry_root(key, &legacy, Some(expected_tree_checksum)) {
+                Ok(resolved) => {
+                    return Ok(RegistryCacheLookup {
+                        resolved: Some(resolved),
+                        invalid,
+                    });
+                }
+                Err(error) => {
+                    invalid.get_or_insert(error);
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                invalid.get_or_insert_with(|| {
+                    manifest_error(&legacy, None, format!("不能检查旧索引缓存：{error}"))
+                });
+            }
+        }
+    }
+    Ok(RegistryCacheLookup {
+        resolved: None,
+        invalid,
+    })
+}
+
+fn publish_registry_snapshot(
+    key: &RegistryPackageKey<'_>,
+    staged: StagedRegistryPackage,
+) -> Result<ResolvedDependency, ManifestError> {
+    publish_registry_snapshot_with_checkpoint(key, staged, |_, _| Ok(()))
+}
+
+fn publish_registry_snapshot_with_checkpoint(
+    key: &RegistryPackageKey<'_>,
+    staged: StagedRegistryPackage,
+    mut checkpoint: impl FnMut(RegistryInstallCheckpoint, &Path) -> Result<(), ManifestError>,
+) -> Result<ResolvedDependency, ManifestError> {
+    let staged_resolved = validate_registry_root(key, &staged.root, Some(&staged.tree_checksum))?;
+    if staged_resolved.locked.checksum != staged.tree_checksum {
+        return Err(manifest_error(
+            &staged.root,
+            None,
+            "索引暂存内容在发布前发生变化",
+        ));
+    }
+    let _cache_lock = acquire_registry_package_lock(key)?;
+    let lookup = find_cached_registry_package_locked(key, &staged.tree_checksum, false)?;
+    if let Some(resolved) = lookup.resolved {
+        return Ok(resolved);
+    }
+
+    let checksum_root = create_registry_snapshot_checksum_root(key, &staged.tree_checksum)?;
+
+    let candidate =
+        RegistryTemporaryDirectory::create_within(key.registry_cache, &checksum_root, "candidate")?;
+    copy_registry_tree_with_checkpoint(&staged.root, candidate.path(), &mut checkpoint)?;
+    checkpoint(RegistryInstallCheckpoint::CandidateCopied, candidate.path())?;
+    validate_registry_root(key, candidate.path(), Some(&staged.tree_checksum))?;
+
+    let generation = registry_generation_destination(&checksum_root, &staged.artifact_checksum)?;
+    checkpoint(RegistryInstallCheckpoint::BeforePublish, &generation)?;
+    candidate.publish(&generation)?;
+    #[cfg(unix)]
+    fs::File::open(&checksum_root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            manifest_error(
+                &checksum_root,
+                None,
+                format!("不能同步索引快照目录：{error}"),
+            )
+        })?;
+    validate_registry_root(key, &generation, Some(&staged.tree_checksum))
 }
 
 #[doc(hidden)]
@@ -2657,33 +3309,6 @@ fn select_remote_registry_release(
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn reusable_registry_cache(
-    cached: &Path,
-    expected_checksum: Option<&str>,
-    offline: bool,
-) -> Result<bool, ManifestError> {
-    if !cached.exists() {
-        return Ok(false);
-    }
-    let valid = cached.join(MANIFEST_NAME).is_file()
-        && load(cached.join(MANIFEST_NAME)).is_ok()
-        && expected_checksum
-            .is_none_or(|expected| tree_checksum(cached).is_ok_and(|actual| actual == expected));
-    if valid {
-        return Ok(true);
-    }
-    if offline {
-        return Err(manifest_error(
-            cached,
-            None,
-            "离线索引缓存损坏或与锁文件校验和不一致；请联网重新安装",
-        ));
-    }
-    fs::remove_dir_all(cached)
-        .map_err(|error| manifest_error(cached, None, format!("不能清理损坏索引缓存：{error}")))?;
-    Ok(false)
 }
 
 fn select_registry_version(
@@ -4030,7 +4655,11 @@ fn download(url: &str, destination: &Path) -> Result<(), ManifestError> {
     result
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> Result<(), ManifestError> {
+fn copy_registry_tree_with_checkpoint(
+    source: &Path,
+    destination: &Path,
+    checkpoint: &mut impl FnMut(RegistryInstallCheckpoint, &Path) -> Result<(), ManifestError>,
+) -> Result<(), ManifestError> {
     fs::create_dir_all(destination)
         .map_err(|error| manifest_error(destination, None, format!("不能创建缓存目录：{error}")))?;
     for entry in fs::read_dir(source)
@@ -4042,16 +4671,39 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), ManifestError> {
         let file_type = entry.file_type().map_err(|error| {
             manifest_error(entry.path(), None, format!("不能检查制品项类型：{error}"))
         })?;
+        checkpoint(RegistryInstallCheckpoint::BeforeCopyEntry, &entry.path())?;
         if file_type.is_dir() {
-            copy_tree(&entry.path(), &destination)?;
+            copy_registry_tree_with_checkpoint(&entry.path(), &destination, checkpoint)?;
         } else if file_type.is_file() {
-            fs::copy(entry.path(), &destination).map_err(|error| {
+            let mut source = OpenOptions::new()
+                .read(true)
+                .open(entry.path())
+                .map_err(|error| {
+                    manifest_error(entry.path(), None, format!("不能读取制品缓存源：{error}"))
+                })?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .map_err(|error| {
+                    manifest_error(&destination, None, format!("不能创建制品缓存：{error}"))
+                })?;
+            io::copy(&mut source, &mut output).map_err(|error| {
                 manifest_error(&destination, None, format!("不能写入制品缓存：{error}"))
+            })?;
+            output.sync_all().map_err(|error| {
+                manifest_error(&destination, None, format!("不能同步制品缓存：{error}"))
             })?;
         } else {
             return Err(manifest_error(entry.path(), None, "制品含特殊文件"));
         }
     }
+    #[cfg(unix)]
+    fs::File::open(destination)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            manifest_error(destination, None, format!("不能同步制品缓存目录：{error}"))
+        })?;
     Ok(())
 }
 
@@ -4203,6 +4855,61 @@ mod tests {
             archive.append_data(&mut header, name, *contents).unwrap();
         }
         archive.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn staged_registry_fixture(
+        key: &RegistryPackageKey<'_>,
+        declared_name: &str,
+        declared_version: &str,
+        entry: &str,
+        include_entry: bool,
+    ) -> Result<StagedRegistryPackage, ManifestError> {
+        staged_registry_fixture_with_expected(
+            key,
+            declared_name,
+            declared_version,
+            entry,
+            include_entry,
+            None,
+        )
+    }
+
+    fn staged_registry_fixture_with_expected(
+        key: &RegistryPackageKey<'_>,
+        declared_name: &str,
+        declared_version: &str,
+        entry: &str,
+        include_entry: bool,
+        expected_tree_checksum: Option<&str>,
+    ) -> Result<StagedRegistryPackage, ManifestError> {
+        let temporary = RegistryTemporaryDirectory::create_within(
+            key.registry_cache,
+            &key.registry_cache.join(".staging"),
+            "fixture-package",
+        )?;
+        let archive = temporary.path().join("package.tar.gz");
+        let manifest = format!(
+            "[包]\n格式=2\n名称='{declared_name}'\n版本='{declared_version}'\n入口='{entry}'\n"
+        );
+        if include_entry {
+            write_archive(
+                &archive,
+                &[
+                    ("package/言序.toml", manifest.as_bytes()),
+                    ("package/主.yx", "公 定 值 为 1；\n".as_bytes()),
+                ],
+            );
+        } else {
+            write_archive(&archive, &[("package/言序.toml", manifest.as_bytes())]);
+        }
+        let artifact_checksum = file_checksum(&archive)?;
+        prepare_staged_registry_package(
+            key,
+            temporary,
+            &archive,
+            &artifact_checksum,
+            expected_tree_checksum,
+        )
     }
 
     fn write_special_archive(path: &Path, entry_type: tar::EntryType) {
@@ -4466,22 +5173,315 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_registry_cache_is_rejected_offline_and_removed_online() {
-        let cached = temp("corrupted-registry-cache");
+    fn offline_registry_cache_revalidates_legacy_content_without_deleting_it() {
+        let root = temp("offline-registry-cache-validation");
+        let registry_cache = root.join("cache");
+        let version = Version::new(1, 0, 0);
+        let requirement = VersionReq::parse("^1").unwrap();
+        let legacy = registry_cache.join("缓存包/1.0.0");
         write(
-            &cached.join(MANIFEST_NAME),
+            &legacy.join(MANIFEST_NAME),
             "[包]\n格式=2\n名称='缓存包'\n版本='1.0.0'\n入口='主.yx'\n",
         );
-        write(&cached.join("主.yx"), "公 定 值 为 1；\n");
-        let checksum = tree_checksum(&cached).unwrap();
-        assert!(reusable_registry_cache(&cached, Some(&checksum), true).unwrap());
+        write(&legacy.join("主.yx"), "公 定 值 为 1；\n");
+        let checksum = tree_checksum(&legacy).unwrap();
+        let key = RegistryPackageKey {
+            registry_cache: &registry_cache,
+            registry: "https://packages.example.invalid/v1",
+            name: "缓存包",
+            version: &version,
+            requirement: &requirement,
+        };
+        let _cache_lock = acquire_registry_package_lock(&key).unwrap();
+        let valid = find_cached_registry_package_locked(&key, &checksum, true).unwrap();
+        assert_eq!(
+            valid.resolved.unwrap().root,
+            fs::canonicalize(&legacy).unwrap()
+        );
 
-        write(&cached.join("主.yx"), "公 定 值 为 2；\n");
-        let error = reusable_registry_cache(&cached, Some(&checksum), true).unwrap_err();
-        assert!(error.message.contains("缓存损坏"));
-        assert!(cached.exists());
-        assert!(!reusable_registry_cache(&cached, Some(&checksum), false).unwrap());
-        assert!(!cached.exists());
+        fs::remove_file(legacy.join("主.yx")).unwrap();
+        let invalid = find_cached_registry_package_locked(&key, &checksum, true).unwrap();
+        assert!(invalid.resolved.is_none());
+        assert!(invalid.invalid.is_some());
+        assert!(legacy.is_dir());
+        assert!(legacy.join(MANIFEST_NAME).is_file());
+        drop(_cache_lock);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn registry_staging_rejects_wrong_identity_and_incomplete_content() {
+        let root = temp("registry-staging-identity");
+        let registry_cache = root.join("cache");
+        let version = Version::new(1, 0, 0);
+        let requirement = VersionReq::parse("^1").unwrap();
+        let key = RegistryPackageKey {
+            registry_cache: &registry_cache,
+            registry: "https://packages.example.invalid/v1",
+            name: "正确包",
+            version: &version,
+            requirement: &requirement,
+        };
+        let legacy = registry_legacy_root(&key);
+        write(
+            &legacy.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='正确包'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&legacy.join("主.yx"), "旧缓存内容\n");
+        let previous = fs::read(legacy.join("主.yx")).unwrap();
+        let cases = [
+            ("错误包", "1.0.0", "主.yx", true, "依赖名"),
+            ("正确包", "1.1.0", "主.yx", true, "索引选择版本"),
+            ("正确包", "1.0.0", "主.yx", false, "未进入包内容"),
+        ];
+        for (name, declared_version, entry, include_entry, expected) in cases {
+            let error = staged_registry_fixture(&key, name, declared_version, entry, include_entry)
+                .unwrap_err();
+            assert!(
+                error.message.contains(expected),
+                "{name}@{declared_version}: {error}"
+            );
+            assert_eq!(fs::read(legacy.join("主.yx")).unwrap(), previous);
+        }
+        let legacy_checksum = tree_checksum(&legacy).unwrap();
+        let checksum_error = staged_registry_fixture_with_expected(
+            &key,
+            "正确包",
+            "1.0.0",
+            "主.yx",
+            true,
+            Some(&legacy_checksum),
+        )
+        .unwrap_err();
+        assert!(checksum_error.message.contains("内容校验不符"));
+        assert_eq!(fs::read(legacy.join("主.yx")).unwrap(), previous);
+        let staging = registry_cache.join(".staging");
+        assert!(
+            !staging.exists()
+                || fs::read_dir(staging)
+                    .unwrap()
+                    .all(|entry| !entry.unwrap().path().is_dir())
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn registry_staging_extracts_the_exact_hashed_archive_bytes() {
+        let root = temp("registry-staging-hash-binding");
+        let registry_cache = root.join("cache");
+        let version = Version::new(1, 0, 0);
+        let requirement = VersionReq::parse("^1").unwrap();
+        let key = RegistryPackageKey {
+            registry_cache: &registry_cache,
+            registry: "https://packages.example.invalid/v1",
+            name: "绑定包",
+            version: &version,
+            requirement: &requirement,
+        };
+        let temporary = RegistryTemporaryDirectory::create_within(
+            &registry_cache,
+            &registry_cache.join(".staging"),
+            "archive-binding",
+        )
+        .unwrap();
+        let archive = temporary.path().join("package.tar.gz");
+        let original_manifest = "[包]\n格式=2\n名称='绑定包'\n版本='1.0.0'\n入口='主.yx'\n";
+        write_archive(
+            &archive,
+            &[
+                ("package/言序.toml", original_manifest.as_bytes()),
+                ("package/主.yx", "原始已校验内容\n".as_bytes()),
+            ],
+        );
+        let expected_artifact_checksum = file_checksum(&archive).unwrap();
+
+        let replacement = root.join("replacement.tar.gz");
+        write_archive(
+            &replacement,
+            &[
+                ("package/言序.toml", original_manifest.as_bytes()),
+                ("package/主.yx", "摘要后替换内容\n".as_bytes()),
+            ],
+        );
+        let replacement_bytes = fs::read(replacement).unwrap();
+        let staged = prepare_staged_registry_package_with_hook(
+            &key,
+            temporary,
+            &archive,
+            &expected_artifact_checksum,
+            None,
+            |path| {
+                crate::storage::atomic_write(path, &replacement_bytes).map_err(|error| {
+                    manifest_error(path, None, format!("不能模拟替换索引制品：{error}"))
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(staged.root.join("主.yx")).unwrap(),
+            "原始已校验内容\n".as_bytes()
+        );
+        assert_eq!(staged.artifact_checksum, expected_artifact_checksum);
+        drop(staged);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn registry_publish_failures_preserve_legacy_cache_and_hide_candidates() {
+        let root = temp("registry-copy-transaction");
+        let registry_cache = root.join("cache");
+        let version = Version::new(1, 0, 0);
+        let requirement = VersionReq::parse("^1").unwrap();
+        let legacy = registry_cache.join("缓存包/1.0.0");
+        write(
+            &legacy.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='缓存包'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&legacy.join("主.yx"), "旧缓存内容\n");
+        let previous = fs::read(legacy.join("主.yx")).unwrap();
+        let key = RegistryPackageKey {
+            registry_cache: &registry_cache,
+            registry: "https://packages.example.invalid/v1",
+            name: "缓存包",
+            version: &version,
+            requirement: &requirement,
+        };
+        for failure in [
+            RegistryInstallCheckpoint::BeforeCopyEntry,
+            RegistryInstallCheckpoint::BeforePublish,
+        ] {
+            let staged = staged_registry_fixture(&key, "缓存包", "1.0.0", "主.yx", true).unwrap();
+            let checksum_root = registry_snapshot_checksum_root(&key, &staged.tree_checksum);
+            let error = publish_registry_snapshot_with_checkpoint(&key, staged, |point, path| {
+                if point == failure {
+                    Err(manifest_error(path, None, "模拟索引缓存发布失败"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert!(error.message.contains("模拟索引缓存发布失败"));
+            assert_eq!(fs::read(legacy.join("主.yx")).unwrap(), previous);
+            assert!(
+                !checksum_root.exists()
+                    || fs::read_dir(checksum_root).unwrap().all(|entry| entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with('.'))
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn concurrent_registry_publishers_share_one_complete_snapshot() {
+        use std::sync::{Arc, Barrier};
+
+        let root = temp("concurrent-registry-publish");
+        let registry_cache = root.join("cache");
+        let version = Version::new(1, 0, 0);
+        let requirement = VersionReq::parse("^1").unwrap();
+        let key = RegistryPackageKey {
+            registry_cache: &registry_cache,
+            registry: "https://packages.example.invalid/v1",
+            name: "并发包",
+            version: &version,
+            requirement: &requirement,
+        };
+        let first = staged_registry_fixture(&key, "并发包", "1.0.0", "主.yx", true).unwrap();
+        let second = staged_registry_fixture(&key, "并发包", "1.0.0", "主.yx", true).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let mut threads = Vec::new();
+        for staged in [first, second] {
+            let registry_cache = registry_cache.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                let version = Version::new(1, 0, 0);
+                let requirement = VersionReq::parse("^1").unwrap();
+                let key = RegistryPackageKey {
+                    registry_cache: &registry_cache,
+                    registry: "https://packages.example.invalid/v1",
+                    name: "并发包",
+                    version: &version,
+                    requirement: &requirement,
+                };
+                barrier.wait();
+                publish_registry_snapshot(&key, staged)
+            }));
+        }
+        let first = threads.remove(0).join().unwrap().unwrap();
+        let second = threads.remove(0).join().unwrap().unwrap();
+        assert_eq!(first.root, second.root);
+        assert_eq!(first.locked.checksum, second.locked.checksum);
+
+        let checksum_root = registry_snapshot_checksum_root(&key, &first.locked.checksum);
+        let generations = fs::read_dir(&checksum_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .count();
+        assert_eq!(generations, 1);
+
+        let _cache_lock = acquire_registry_package_lock(&key).unwrap();
+        let valid =
+            find_cached_registry_package_locked(&key, &first.locked.checksum, false).unwrap();
+        assert_eq!(valid.resolved.unwrap().root, first.root);
+        write(&first.root.join("主.yx"), "损坏内容\n");
+        let invalid =
+            find_cached_registry_package_locked(&key, &first.locked.checksum, false).unwrap();
+        assert!(invalid.resolved.is_none());
+        assert!(invalid.invalid.is_some());
+        assert!(first.root.is_dir());
+        drop(_cache_lock);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn damaged_registry_snapshot_is_preserved_while_a_complete_repair_is_published() {
+        let root = temp("registry-snapshot-repair");
+        let registry_cache = root.join("cache");
+        let version = Version::new(1, 0, 0);
+        let requirement = VersionReq::parse("^1").unwrap();
+        let key = RegistryPackageKey {
+            registry_cache: &registry_cache,
+            registry: "https://packages.example.invalid/v1",
+            name: "修复包",
+            version: &version,
+            requirement: &requirement,
+        };
+        let initial = staged_registry_fixture(&key, "修复包", "1.0.0", "主.yx", true).unwrap();
+        let initial = publish_registry_snapshot(&key, initial).unwrap();
+        let checksum = initial.locked.checksum.clone();
+        write(&initial.root.join("主.yx"), "已损坏的旧快照\n");
+        let damaged = fs::read(initial.root.join("主.yx")).unwrap();
+
+        let replacement = staged_registry_fixture_with_expected(
+            &key,
+            "修复包",
+            "1.0.0",
+            "主.yx",
+            true,
+            Some(&checksum),
+        )
+        .unwrap();
+        let replacement = publish_registry_snapshot(&key, replacement).unwrap();
+        assert_ne!(initial.root, replacement.root);
+        assert_eq!(fs::read(initial.root.join("主.yx")).unwrap(), damaged);
+        assert_eq!(replacement.locked.checksum, checksum);
+
+        let checksum_root = registry_snapshot_checksum_root(&key, &checksum);
+        let generations = fs::read_dir(checksum_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .count();
+        assert_eq!(generations, 2);
+        let _cache_lock = acquire_registry_package_lock(&key).unwrap();
+        let lookup = find_cached_registry_package_locked(&key, &checksum, false).unwrap();
+        assert_eq!(lookup.resolved.unwrap().root, replacement.root);
+        drop(_cache_lock);
+        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(windows)]
