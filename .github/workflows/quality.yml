@@ -274,6 +274,21 @@ jobs:
         run: |
           cargo package -p yanxu-package --locked
           cargo build -p yanxu --release --locked
+      - name: 验证共享包构建元数据
+        shell: bash
+        env:
+          YANXU_SOURCE_REF: ${{ inputs.ref || github.sha }}
+        run: |
+          set -euo pipefail
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu-package") | .version')"
+          crate="target/package/yanxu-package-$package_version.crate"
+          metadata="$RUNNER_TEMP/yanxu-package-$package_version.build.json"
+          scripts/generate-package-build-metadata.sh "$crate" "$metadata"
+          jq -e --arg version "$package_version" \
+            '.schema_version == 1 and .package.version == $version
+             and .artifact.name == ("yanxu-package-" + $version + ".crate")
+             and .build.command == "cargo package -p yanxu-package --locked"' \
+            "$metadata" >/dev/null
       - name: 验证目标构建元数据
         shell: bash
         env:
