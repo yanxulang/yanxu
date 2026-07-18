@@ -46,10 +46,11 @@ impl Drop for ProjectLock {
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.as_os_str().is_empty() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
     let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = temporary_path(path, sequence, "tmp");
     let result = (|| {
@@ -106,5 +107,23 @@ fn replace(temporary: &Path, destination: &Path, sequence: u64) -> io::Result<()
             Ok(())
         }
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn atomically_writes_a_file_in_the_current_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = PathBuf::from(format!(".yanxu-atomic-relative-{unique}"));
+        atomic_write(&path, b"complete\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"complete\n");
+        fs::remove_file(path).unwrap();
     }
 }
