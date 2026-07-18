@@ -2104,7 +2104,7 @@ fn resolve_git(
     revision: &str,
     offline: bool,
 ) -> Result<(PathBuf, String), ManifestError> {
-    if url.starts_with("http://") || url.starts_with("git://") {
+    if !secure_git_source(url) {
         return Err(manifest_error(
             Path::new(url),
             None,
@@ -2195,6 +2195,18 @@ fn resolve_git(
         return Err(manifest_error(&cache, None, "不能读取 Git 精确修订"));
     }
     Ok((cache, String::from_utf8_lossy(&output.stdout).trim().into()))
+}
+
+fn secure_git_source(url: &str) -> bool {
+    Path::new(url).exists()
+        || url.starts_with("file://")
+        || url.starts_with("https://")
+        || url.starts_with("ssh://")
+        || url.starts_with("git+ssh://")
+        || (!url.contains("://")
+            && url
+                .split_once(':')
+                .is_some_and(|(authority, path)| authority.contains('@') && !path.is_empty()))
 }
 
 fn resolve_registry(
@@ -3820,6 +3832,9 @@ mod tests {
         let git_error =
             resolve_git("http://example.invalid/package.git", "HEAD", false).unwrap_err();
         assert!(git_error.message.contains("HTTPS 或 SSH"));
+        let ftp_error =
+            resolve_git("ftp://example.invalid/package.git", "HEAD", false).unwrap_err();
+        assert!(ftp_error.message.contains("HTTPS 或 SSH"));
 
         let registry_error = resolve_registry(
             "示例",
