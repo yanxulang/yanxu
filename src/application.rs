@@ -19,6 +19,8 @@ use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 pub const YXB_FORMAT_VERSION: u32 = 1;
+pub const YXB_FORMAT_UNSUPPORTED_CODE: &str = "YXB_FORMAT_UNSUPPORTED";
+pub const YXB_BYTECODE_UNSUPPORTED_CODE: &str = "YXB_BYTECODE_UNSUPPORTED";
 const YXB_MAGIC: &[u8] = b"YANXU-YXB-1\n";
 const YXB_COMPRESSED_MAGIC: &[u8] = b"YANXU-YXB-1Z\n";
 const STANDALONE_MAGIC: &[u8; 16] = b"YANXU-APP-v1\0\0\0\0";
@@ -243,6 +245,12 @@ impl PermissionSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplicationError {
     pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveFormatHeader {
+    format_version: u64,
+    bytecode_format: u64,
 }
 
 impl fmt::Display for ApplicationError {
@@ -863,6 +871,17 @@ fn deserialize_with_limits(
         return Err(application_error("缺少 YXB 文件头"));
     };
     reject_duplicate_json_keys(&payload)?;
+    let header: ArchiveFormatHeader = serde_json::from_slice(&payload)
+        .map_err(|error| application_error(format!("归档格式头无效：{error}")))?;
+    if header.format_version != u64::from(YXB_FORMAT_VERSION) {
+        return Err(unsupported_yxb_format(header.format_version));
+    }
+    if header.bytecode_format != u64::from(bytecode::BYTECODE_FORMAT_VERSION) {
+        return Err(unsupported_yxb_bytecode(
+            header.format_version,
+            header.bytecode_format,
+        ));
+    }
     let archive: ApplicationArchive = serde_json::from_slice(&payload)
         .map_err(|error| application_error(format!("归档 JSON 无效：{error}")))?;
     validate_archive(&archive)?;
@@ -954,17 +973,13 @@ fn reject_duplicate_json_keys(payload: &[u8]) -> Result<(), ApplicationError> {
 
 pub fn validate_archive(archive: &ApplicationArchive) -> Result<(), ApplicationError> {
     if archive.format_version != YXB_FORMAT_VERSION {
-        return Err(application_error(format!(
-            "不支持 YXB 格式 {}，当前仅支持 {YXB_FORMAT_VERSION}",
-            archive.format_version
-        )));
+        return Err(unsupported_yxb_format(u64::from(archive.format_version)));
     }
     if archive.bytecode_format != bytecode::BYTECODE_FORMAT_VERSION {
-        return Err(application_error(format!(
-            "YXB 字节码格式 {} 与运行时 {} 不兼容",
-            archive.bytecode_format,
-            bytecode::BYTECODE_FORMAT_VERSION
-        )));
+        return Err(unsupported_yxb_bytecode(
+            u64::from(archive.format_version),
+            u64::from(archive.bytecode_format),
+        ));
     }
     if archive.target.is_empty() || archive.target.len() > 256 {
         return Err(application_error("YXB 目标平台为空或过长"));
@@ -1600,6 +1615,19 @@ fn application_error(message: impl Into<String>) -> ApplicationError {
     }
 }
 
+fn unsupported_yxb_format(detected: u64) -> ApplicationError {
+    application_error(format!(
+        "[{YXB_FORMAT_UNSUPPORTED_CODE}] 检测到 YXB 格式 {detected}；当前支持 YXB 格式 {YXB_FORMAT_VERSION}；安全自动迁移：否。请使用支持该制品的言序导出源码，再执行：yanxu compile <源码或项目> -o <新制品.yxb> --release"
+    ))
+}
+
+fn unsupported_yxb_bytecode(yxb_format: u64, bytecode_format: u64) -> ApplicationError {
+    application_error(format!(
+        "[{YXB_BYTECODE_UNSUPPORTED_CODE}] 检测到 YXB 格式 {yxb_format}、字节码格式 {bytecode_format}；当前支持 YXB 格式 {YXB_FORMAT_VERSION}、字节码格式 {}；安全自动迁移：否。格式 {bytecode_format} 不含当前运行时要求的完整模块与类型身份，请从原源码或项目重新构建：yanxu compile <源码或项目> -o <新制品.yxb> --release",
+        bytecode::BYTECODE_FORMAT_VERSION
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1982,6 +2010,35 @@ mod tests {
         let decoded = deserialize(&legacy).unwrap();
         assert!(decoded.runtime_version.is_empty());
         assert!(decoded.build_commit.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_bytecode_fixture_reports_exact_rebuild_guidance() {
+        let legacy = include_bytes!("../tests/fixtures/yxb/legacy-v1-bytecode.yxb");
+        let error = deserialize(legacy).unwrap_err();
+        for expected in [
+            YXB_BYTECODE_UNSUPPORTED_CODE,
+            "检测到 YXB 格式 1、字节码格式 1",
+            "当前支持 YXB 格式 1、字节码格式 2",
+            "安全自动迁移：否",
+            "yanxu compile <源码或项目> -o <新制品.yxb> --release",
+        ] {
+            assert!(error.message.contains(expected), "{error}");
+        }
+
+        let source = include_str!("../tests/fixtures/yxb/legacy-v1-source.yx");
+        let (root, current) = compile_test_application(source, "");
+        let current_bytes = serialize(&current).unwrap();
+        let decoded = deserialize(&current_bytes).unwrap();
+        let mut vm = crate::vm::Vm::silent();
+        vm.execute_application(&decoded).unwrap();
+        assert_eq!(vm.take_output(), ["格式一"]);
+
+        let mut corrupt = current_bytes;
+        let last = corrupt.last_mut().unwrap();
+        *last ^= 0xff;
+        assert!(deserialize(&corrupt).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
