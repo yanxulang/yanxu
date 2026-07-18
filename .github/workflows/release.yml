@@ -382,6 +382,10 @@ jobs:
             gh attestation verify "dist/$archive" --repo "$REPOSITORY" \
               --signer-repo "$REPOSITORY" --bundle "$provenance" \
               --source-digest "${{ needs.validate.outputs.commit }}" >/dev/null
+            gh attestation verify "dist/$archive" --repo "$REPOSITORY" \
+              --signer-repo "$REPOSITORY" --bundle "$sbom_attestation" \
+              --predicate-type "https://cyclonedx.org/bom" \
+              --source-digest "${{ needs.validate.outputs.commit }}" >/dev/null
           done
           gh release edit "$TAG" --repo "$REPOSITORY" --draft=false --title "言序 $VERSION"
 
