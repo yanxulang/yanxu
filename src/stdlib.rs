@@ -3116,15 +3116,17 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let (release_server, wait_for_client) = std::sync::mpsc::sync_channel(0);
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).unwrap();
-            std::thread::sleep(Duration::from_millis(150));
+            let _ = wait_for_client.recv_timeout(Duration::from_secs(5));
         });
         let error =
             http_request_with_options("GET", &format!("http://{address}/slow"), None, 20, 64)
                 .unwrap_err();
+        release_server.send(()).unwrap();
         server.join().unwrap();
         assert_eq!(error.code, "NET_TIMEOUT");
     }
