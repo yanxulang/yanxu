@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 已存在的共享包标签（如 yanxu-package-v1.1.13）
+        description: 已存在的共享包标签（如 yanxu-package-v1.1.18）
         required: true
         type: string
 
@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: yanxu-package-release-${{ inputs.tag || github.ref_name }}
+  group: yanxu-stable-release
   cancel-in-progress: false
 
 jobs:
@@ -25,6 +25,8 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+      attestation_ref: ${{ steps.version.outputs.attestation_ref }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -50,9 +52,22 @@ jobs:
             echo "共享包标签提交不属于 origin/main 主线" >&2
             exit 1
           fi
+          if [[ "$GITHUB_REF" != "refs/tags/$tag" ]]; then
+            echo "共享包发行只能从目标标签 ref 触发，当前为 $GITHUB_REF" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$tag_commit" ]]; then
+            echo "发行证明要求工作流提交与标签提交一致" >&2
+            exit 1
+          fi
           grep -Fqx "## $version" CHANGELOG.md
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          test -f "crates/yanxu-package/RELEASE_NOTES_$version.md"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "commit=$tag_commit"
+            echo "attestation_ref=$GITHUB_REF"
+          } >> "$GITHUB_OUTPUT"
 
   quality:
     name: 共享包独立质量门禁
@@ -61,9 +76,16 @@ jobs:
     with:
       ref: refs/tags/${{ needs.validate.outputs.tag }}
 
-  package:
-    name: 构建并发布共享包制品
-    needs: [validate, quality]
+  dynamic-safety:
+    name: 共享包动态安全门禁
+    needs: validate
+    uses: ./.github/workflows/dynamic-safety.yml
+    with:
+      ref: refs/tags/${{ needs.validate.outputs.tag }}
+
+  create-release:
+    name: 创建共享包 Release 草稿
+    needs: [validate, quality, dynamic-safety]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -71,14 +93,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/tags/${{ needs.validate.outputs.tag }}
-      - name: 生成 crate 与 SHA-256
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo package -p yanxu-package --locked
-          crate="target/package/yanxu-package-${{ needs.validate.outputs.version }}.crate"
-          (cd target/package && sha256sum "$(basename "$crate")" > "$(basename "$crate").sha256")
-      - name: 创建独立 Release 草稿并上传
+      - name: 核对状态并创建草稿
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -86,12 +101,501 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2016
+          state="$(gh api graphql \
+            -f owner="$GITHUB_REPOSITORY_OWNER" \
+            -f name="${GITHUB_REPOSITORY#*/}" \
+            -f tag="$TAG" \
+            -f query='query($owner: String!, $name: String!, $tag: String!) {
+              repository(owner: $owner, name: $name) {
+                release(tagName: $tag) { isDraft isPrerelease }
+              }
+            }' \
+            --jq '.data.repository.release |
+              if . == null then "missing"
+              elif .isDraft then "draft"
+              elif .isPrerelease then "prerelease"
+              else "stable" end')"
+          case "$state" in
+            missing)
+              gh release create "$TAG" --verify-tag --draft --latest=false \
+                --title "yanxu-package $VERSION" \
+                --notes-file "crates/yanxu-package/RELEASE_NOTES_$VERSION.md"
+              ;;
+            draft) ;;
+            prerelease) gh release edit "$TAG" --draft=true --latest=false ;;
+            stable) echo "稳定 Release $TAG 已存在，拒绝覆盖公开资产" >&2; exit 1 ;;
+            *) echo "未知 Release 状态：$state" >&2; exit 1 ;;
+          esac
+          test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = "true"
+
+  package:
+    name: 构建共享包制品
+    needs: [validate, create-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+      - name: 生成并复验可复现 crate
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          YANXU_SOURCE_REF: refs/tags/${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          scripts/verify-yanxu-package-contents.sh
+          cargo package -p yanxu-package --locked
           crate="target/package/yanxu-package-$VERSION.crate"
-          notes="crates/yanxu-package/RELEASE_NOTES_$VERSION.md"
-          test -f "$notes"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --latest=false --title "yanxu-package $VERSION" \
-              --notes-file "$notes"
+          first="$RUNNER_TEMP/yanxu-package-$VERSION.first.crate"
+          cp "$crate" "$first"
+          cargo package -p yanxu-package --locked
+          cmp "$first" "$crate"
+          mkdir -p dist
+          cp "$crate" "dist/$(basename "$crate")"
+          (cd dist && sha256sum "yanxu-package-$VERSION.crate" \
+            > "yanxu-package-$VERSION.crate.sha256")
+          scripts/generate-package-build-metadata.sh \
+            "$crate" "dist/yanxu-package-$VERSION.build.json"
+          test "$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 3
+      - name: 保存共享包构建制品
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-yanxu-package-build
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  supply-chain:
+    name: 共享包 SBOM 与构建证明
+    needs: [validate, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-yanxu-package-build
+          path: ${{ runner.temp }}/release
+      - name: 安装 SBOM 工具
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cargo-cyclonedx@0.5.9
+      - name: 生成共享包 SBOM
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/release"
+          sbom_dir="$RUNNER_TEMP/sbom"
+          core_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu") | .version')"
+          mkdir -p "$sbom_dir"
+          scripts/generate-sbom.sh "$sbom_dir/yanxu-$core_version.cdx.json"
+          cp "$sbom_dir/yanxu-package-$VERSION.cdx.json" \
+            "$release_dir/yanxu-package-$VERSION.cdx.json"
+          test "$(find "$release_dir" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 4
+      - id: provenance
+        name: 创建共享包构建来源证明
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/yanxu-package-${{ needs.validate.outputs.version }}.crate
+            ${{ runner.temp }}/release/yanxu-package-${{ needs.validate.outputs.version }}.crate.sha256
+            ${{ runner.temp }}/release/yanxu-package-${{ needs.validate.outputs.version }}.build.json
+            ${{ runner.temp }}/release/yanxu-package-${{ needs.validate.outputs.version }}.cdx.json
+      - id: sbom
+        name: 创建共享包 SBOM 证明
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: ${{ runner.temp }}/release/yanxu-package-${{ needs.validate.outputs.version }}.crate
+          sbom-path: ${{ runner.temp }}/release/yanxu-package-${{ needs.validate.outputs.version }}.cdx.json
+      - name: 准备可下载证明
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$PROVENANCE_BUNDLE" \
+            "$RUNNER_TEMP/release/yanxu-package-$VERSION.provenance.jsonl"
+          cp "$SBOM_BUNDLE" \
+            "$RUNNER_TEMP/release/yanxu-package-$VERSION.sbom-attestation.jsonl"
+          test -s "$RUNNER_TEMP/release/yanxu-package-$VERSION.provenance.jsonl"
+          test -s "$RUNNER_TEMP/release/yanxu-package-$VERSION.sbom-attestation.jsonl"
+      - name: 保存共享包供应链制品
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-yanxu-package-supply-chain
+          path: |
+            ${{ runner.temp }}/release/*.cdx.json
+            ${{ runner.temp }}/release/*.jsonl
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  publish-release:
+    name: 验证并发布共享包六项资产
+    needs: [validate, package, supply-chain]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-yanxu-package-build
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-yanxu-package-supply-chain
+          path: dist
+      - name: 先验来源再核对并上传
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          COMMIT_SHA: ${{ needs.validate.outputs.commit }}
+          ATTESTATION_REF: ${{ needs.validate.outputs.attestation_ref }}
+        run: |
+          set -euo pipefail
+          crate="yanxu-package-$VERSION.crate"
+          checksum="$crate.sha256"
+          metadata="yanxu-package-$VERSION.build.json"
+          sbom="yanxu-package-$VERSION.cdx.json"
+          provenance="yanxu-package-$VERSION.provenance.jsonl"
+          sbom_attestation="yanxu-package-$VERSION.sbom-attestation.jsonl"
+          expected_assets=(
+            "$crate" "$checksum" "$metadata" "$sbom"
+            "$provenance" "$sbom_attestation"
+          )
+          test "$(find dist -mindepth 1 -maxdepth 1 | wc -l)" -eq 6
+          test "$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 6
+          for asset in "${expected_assets[@]}"; do test -s "dist/$asset"; done
+
+          for subject in "$crate" "$checksum" "$metadata" "$sbom"; do
+            gh attestation verify "dist/$subject" --repo "$REPOSITORY" \
+              --signer-workflow "$REPOSITORY/.github/workflows/package-release.yml" \
+              --bundle "dist/$provenance" \
+              --source-digest "$COMMIT_SHA" \
+              --source-ref "$ATTESTATION_REF" >/dev/null
+          done
+          gh attestation verify "dist/$crate" --repo "$REPOSITORY" \
+            --signer-workflow "$REPOSITORY/.github/workflows/package-release.yml" \
+            --bundle "dist/$sbom_attestation" \
+            --predicate-type "https://cyclonedx.org/bom" \
+            --source-digest "$COMMIT_SHA" \
+            --source-ref "$ATTESTATION_REF" >/dev/null
+
+          test "$(wc -l < "dist/$checksum")" -eq 1
+          if LC_ALL=C grep -q $'\r' "dist/$checksum"; then
+            echo "共享包校验文件不得包含 CR 字节" >&2
+            exit 1
           fi
-          gh release upload "$TAG" "$crate" "$crate.sha256" --clobber
-          gh release edit "$TAG" --draft=false --latest=false --title "yanxu-package $VERSION"
+          checksum_value="$(awk '{print $1}' "dist/$checksum")"
+          checksum_name="$(awk '{print $2}' "dist/$checksum")"
+          if ! [[ "$checksum_value" =~ ^[0-9a-f]{64}$ ]] || [[ "$checksum_name" != "$crate" ]]; then
+            echo "共享包校验文件格式或资产名不正确" >&2
+            exit 1
+          fi
+          (cd dist && sha256sum --check "$checksum")
+
+          prefix="yanxu-package-$VERSION"
+          expected_entries="$(printf '%s\n' \
+            "$prefix/.cargo_vcs_info.json" \
+            "$prefix/Cargo.lock" \
+            "$prefix/Cargo.toml" \
+            "$prefix/Cargo.toml.orig" \
+            "$prefix/LICENSE" \
+            "$prefix/src/lib.rs" \
+            "$prefix/src/package/archive.rs" \
+            "$prefix/src/package.rs" \
+            "$prefix/src/permissions.rs" \
+            "$prefix/src/storage.rs" | LC_ALL=C sort)"
+          actual_entries="$(tar -tzf "dist/$crate" | LC_ALL=C sort)"
+          if [[ "$actual_entries" != "$expected_entries" ]]; then
+            echo "共享包归档不符合严格文件允许清单" >&2
+            exit 1
+          fi
+          extracted="$RUNNER_TEMP/yanxu-package-release"
+          mkdir -p "$extracted"
+          tar -xzf "dist/$crate" -C "$extracted"
+          package_root="$extracted/$prefix"
+          test "$(find "$package_root" -type f | wc -l)" -eq 10
+          jq -e --arg commit "$COMMIT_SHA" \
+            '.git.sha1 == $commit and (.git.dirty // false) == false
+             and .path_in_vcs == "crates/yanxu-package"' \
+            "$package_root/.cargo_vcs_info.json" >/dev/null
+          cmp LICENSE "$package_root/LICENSE"
+
+          crate_sha="$(sha256sum "dist/$crate" | awk '{print $1}')"
+          crate_bytes="$(wc -c < "dist/$crate" | tr -d ' ')"
+          workspace_lock_sha="$(sha256sum Cargo.lock | awk '{print $1}')"
+          packaged_lock_sha="$(sha256sum "$package_root/Cargo.lock" | awk '{print $1}')"
+          license_sha="$(sha256sum LICENSE | awk '{print $1}')"
+          jq -e \
+            --arg repository "$REPOSITORY" \
+            --arg ref "refs/tags/$TAG" \
+            --arg commit "$COMMIT_SHA" \
+            --arg version "$VERSION" \
+            --arg crate "$crate" \
+            --arg crate_sha "$crate_sha" \
+            --argjson crate_bytes "$crate_bytes" \
+            --arg workspace_lock "$workspace_lock_sha" \
+            --arg packaged_lock "$packaged_lock_sha" \
+            --arg license "$license_sha" \
+            '.schema_version == 1
+             and .package.name == "yanxu-package" and .package.version == $version
+             and .package.license == "MIT" and .package.path_in_vcs == "crates/yanxu-package"
+             and .source.repository == $repository and .source.ref == $ref
+             and .source.commit_sha == $commit
+             and .artifact.name == $crate and .artifact.sha256 == $crate_sha
+             and .artifact.bytes == $crate_bytes and .artifact.format == "cargo-crate-v1"
+             and .build.command == "cargo package -p yanxu-package --locked"
+             and .build.locked
+             and .build.workspace_cargo_lock_sha256 == $workspace_lock
+             and .build.packaged_cargo_lock_sha256 == $packaged_lock
+             and .build.license_sha256 == $license' \
+            "dist/$metadata" >/dev/null
+          jq -e \
+            --arg version "$VERSION" \
+            --arg commit "$COMMIT_SHA" \
+            --arg lock "$workspace_lock_sha" \
+            '.bomFormat == "CycloneDX" and .specVersion == "1.5"
+             and .metadata.component.name == "yanxu-package"
+             and .metadata.component.version == $version
+             and (.dependencies | length) > 0
+             and ([.metadata.properties[] |
+               select(.name == "cdx:yanxu:source:commit" and .value == $commit)] | length) == 1
+             and ([.metadata.properties[] |
+               select(.name == "cdx:yanxu:cargo-lock:sha256" and .value == $lock)] | length) == 1' \
+            "dist/$sbom" >/dev/null
+          if grep -F "$GITHUB_WORKSPACE" "dist/$sbom"; then
+            echo "共享包 SBOM 含构建机绝对路径" >&2
+            exit 1
+          fi
+
+          state="$(gh release view "$TAG" --repo "$REPOSITORY" \
+            --json isDraft,isPrerelease \
+            --jq 'if .isDraft then "draft" elif .isPrerelease then "prerelease" else "stable" end')"
+          case "$state" in
+            draft) ;;
+            prerelease) gh release edit "$TAG" --repo "$REPOSITORY" --draft=true --latest=false ;;
+            stable) echo "稳定 Release $TAG 已存在，拒绝覆盖公开资产" >&2; exit 1 ;;
+            *) echo "未知 Release 状态：$state" >&2; exit 1 ;;
+          esac
+          test "$(gh release view "$TAG" --repo "$REPOSITORY" --json isDraft --jq .isDraft)" = "true"
+
+          remote_assets="$(gh release view "$TAG" --repo "$REPOSITORY" \
+            --json assets --jq '.assets[].name')"
+          while IFS= read -r remote_asset; do
+            [[ -z "$remote_asset" ]] && continue
+            keep=false
+            for expected in "${expected_assets[@]}"; do
+              if [[ "$remote_asset" == "$expected" ]]; then keep=true; break; fi
+            done
+            if [[ "$keep" == "false" ]]; then
+              gh release delete-asset "$TAG" "$remote_asset" --repo "$REPOSITORY" --yes
+            fi
+          done <<< "$remote_assets"
+          gh release upload "$TAG" dist/* --repo "$REPOSITORY" --clobber
+          expected_remote="$(printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort)"
+          actual_remote="$(gh release view "$TAG" --repo "$REPOSITORY" \
+            --json assets --jq '.assets[].name' | LC_ALL=C sort)"
+          [[ "$actual_remote" == "$expected_remote" ]]
+          remote_dir="$RUNNER_TEMP/yanxu-package-uploaded"
+          mkdir -p "$remote_dir"
+          gh release download "$TAG" --repo "$REPOSITORY" --dir "$remote_dir"
+          test "$(find "$remote_dir" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 6
+          for asset in "${expected_assets[@]}"; do
+            cmp "dist/$asset" "$remote_dir/$asset"
+          done
+          gh release edit "$TAG" --repo "$REPOSITORY" \
+            --draft=false --prerelease=true --latest=false \
+            --title "yanxu-package $VERSION"
+          test "$(gh release view "$TAG" --repo "$REPOSITORY" \
+            --json isDraft,isPrerelease,assets \
+            --jq '.isDraft == false and .isPrerelease == true and (.assets | length) == 6')" = "true"
+
+  verify-published:
+    name: 从公开资产编译共享包消费者
+    needs: [validate, publish-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+      - name: 下载、验签并从仓库外编译
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          COMMIT_SHA: ${{ needs.validate.outputs.commit }}
+          ATTESTATION_REF: ${{ needs.validate.outputs.attestation_ref }}
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/public-release"
+          mkdir -p "$release_dir"
+          gh release download "$TAG" --repo "$REPOSITORY" --dir "$release_dir"
+          test "$(find "$release_dir" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 6
+          crate="yanxu-package-$VERSION.crate"
+          checksum="$crate.sha256"
+          metadata="yanxu-package-$VERSION.build.json"
+          sbom="yanxu-package-$VERSION.cdx.json"
+          provenance="yanxu-package-$VERSION.provenance.jsonl"
+          sbom_attestation="yanxu-package-$VERSION.sbom-attestation.jsonl"
+          for asset in \
+            "$crate" "$checksum" "$metadata" "$sbom" \
+            "$provenance" "$sbom_attestation"; do
+            test -s "$release_dir/$asset"
+          done
+          for subject in "$crate" "$checksum" "$metadata" "$sbom"; do
+            gh attestation verify "$release_dir/$subject" --repo "$REPOSITORY" \
+              --signer-workflow "$REPOSITORY/.github/workflows/package-release.yml" \
+              --bundle "$release_dir/$provenance" \
+              --source-digest "$COMMIT_SHA" \
+              --source-ref "$ATTESTATION_REF" >/dev/null
+          done
+          gh attestation verify "$release_dir/$crate" --repo "$REPOSITORY" \
+            --signer-workflow "$REPOSITORY/.github/workflows/package-release.yml" \
+            --bundle "$release_dir/$sbom_attestation" \
+            --predicate-type "https://cyclonedx.org/bom" \
+            --source-digest "$COMMIT_SHA" \
+            --source-ref "$ATTESTATION_REF" >/dev/null
+          checksum_value="$(awk '{print $1}' "$release_dir/$checksum")"
+          checksum_name="$(awk '{print $2}' "$release_dir/$checksum")"
+          if ! [[ "$checksum_value" =~ ^[0-9a-f]{64}$ ]] || [[ "$checksum_name" != "$crate" ]]; then
+            echo "公开共享包校验文件格式或资产名不正确" >&2
+            exit 1
+          fi
+          (cd "$release_dir" && sha256sum --check "$checksum")
+          test "$(gh release view "$TAG" --repo "$REPOSITORY" \
+            --json isDraft,isPrerelease,assets \
+            --jq '.isDraft == false and .isPrerelease == true and (.assets | length) == 6')" = "true"
+
+          extracted="$RUNNER_TEMP/extracted"
+          mkdir -p "$extracted"
+          prefix="yanxu-package-$VERSION"
+          expected_entries="$(printf '%s\n' \
+            "$prefix/.cargo_vcs_info.json" \
+            "$prefix/Cargo.lock" \
+            "$prefix/Cargo.toml" \
+            "$prefix/Cargo.toml.orig" \
+            "$prefix/LICENSE" \
+            "$prefix/src/lib.rs" \
+            "$prefix/src/package/archive.rs" \
+            "$prefix/src/package.rs" \
+            "$prefix/src/permissions.rs" \
+            "$prefix/src/storage.rs" | LC_ALL=C sort)"
+          actual_entries="$(tar -tzf "$release_dir/$crate" | LC_ALL=C sort)"
+          [[ "$actual_entries" == "$expected_entries" ]]
+          tar -xzf "$release_dir/$crate" -C "$extracted"
+          package_root="$extracted/$prefix"
+          crate_sha="$(sha256sum "$release_dir/$crate" | awk '{print $1}')"
+          jq -e \
+            --arg version "$VERSION" \
+            --arg commit "$COMMIT_SHA" \
+            --arg crate_sha "$crate_sha" \
+            '.schema_version == 1 and .package.name == "yanxu-package"
+             and .package.version == $version and .source.commit_sha == $commit
+             and .artifact.sha256 == $crate_sha and .build.locked' \
+            "$release_dir/$metadata" >/dev/null
+          jq -e \
+            --arg version "$VERSION" \
+            --arg commit "$COMMIT_SHA" \
+            '.bomFormat == "CycloneDX" and .specVersion == "1.5"
+             and .metadata.component.name == "yanxu-package"
+             and .metadata.component.version == $version
+             and ([.metadata.properties[] |
+               select(.name == "cdx:yanxu:source:commit" and .value == $commit)] | length) == 1' \
+            "$release_dir/$sbom" >/dev/null
+          consumer="$RUNNER_TEMP/consumer"
+          mkdir -p "$consumer/src"
+          cat > "$consumer/Cargo.toml" <<EOF
+          [package]
+          name = "yanxu-package-release-consumer"
+          version = "0.1.0"
+          edition = "2024"
+
+          [dependencies]
+          yanxu-package = { path = "$package_root" }
+          EOF
+          cat > "$consumer/src/main.rs" <<'EOF'
+          fn main() {
+              let manifest = yanxu_package::manifest_template("release-consumer").unwrap();
+              assert!(manifest.contains("release-consumer"));
+          }
+          EOF
+          cargo generate-lockfile --manifest-path "$consumer/Cargo.toml"
+          cargo check --manifest-path "$consumer/Cargo.toml" --locked
+
+  quarantine-release:
+    name: 消费者验证失败时保持预发布
+    if: ${{ always() && needs.publish-release.result == 'success' && needs.verify-published.result != 'success' }}
+    needs: [validate, publish-release, verify-published]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 保持预发布并使工作流失败
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh release edit "$TAG" --repo "$REPOSITORY" --prerelease --latest=false
+          echo "公开共享包消费者验证失败，Release 保持预发布状态。" >&2
+          exit 1
+
+  finalize-release:
+    name: 确认共享包稳定 Release
+    needs: [validate, verify-published]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 转为稳定且不改变核心 latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          latest_before="$(gh release view --repo "$REPOSITORY" --json tagName --jq .tagName)"
+          state="$(gh release view "$TAG" --repo "$REPOSITORY" \
+            --json isDraft,isPrerelease,assets \
+            --jq 'if .isDraft or (.assets | length) != 6 then "invalid"
+                  elif .isPrerelease then "prerelease" else "stable" end')"
+          case "$state" in
+            prerelease)
+              gh release edit "$TAG" --repo "$REPOSITORY" --prerelease=false --latest=false
+              ;;
+            stable) ;;
+            *) echo "共享包 Release 状态或资产集合不满足正式发布条件" >&2; exit 1 ;;
+          esac
+          test "$(gh release view "$TAG" --repo "$REPOSITORY" \
+            --json isDraft,isPrerelease,assets \
+            --jq '.isDraft == false and .isPrerelease == false and (.assets | length) == 6')" = "true"
+          latest_after="$(gh release view --repo "$REPOSITORY" --json tagName --jq .tagName)"
+          test "$latest_after" = "$latest_before"
+          test "$latest_after" != "$TAG"
