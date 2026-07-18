@@ -9,7 +9,7 @@
 | 字节码块 | 2 | 2 | `Chunk.format_version` |
 | YXB 应用 | 1 | 1 | `format_version`与内容校验和 |
 | 工程协议 | 1 | 1 | `protocol_version` |
-| 原生扩展 ABI | 1 | 1 | `abi_version`与`struct_size` |
+| 原生扩展 ABI | 2 | 1、2 | `abi_version`与`struct_size` |
 | 测试报告 | 1 | 1 | `schema_version`和`test-report-v1` URI |
 | 兼容报告 | 1 | 1 | `schema_version`和`compatibility-report-v1` URI |
 | C ABI 结果 | 1 | 1 | JSON `schema`字段 |

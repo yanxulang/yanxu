@@ -124,6 +124,7 @@ yanbao bundle --manifest-path 我的窗口
 进一步阅读：
 
 - [运行时架构](https://docs.yanxu.dev/project/architecture/)
+- [项目当前状态](docs/project/status.md)
 - [兼容政策](COMPATIBILITY.md)
 - [原生 ABI v1](reference/native-abi-v1.md)
 - [原生 ABI v2](reference/native-abi-v2.md)
@@ -155,7 +156,7 @@ cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-开发环境、测试矩阵和提交要求见[贡献指南](CONTRIBUTING.md)与[开发说明](DEVELOPMENT.md)。
+开发环境、测试矩阵和提交要求见[贡献指南](CONTRIBUTING.md)；当前版本、格式与兼容基线见[项目当前状态](docs/project/status.md)。
 
 ## 许可证
 
