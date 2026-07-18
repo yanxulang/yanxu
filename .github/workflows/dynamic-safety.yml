@@ -1,0 +1,128 @@
+name: 动态安全检查
+
+on:
+  schedule:
+    - cron: "43 2 * * 2"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 要检查的提交或标签
+        required: false
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      ref:
+        description: 要检查的提交或标签
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dynamic-safety-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+env:
+  YANXU_NIGHTLY: nightly-2026-07-18
+
+jobs:
+  miri:
+    name: Miri 有界范围
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 准备固定 nightly 与 Miri
+        run: rustup toolchain install "$YANXU_NIGHTLY" --profile minimal --component miri,rust-src
+      - name: 运行资源预算、字节码与权限范围
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation
+        run: |
+          cargo "+$YANXU_NIGHTLY" miri setup
+          cargo "+$YANXU_NIGHTLY" miri test -p yanxu --lib --locked budget::tests::
+          cargo "+$YANXU_NIGHTLY" miri test -p yanxu --lib --locked bytecode::tests::bytecode_archives_round_trip_and_reject_unknown_versions
+          cargo "+$YANXU_NIGHTLY" miri test -p yanxu-package --lib --locked permissions::tests::intersection_never_exceeds_host_or_application_permissions
+
+  address-sanitizer:
+    name: AddressSanitizer · Rust 核心
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 准备固定 nightly 与标准库源码
+        run: rustup toolchain install "$YANXU_NIGHTLY" --profile minimal --component rust-src
+      - name: 检查核心与包实现
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
+        run: |
+          cargo "+$YANXU_NIGHTLY" test -Zbuild-std --target x86_64-unknown-linux-gnu -p yanxu --lib --locked
+          cargo "+$YANXU_NIGHTLY" test -Zbuild-std --target x86_64-unknown-linux-gnu -p yanxu-package --lib --locked
+
+  undefined-behavior-sanitizer:
+    name: UndefinedBehaviorSanitizer · C ABI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 构建发行动态库
+        run: cargo build -p yanxu --release --locked
+      - name: 检查 C ABI 宿主
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+        run: |
+          clang -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all \
+            examples/embedding/c-host/main.c -Iinclude -Ltarget/release -lyanxu \
+            -o "$RUNNER_TEMP/yanxu-c-host-ubsan"
+          "$RUNNER_TEMP/yanxu-c-host-ubsan"
+
+  fuzz:
+    name: 实际模糊测试 · ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - frontend
+          - formatting
+          - bytecode_archive
+          - application_archive
+          - manifest
+          - lockfile
+          - engineering_protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 准备固定 nightly 与标准库源码
+        run: rustup toolchain install "$YANXU_NIGHTLY" --profile minimal --component rust-src
+      - name: 安装模糊测试工具
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: 运行有界实际变异
+        shell: bash
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          corpus="$RUNNER_TEMP/corpus-$FUZZ_TARGET"
+          mkdir -p "$corpus"
+          cp "fuzz/corpus/$FUZZ_TARGET/"* "$corpus/"
+          cargo "+$YANXU_NIGHTLY" fuzz run "$FUZZ_TARGET" --fuzz-dir fuzz "$corpus" -- \
+            -max_total_time=60 -max_len=65536 -timeout=10 -rss_limit_mb=4096
+      - name: 保存崩溃输入
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-failure-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

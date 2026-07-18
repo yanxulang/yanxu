@@ -78,9 +78,16 @@ jobs:
     with:
       ref: refs/tags/${{ needs.validate.outputs.tag }}
 
+  dynamic-safety:
+    name: 标签提交动态安全门禁
+    needs: validate
+    uses: ./.github/workflows/dynamic-safety.yml
+    with:
+      ref: refs/tags/${{ needs.validate.outputs.tag }}
+
   create-release:
     name: 创建 Release
-    needs: [validate, quality]
+    needs: [validate, quality, dynamic-safety]
     runs-on: ubuntu-latest
     permissions:
       contents: write
