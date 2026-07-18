@@ -7,6 +7,80 @@ pub struct ExecutionBudget {
     pub max_collection_elements: usize,
 }
 
+pub const MAX_BYTE_VALUE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_SOCKET_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostResourceLimits {
+    max_byte_value_bytes: u64,
+    max_http_response_bytes: u64,
+    max_socket_read_bytes: u64,
+}
+
+impl HostResourceLimits {
+    pub fn new(
+        max_byte_value_bytes: u64,
+        max_http_response_bytes: u64,
+        max_socket_read_bytes: u64,
+    ) -> Result<Self, String> {
+        if !(1..=MAX_BYTE_VALUE_BYTES).contains(&max_byte_value_bytes) {
+            return Err(format!(
+                "宿主字节值上限须在 1..={MAX_BYTE_VALUE_BYTES} 字节之间"
+            ));
+        }
+        if !(1..=MAX_HTTP_RESPONSE_BYTES).contains(&max_http_response_bytes)
+            || max_http_response_bytes > max_byte_value_bytes
+        {
+            return Err(format!(
+                "宿主 HTTP 响应上限须在 1..={MAX_HTTP_RESPONSE_BYTES} 字节之间，且不得超过字节值上限"
+            ));
+        }
+        if !(1..=MAX_SOCKET_READ_BYTES).contains(&max_socket_read_bytes)
+            || max_socket_read_bytes > max_byte_value_bytes
+        {
+            return Err(format!(
+                "宿主套接字单次读取上限须在 1..={MAX_SOCKET_READ_BYTES} 字节之间，且不得超过字节值上限"
+            ));
+        }
+        Ok(Self {
+            max_byte_value_bytes,
+            max_http_response_bytes,
+            max_socket_read_bytes,
+        })
+    }
+
+    pub const fn max_byte_value_bytes(self) -> u64 {
+        self.max_byte_value_bytes
+    }
+
+    pub const fn max_http_response_bytes(self) -> u64 {
+        self.max_http_response_bytes
+    }
+
+    pub const fn max_socket_read_bytes(self) -> u64 {
+        self.max_socket_read_bytes
+    }
+
+    pub const fn effective_http_response_bytes(self, requested: u64) -> u64 {
+        if requested < self.max_http_response_bytes {
+            requested
+        } else {
+            self.max_http_response_bytes
+        }
+    }
+}
+
+impl Default for HostResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_byte_value_bytes: MAX_BYTE_VALUE_BYTES,
+            max_http_response_bytes: MAX_HTTP_RESPONSE_BYTES,
+            max_socket_read_bytes: MAX_SOCKET_READ_BYTES,
+        }
+    }
+}
+
 impl ExecutionBudget {
     pub const fn new(
         max_steps: u64,
@@ -34,6 +108,7 @@ impl Default for ExecutionBudget {
 #[derive(Debug, Clone)]
 pub(crate) struct ResourceMeter {
     budget: ExecutionBudget,
+    host_limits: HostResourceLimits,
     steps: u64,
     call_depth: usize,
 }
@@ -42,6 +117,7 @@ impl ResourceMeter {
     pub(crate) fn new(budget: ExecutionBudget) -> Self {
         Self {
             budget,
+            host_limits: HostResourceLimits::default(),
             steps: 0,
             call_depth: 0,
         }
@@ -54,6 +130,14 @@ impl ResourceMeter {
     pub(crate) fn set_budget(&mut self, budget: ExecutionBudget) {
         self.budget = budget;
         self.reset();
+    }
+
+    pub(crate) fn host_limits(&self) -> HostResourceLimits {
+        self.host_limits
+    }
+
+    pub(crate) fn set_host_limits(&mut self, host_limits: HostResourceLimits) {
+        self.host_limits = host_limits;
     }
 
     pub(crate) fn reset(&mut self) {
@@ -142,5 +226,27 @@ mod tests {
         meter.close_step_window(saved);
         // 恢复后外层余额保持耗尽状态，不因窗口而放宽。
         assert!(meter.charge_step().is_err());
+    }
+
+    #[test]
+    fn host_limits_are_ordered_bounded_and_can_only_tighten_requests() {
+        let limits = HostResourceLimits::new(8 * 1024 * 1024, 6 * 1024 * 1024, 1024).unwrap();
+        assert_eq!(limits.max_byte_value_bytes(), 8 * 1024 * 1024);
+        assert_eq!(limits.effective_http_response_bytes(4 * 1024), 4 * 1024);
+        assert_eq!(
+            limits.effective_http_response_bytes(8 * 1024 * 1024),
+            6 * 1024 * 1024
+        );
+        assert!(HostResourceLimits::new(0, 1, 1).is_err());
+        assert!(HostResourceLimits::new(1024, 2048, 1).is_err());
+        assert!(HostResourceLimits::new(1024, 1024, 2048).is_err());
+        assert!(
+            HostResourceLimits::new(
+                MAX_BYTE_VALUE_BYTES + 1,
+                MAX_HTTP_RESPONSE_BYTES,
+                MAX_SOCKET_READ_BYTES,
+            )
+            .is_err()
+        );
     }
 }

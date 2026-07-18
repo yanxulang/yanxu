@@ -841,6 +841,10 @@ impl Vm {
         self.resources.set_budget(budget);
     }
 
+    pub fn set_host_resource_limits(&mut self, limits: crate::budget::HostResourceLimits) {
+        self.resources.set_host_limits(limits);
+    }
+
     pub fn set_arguments(&mut self, arguments: Vec<String>) {
         self.arguments = arguments;
     }
@@ -2100,6 +2104,18 @@ impl Vm {
                     self.ensure_value_budget_inner(item, span, visited)?;
                 }
             }
+            VmValue::Bytes(bytes)
+                if bytes.len() as u64 > self.resources.host_limits().max_byte_value_bytes() =>
+            {
+                return Err(bytes_error(
+                    span,
+                    "BYTES_LIMIT",
+                    format!(
+                        "字节串不得超过宿主 {} 字节上限",
+                        self.resources.host_limits().max_byte_value_bytes()
+                    ),
+                ));
+            }
             _ => {}
         }
         Ok(())
@@ -2941,23 +2957,29 @@ impl Vm {
             Std::JsonStringify => serde_json::to_string(&vm_value_to_json(&arguments[0], span)?)
                 .map(VmValue::String)
                 .map_err(|runtime_error| error(span, format!("JSON 序列化失败：{runtime_error}"))),
-            Std::HttpGet => crate::stdlib::http_request_with_options_guarded(
+            Std::HttpGet => crate::stdlib::http_request_with_options_and_limits_guarded(
                 "GET",
                 vm_string(&arguments[0], "网络.获取", span)?,
                 None,
-                crate::stdlib::HTTP_DEFAULT_TIMEOUT_MILLIS,
-                crate::stdlib::HTTP_DEFAULT_MAX_BYTES,
                 &self.permissions,
+                crate::stdlib::HttpRequestBudget::new(
+                    crate::stdlib::HTTP_DEFAULT_TIMEOUT_MILLIS,
+                    crate::stdlib::HTTP_DEFAULT_MAX_BYTES,
+                    self.resources.host_limits(),
+                ),
             )
             .map(|response| VmValue::String(response.body))
             .map_err(|source| network_error(span, source)),
-            Std::HttpPost => crate::stdlib::http_request_with_options_guarded(
+            Std::HttpPost => crate::stdlib::http_request_with_options_and_limits_guarded(
                 "POST",
                 vm_string(&arguments[0], "网络.发文", span)?,
                 Some(vm_string(&arguments[1], "网络.发文", span)?),
-                crate::stdlib::HTTP_DEFAULT_TIMEOUT_MILLIS,
-                crate::stdlib::HTTP_DEFAULT_MAX_BYTES,
                 &self.permissions,
+                crate::stdlib::HttpRequestBudget::new(
+                    crate::stdlib::HTTP_DEFAULT_TIMEOUT_MILLIS,
+                    crate::stdlib::HTTP_DEFAULT_MAX_BYTES,
+                    self.resources.host_limits(),
+                ),
             )
             .map(|response| VmValue::String(response.body))
             .map_err(|source| network_error(span, source)),
@@ -2967,13 +2989,16 @@ impl Vm {
                 let body = vm_string(&arguments[2], "网络.请求", span)?;
                 let timeout = vm_positive_u64(&arguments[3], "网络.请求", "超时毫秒", span)?;
                 let max_bytes = vm_positive_u64(&arguments[4], "网络.请求", "最大字节", span)?;
-                let response = crate::stdlib::http_request_with_options_guarded(
+                let response = crate::stdlib::http_request_with_options_and_limits_guarded(
                     method,
                     url,
                     Some(body),
-                    timeout,
-                    max_bytes,
                     &self.permissions,
+                    crate::stdlib::HttpRequestBudget::new(
+                        timeout,
+                        max_bytes,
+                        self.resources.host_limits(),
+                    ),
                 )
                 .map_err(|source| network_error(span, source))?;
                 let headers = VmValue::Map(Rc::new(RefCell::new(VmMap {
@@ -3021,14 +3046,17 @@ impl Vm {
                 };
                 let timeout = vm_positive_u64(&arguments[4], "网络.请求字节", "超时毫秒", span)?;
                 let max_bytes = vm_positive_u64(&arguments[5], "网络.请求字节", "最大字节", span)?;
-                let response = crate::stdlib::http_request_bytes_with_options_guarded(
+                let response = crate::stdlib::http_request_bytes_with_options_and_limits_guarded(
                     method,
                     url,
                     &headers,
                     body.as_deref().map(Vec::as_slice),
-                    timeout,
-                    max_bytes,
                     &self.permissions,
+                    crate::stdlib::HttpRequestBudget::new(
+                        timeout,
+                        max_bytes,
+                        self.resources.host_limits(),
+                    ),
                 )
                 .map_err(|source| network_error(span, source))?;
                 let headers = VmValue::Map(Rc::new(RefCell::new(VmMap {
@@ -3088,7 +3116,12 @@ impl Vm {
             }
             Std::SocketReceive => {
                 let socket = vm_socket(&arguments[0], "套接字.接收", span)?;
-                let max_bytes = vm_socket_max_bytes(&arguments[1], "套接字.接收", span)?;
+                let max_bytes = vm_socket_max_bytes(
+                    &arguments[1],
+                    "套接字.接收",
+                    self.resources.host_limits().max_socket_read_bytes(),
+                    span,
+                )?;
                 let timeout = vm_socket_timeout(&arguments[2], "套接字.接收", span)?;
                 crate::stdlib::socket_receive(&mut socket.borrow_mut(), max_bytes, timeout)
                     .map(VmValue::String)
@@ -3104,7 +3137,12 @@ impl Vm {
             }
             Std::SocketReceiveBytes => {
                 let socket = vm_socket(&arguments[0], "套接字.接收字节", span)?;
-                let max_bytes = vm_socket_max_bytes(&arguments[1], "套接字.接收字节", span)?;
+                let max_bytes = vm_socket_max_bytes(
+                    &arguments[1],
+                    "套接字.接收字节",
+                    self.resources.host_limits().max_socket_read_bytes(),
+                    span,
+                )?;
                 let timeout = vm_socket_timeout(&arguments[2], "套接字.接收字节", span)?;
                 let received = crate::stdlib::socket_receive_bytes(
                     &mut socket.borrow_mut(),
@@ -3119,7 +3157,12 @@ impl Vm {
             }
             Std::SocketReadExact => {
                 let socket = vm_socket(&arguments[0], "套接字.精确读取", span)?;
-                let byte_count = vm_socket_max_bytes(&arguments[1], "套接字.精确读取", span)?;
+                let byte_count = vm_socket_max_bytes(
+                    &arguments[1],
+                    "套接字.精确读取",
+                    self.resources.host_limits().max_socket_read_bytes(),
+                    span,
+                )?;
                 let timeout = vm_socket_timeout(&arguments[2], "套接字.精确读取", span)?;
                 crate::stdlib::socket_read_exact_bytes(
                     &mut socket.borrow_mut(),
@@ -3156,7 +3199,12 @@ impl Vm {
             }
             Std::SocketUdpReceiveFrom => {
                 let socket = vm_socket(&arguments[0], "套接字.UDP接收自", span)?;
-                let max_bytes = vm_socket_max_bytes(&arguments[1], "套接字.UDP接收自", span)?;
+                let max_bytes = vm_socket_max_bytes(
+                    &arguments[1],
+                    "套接字.UDP接收自",
+                    self.resources.host_limits().max_socket_read_bytes(),
+                    span,
+                )?;
                 let timeout = vm_socket_timeout(&arguments[2], "套接字.UDP接收自", span)?;
                 let (text, peer) = crate::stdlib::socket_udp_receive_from(
                     &mut socket.borrow_mut(),
@@ -3186,7 +3234,12 @@ impl Vm {
             }
             Std::SocketUdpReceiveBytesFrom => {
                 let socket = vm_socket(&arguments[0], "套接字.UDP接收字节自", span)?;
-                let max_bytes = vm_socket_max_bytes(&arguments[1], "套接字.UDP接收字节自", span)?;
+                let max_bytes = vm_socket_max_bytes(
+                    &arguments[1],
+                    "套接字.UDP接收字节自",
+                    self.resources.host_limits().max_socket_read_bytes(),
+                    span,
+                )?;
                 let timeout = vm_socket_timeout(&arguments[2], "套接字.UDP接收字节自", span)?;
                 let (bytes, peer) = crate::stdlib::socket_udp_receive_bytes_from(
                     &mut socket.borrow_mut(),
@@ -5182,20 +5235,19 @@ fn vm_socket_timeout(value: &VmValue, _function: &str, span: &Span) -> Result<u6
     Ok(number as u64)
 }
 
-fn vm_socket_max_bytes(value: &VmValue, _function: &str, span: &Span) -> Result<u64, VmError> {
+fn vm_socket_max_bytes(
+    value: &VmValue,
+    _function: &str,
+    host_max_bytes: u64,
+    span: &Span,
+) -> Result<u64, VmError> {
     let number = number(value, span)?;
-    if number <= 0.0
-        || number.fract() != 0.0
-        || number > crate::stdlib::SOCKET_MAX_READ_BYTES as f64
-    {
+    if number <= 0.0 || number.fract() != 0.0 || number > host_max_bytes as f64 {
         return Err(socket_error(
             span,
             crate::stdlib::SocketError::new(
                 "SOCKET_LIMIT",
-                format!(
-                    "套接字单次接收上限须在 1..={} 字节之间",
-                    crate::stdlib::SOCKET_MAX_READ_BYTES
-                ),
+                format!("套接字单次接收上限须在 1..={} 字节之间", host_max_bytes),
             ),
         ));
     }

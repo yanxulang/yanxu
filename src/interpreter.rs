@@ -791,6 +791,10 @@ impl Interpreter {
         self.resources.set_budget(budget);
     }
 
+    pub fn set_host_resource_limits(&mut self, limits: crate::budget::HostResourceLimits) {
+        self.resources.set_host_limits(limits);
+    }
+
     pub fn budget(&self) -> crate::budget::ExecutionBudget {
         self.resources.budget()
     }
@@ -1728,12 +1732,20 @@ impl Interpreter {
                 .map(|()| Value::Nil)
                 .map_err(RuntimeError::new)
             }
-            GuardedNative::HttpGet => native_http_get(arguments, &self.permissions),
-            GuardedNative::HttpPost => native_http_post(arguments, &self.permissions),
-            GuardedNative::HttpRequest => native_http_request(arguments, &self.permissions),
-            GuardedNative::HttpBytesRequest => {
-                native_http_bytes_request(arguments, &self.permissions)
+            GuardedNative::HttpGet => {
+                native_http_get(arguments, &self.permissions, self.resources.host_limits())
             }
+            GuardedNative::HttpPost => {
+                native_http_post(arguments, &self.permissions, self.resources.host_limits())
+            }
+            GuardedNative::HttpRequest => {
+                native_http_request(arguments, &self.permissions, self.resources.host_limits())
+            }
+            GuardedNative::HttpBytesRequest => native_http_bytes_request(
+                arguments,
+                &self.permissions,
+                self.resources.host_limits(),
+            ),
             GuardedNative::SocketTcpConnect => {
                 native_socket_tcp_connect(arguments, &self.permissions, &self.socket_quota)
             }
@@ -1742,23 +1754,36 @@ impl Interpreter {
             }
             GuardedNative::SocketAccept => native_socket_accept(arguments),
             GuardedNative::SocketSend => native_socket_send(arguments),
-            GuardedNative::SocketReceive => native_socket_receive(arguments),
+            GuardedNative::SocketReceive => native_socket_receive(
+                arguments,
+                self.resources.host_limits().max_socket_read_bytes(),
+            ),
             GuardedNative::SocketSendBytes => native_socket_send_bytes(arguments),
-            GuardedNative::SocketReceiveBytes => native_socket_receive_bytes(arguments),
-            GuardedNative::SocketReadExact => native_socket_read_exact(arguments),
+            GuardedNative::SocketReceiveBytes => native_socket_receive_bytes(
+                arguments,
+                self.resources.host_limits().max_socket_read_bytes(),
+            ),
+            GuardedNative::SocketReadExact => native_socket_read_exact(
+                arguments,
+                self.resources.host_limits().max_socket_read_bytes(),
+            ),
             GuardedNative::SocketUdpBind => {
                 native_socket_udp_bind(arguments, &self.permissions, &self.socket_quota)
             }
             GuardedNative::SocketUdpSendTo => {
                 native_socket_udp_send_to(arguments, &self.permissions)
             }
-            GuardedNative::SocketUdpReceiveFrom => native_socket_udp_receive_from(arguments),
+            GuardedNative::SocketUdpReceiveFrom => native_socket_udp_receive_from(
+                arguments,
+                self.resources.host_limits().max_socket_read_bytes(),
+            ),
             GuardedNative::SocketUdpSendBytesTo => {
                 native_socket_udp_send_bytes_to(arguments, &self.permissions)
             }
-            GuardedNative::SocketUdpReceiveBytesFrom => {
-                native_socket_udp_receive_bytes_from(arguments)
-            }
+            GuardedNative::SocketUdpReceiveBytesFrom => native_socket_udp_receive_bytes_from(
+                arguments,
+                self.resources.host_limits().max_socket_read_bytes(),
+            ),
             GuardedNative::SocketLocalAddress => native_socket_local_address(arguments),
             GuardedNative::SocketPeerAddress => native_socket_peer_address(arguments),
             GuardedNative::SocketClose => native_socket_close(arguments),
@@ -2621,6 +2646,17 @@ impl Interpreter {
                     self.ensure_value_budget_inner(key, visited)?;
                     self.ensure_value_budget_inner(item, visited)?;
                 }
+            }
+            Value::Bytes(bytes)
+                if bytes.len() as u64 > self.resources.host_limits().max_byte_value_bytes() =>
+            {
+                return Err(RuntimeError::bytes(
+                    "BYTES_LIMIT",
+                    format!(
+                        "字节串不得超过宿主 {} 字节上限",
+                        self.resources.host_limits().max_byte_value_bytes()
+                    ),
+                ));
             }
             _ => {}
         }
@@ -4158,12 +4194,14 @@ fn native_json_stringify(arguments: &[Value]) -> Result<Value, RuntimeError> {
 fn native_http_get(
     arguments: &[Value],
     permissions: &crate::permissions::PermissionSet,
+    host_limits: crate::budget::HostResourceLimits,
 ) -> Result<Value, RuntimeError> {
     http_request(
         "GET",
         string_argument(arguments, 0, "网络.获取")?,
         None,
         permissions,
+        host_limits,
     )
     .map(Value::String)
 }
@@ -4171,12 +4209,14 @@ fn native_http_get(
 fn native_http_post(
     arguments: &[Value],
     permissions: &crate::permissions::PermissionSet,
+    host_limits: crate::budget::HostResourceLimits,
 ) -> Result<Value, RuntimeError> {
     http_request(
         "POST",
         string_argument(arguments, 0, "网络.发文")?,
         Some(string_argument(arguments, 1, "网络.发文")?),
         permissions,
+        host_limits,
     )
     .map(Value::String)
 }
@@ -4184,16 +4224,16 @@ fn native_http_post(
 fn native_http_request(
     arguments: &[Value],
     permissions: &crate::permissions::PermissionSet,
+    host_limits: crate::budget::HostResourceLimits,
 ) -> Result<Value, RuntimeError> {
     let timeout = positive_u64_argument(arguments, 3, "网络.请求", "超时毫秒")?;
     let max_bytes = positive_u64_argument(arguments, 4, "网络.请求", "最大字节")?;
-    let response = crate::stdlib::http_request_with_options_guarded(
+    let response = crate::stdlib::http_request_with_options_and_limits_guarded(
         string_argument(arguments, 0, "网络.请求")?,
         string_argument(arguments, 1, "网络.请求")?,
         Some(string_argument(arguments, 2, "网络.请求")?),
-        timeout,
-        max_bytes,
         permissions,
+        crate::stdlib::HttpRequestBudget::new(timeout, max_bytes, host_limits),
     )
     .map_err(RuntimeError::network)?;
     let headers = Value::Map(Rc::new(RefCell::new(YanxuMap {
@@ -4219,6 +4259,7 @@ fn native_http_request(
 fn native_http_bytes_request(
     arguments: &[Value],
     permissions: &crate::permissions::PermissionSet,
+    host_limits: crate::budget::HostResourceLimits,
 ) -> Result<Value, RuntimeError> {
     let headers = string_map_argument(arguments, 2, "网络.请求字节")?;
     let body = match &arguments[3] {
@@ -4236,14 +4277,13 @@ fn native_http_bytes_request(
     };
     let timeout = positive_u64_argument(arguments, 4, "网络.请求字节", "超时毫秒")?;
     let max_bytes = positive_u64_argument(arguments, 5, "网络.请求字节", "最大字节")?;
-    let response = crate::stdlib::http_request_bytes_with_options_guarded(
+    let response = crate::stdlib::http_request_bytes_with_options_and_limits_guarded(
         string_argument(arguments, 0, "网络.请求字节")?,
         string_argument(arguments, 1, "网络.请求字节")?,
         &headers,
         body.as_deref().map(Vec::as_slice),
-        timeout,
-        max_bytes,
         permissions,
+        crate::stdlib::HttpRequestBudget::new(timeout, max_bytes, host_limits),
     )
     .map_err(RuntimeError::network)?;
     let headers = Value::Map(Rc::new(RefCell::new(YanxuMap {
@@ -4304,8 +4344,8 @@ fn native_socket_send(arguments: &[Value]) -> Result<Value, RuntimeError> {
         .map_err(RuntimeError::socket)
 }
 
-fn native_socket_receive(arguments: &[Value]) -> Result<Value, RuntimeError> {
-    let max_bytes = socket_max_bytes_argument(arguments, 1, "套接字.接收")?;
+fn native_socket_receive(arguments: &[Value], host_max_bytes: u64) -> Result<Value, RuntimeError> {
+    let max_bytes = socket_max_bytes_argument(arguments, 1, "套接字.接收", host_max_bytes)?;
     let timeout = socket_timeout_argument(arguments, 2, "套接字.接收")?;
     let socket = socket_argument(arguments, 0, "套接字.接收")?;
     crate::stdlib::socket_receive(&mut socket.borrow_mut(), max_bytes, timeout)
@@ -4322,8 +4362,11 @@ fn native_socket_send_bytes(arguments: &[Value]) -> Result<Value, RuntimeError> 
         .map_err(RuntimeError::socket)
 }
 
-fn native_socket_receive_bytes(arguments: &[Value]) -> Result<Value, RuntimeError> {
-    let max_bytes = socket_max_bytes_argument(arguments, 1, "套接字.接收字节")?;
+fn native_socket_receive_bytes(
+    arguments: &[Value],
+    host_max_bytes: u64,
+) -> Result<Value, RuntimeError> {
+    let max_bytes = socket_max_bytes_argument(arguments, 1, "套接字.接收字节", host_max_bytes)?;
     let timeout = socket_timeout_argument(arguments, 2, "套接字.接收字节")?;
     let socket = socket_argument(arguments, 0, "套接字.接收字节")?;
     let received =
@@ -4335,8 +4378,11 @@ fn native_socket_receive_bytes(arguments: &[Value]) -> Result<Value, RuntimeErro
     ]))
 }
 
-fn native_socket_read_exact(arguments: &[Value]) -> Result<Value, RuntimeError> {
-    let byte_count = socket_max_bytes_argument(arguments, 1, "套接字.精确读取")?;
+fn native_socket_read_exact(
+    arguments: &[Value],
+    host_max_bytes: u64,
+) -> Result<Value, RuntimeError> {
+    let byte_count = socket_max_bytes_argument(arguments, 1, "套接字.精确读取", host_max_bytes)?;
     let timeout = socket_timeout_argument(arguments, 2, "套接字.精确读取")?;
     let socket = socket_argument(arguments, 0, "套接字.精确读取")?;
     crate::stdlib::socket_read_exact_bytes(&mut socket.borrow_mut(), byte_count, timeout)
@@ -4374,8 +4420,11 @@ fn native_socket_udp_send_to(
     .map_err(RuntimeError::socket)
 }
 
-fn native_socket_udp_receive_from(arguments: &[Value]) -> Result<Value, RuntimeError> {
-    let max_bytes = socket_max_bytes_argument(arguments, 1, "套接字.UDP接收自")?;
+fn native_socket_udp_receive_from(
+    arguments: &[Value],
+    host_max_bytes: u64,
+) -> Result<Value, RuntimeError> {
+    let max_bytes = socket_max_bytes_argument(arguments, 1, "套接字.UDP接收自", host_max_bytes)?;
     let timeout = socket_timeout_argument(arguments, 2, "套接字.UDP接收自")?;
     let socket = socket_argument(arguments, 0, "套接字.UDP接收自")?;
     let (text, peer) =
@@ -4406,8 +4455,12 @@ fn native_socket_udp_send_bytes_to(
     .map_err(RuntimeError::socket)
 }
 
-fn native_socket_udp_receive_bytes_from(arguments: &[Value]) -> Result<Value, RuntimeError> {
-    let max_bytes = socket_max_bytes_argument(arguments, 1, "套接字.UDP接收字节自")?;
+fn native_socket_udp_receive_bytes_from(
+    arguments: &[Value],
+    host_max_bytes: u64,
+) -> Result<Value, RuntimeError> {
+    let max_bytes =
+        socket_max_bytes_argument(arguments, 1, "套接字.UDP接收字节自", host_max_bytes)?;
     let timeout = socket_timeout_argument(arguments, 2, "套接字.UDP接收字节自")?;
     let socket = socket_argument(arguments, 0, "套接字.UDP接收字节自")?;
     let (bytes, peer) =
@@ -4683,18 +4736,13 @@ fn socket_max_bytes_argument(
     arguments: &[Value],
     index: usize,
     function: &str,
+    host_max_bytes: u64,
 ) -> Result<u64, RuntimeError> {
     let number = number_argument(arguments, index, function)?;
-    if number <= 0.0
-        || number.fract() != 0.0
-        || number > crate::stdlib::SOCKET_MAX_READ_BYTES as f64
-    {
+    if number <= 0.0 || number.fract() != 0.0 || number > host_max_bytes as f64 {
         return Err(RuntimeError::socket(crate::stdlib::SocketError::new(
             "SOCKET_LIMIT",
-            format!(
-                "套接字单次接收上限须在 1..={} 字节之间",
-                crate::stdlib::SOCKET_MAX_READ_BYTES
-            ),
+            format!("套接字单次接收上限须在 1..={} 字节之间", host_max_bytes),
         )));
     }
     Ok(number as u64)
@@ -4956,14 +5004,18 @@ fn http_request(
     url: &str,
     body: Option<&str>,
     permissions: &crate::permissions::PermissionSet,
+    host_limits: crate::budget::HostResourceLimits,
 ) -> Result<String, RuntimeError> {
-    crate::stdlib::http_request_with_options_guarded(
+    crate::stdlib::http_request_with_options_and_limits_guarded(
         method,
         url,
         body,
-        crate::stdlib::HTTP_DEFAULT_TIMEOUT_MILLIS,
-        crate::stdlib::HTTP_DEFAULT_MAX_BYTES,
         permissions,
+        crate::stdlib::HttpRequestBudget::new(
+            crate::stdlib::HTTP_DEFAULT_TIMEOUT_MILLIS,
+            crate::stdlib::HTTP_DEFAULT_MAX_BYTES,
+            host_limits,
+        ),
     )
     .map(|response| response.body)
     .map_err(RuntimeError::network)

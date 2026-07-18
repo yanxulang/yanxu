@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 pub const API_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const BYTES_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
+pub const BYTES_MAX_VALUE_BYTES: usize = crate::budget::MAX_BYTE_VALUE_BYTES as usize;
 pub const SECURE_RANDOM_MAX_BYTES: usize = 1024 * 1024;
 pub const PROCESS_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const PROCESS_MAX_TIMEOUT_MILLIS: u64 = 300_000;
@@ -1018,7 +1018,29 @@ pub fn csv_stringify(rows: &[Vec<String>]) -> String {
 
 pub const HTTP_DEFAULT_TIMEOUT_MILLIS: u64 = 10_000;
 pub const HTTP_DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub const HTTP_MAX_RESPONSE_BYTES: u64 = crate::budget::MAX_HTTP_RESPONSE_BYTES;
 pub const HTTP_MAX_REDIRECTS: usize = 10;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HttpRequestBudget {
+    timeout_millis: u64,
+    requested_max_bytes: u64,
+    host_limits: crate::budget::HostResourceLimits,
+}
+
+impl HttpRequestBudget {
+    pub(crate) const fn new(
+        timeout_millis: u64,
+        requested_max_bytes: u64,
+        host_limits: crate::budget::HostResourceLimits,
+    ) -> Self {
+        Self {
+            timeout_millis,
+            requested_max_bytes,
+            host_limits,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkError {
@@ -1047,7 +1069,7 @@ impl std::fmt::Display for NetworkError {
 
 impl std::error::Error for NetworkError {}
 
-pub const SOCKET_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+pub const SOCKET_MAX_READ_BYTES: u64 = crate::budget::MAX_SOCKET_READ_BYTES;
 pub const SOCKET_MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 pub const SOCKET_MAX_OPEN_RESOURCES: usize = 128;
 pub const SOCKET_MAX_OPEN_LISTENERS: usize = 16;
@@ -2200,6 +2222,27 @@ pub fn http_request_with_options_guarded(
     max_bytes: u64,
     permissions: &crate::permissions::PermissionSet,
 ) -> Result<HttpResponse, NetworkError> {
+    http_request_with_options_and_limits_guarded(
+        method,
+        url,
+        body,
+        permissions,
+        HttpRequestBudget::new(
+            timeout_millis,
+            max_bytes,
+            crate::budget::HostResourceLimits::default(),
+        ),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn http_request_with_options_and_limits_guarded(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    permissions: &crate::permissions::PermissionSet,
+    budget: HttpRequestBudget,
+) -> Result<HttpResponse, NetworkError> {
     let headers = vec![
         ("content-type".into(), "text/plain; charset=utf-8".into()),
         (
@@ -2207,14 +2250,13 @@ pub fn http_request_with_options_guarded(
             "text/plain, application/json;q=0.9, */*;q=0.1".into(),
         ),
     ];
-    let response = http_request_bytes_with_options_guarded(
+    let response = http_request_bytes_with_options_and_limits_guarded(
         method,
         url,
         &headers,
         body.map(str::as_bytes),
-        timeout_millis,
-        max_bytes,
         permissions,
+        budget,
     )?;
     let body = String::from_utf8(response.body)
         .map_err(|_| NetworkError::new("NET_UTF8", "HTTP 响应正文不是 UTF-8 文字"))?;
@@ -2236,7 +2278,36 @@ pub fn http_request_bytes_with_options_guarded(
     max_bytes: u64,
     permissions: &crate::permissions::PermissionSet,
 ) -> Result<HttpBytesResponse, NetworkError> {
+    http_request_bytes_with_options_and_limits_guarded(
+        method,
+        url,
+        headers,
+        body,
+        permissions,
+        HttpRequestBudget::new(
+            timeout_millis,
+            max_bytes,
+            crate::budget::HostResourceLimits::default(),
+        ),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn http_request_bytes_with_options_and_limits_guarded(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    permissions: &crate::permissions::PermissionSet,
+    budget: HttpRequestBudget,
+) -> Result<HttpBytesResponse, NetworkError> {
     use ureq::ResponseExt as _;
+
+    let HttpRequestBudget {
+        timeout_millis,
+        requested_max_bytes: max_bytes,
+        host_limits,
+    } = budget;
 
     let mut parsed = Url::parse(url)
         .map_err(|error| NetworkError::new("NET_URL", format!("网络地址无效：{error}")))?;
@@ -2247,6 +2318,7 @@ pub fn http_request_bytes_with_options_guarded(
     if max_bytes == 0 {
         return Err(NetworkError::new("NET_LIMIT", "响应大小上限须大于零字节"));
     }
+    let effective_max_bytes = host_limits.effective_http_response_bytes(max_bytes);
     let mut method = ureq::http::Method::from_bytes(method.as_bytes())
         .map_err(|error| NetworkError::new("NET_PROTOCOL", format!("HTTP 方法无效：{error}")))?;
     let mut request_headers = validate_request_headers(headers)?;
@@ -2353,19 +2425,24 @@ pub fn http_request_bytes_with_options_guarded(
         if response
             .body()
             .content_length()
-            .is_some_and(|length| length > max_bytes)
+            .is_some_and(|length| length > effective_max_bytes)
         {
-            return Err(NetworkError::new(
-                "NET_LIMIT",
-                format!("HTTP 响应超过 {max_bytes} 字节上限"),
-            ));
+            return Err(http_limit_error(max_bytes, effective_max_bytes));
         }
         let bytes = response
             .body_mut()
             .with_config()
-            .limit(max_bytes)
+            .limit(effective_max_bytes.saturating_add(1))
             .read_to_vec()
-            .map_err(network_error_from_ureq)?;
+            .map_err(|error| match error {
+                ureq::Error::BodyExceedsLimit(_) => {
+                    http_limit_error(max_bytes, effective_max_bytes)
+                }
+                error => network_error_from_ureq(error),
+            })?;
+        if bytes.len() as u64 > effective_max_bytes {
+            return Err(http_limit_error(max_bytes, effective_max_bytes));
+        }
         return Ok(HttpBytesResponse {
             status,
             url: final_url,
@@ -2374,6 +2451,21 @@ pub fn http_request_bytes_with_options_guarded(
         });
     }
     unreachable!("redirect loop returns at its configured bound")
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn http_limit_error(requested: u64, effective: u64) -> NetworkError {
+    if effective < requested {
+        NetworkError::new(
+            "NET_LIMIT",
+            format!("HTTP 响应超过宿主 {effective} 字节上限（应用请求 {requested} 字节）"),
+        )
+    } else {
+        NetworkError::new(
+            "NET_LIMIT",
+            format!("HTTP 响应超过应用请求的 {requested} 字节上限"),
+        )
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -2524,6 +2616,32 @@ pub fn http_request_bytes_with_options_guarded(
 }
 
 #[cfg(target_family = "wasm")]
+pub(crate) fn http_request_bytes_with_options_and_limits_guarded(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    permissions: &crate::permissions::PermissionSet,
+    budget: HttpRequestBudget,
+) -> Result<HttpBytesResponse, NetworkError> {
+    let HttpRequestBudget {
+        timeout_millis,
+        requested_max_bytes: max_bytes,
+        host_limits,
+    } = budget;
+    let _ = host_limits;
+    http_request_bytes_with_options_guarded(
+        method,
+        url,
+        headers,
+        body,
+        timeout_millis,
+        max_bytes,
+        permissions,
+    )
+}
+
+#[cfg(target_family = "wasm")]
 pub fn http_request_with_options_guarded(
     _method: &str,
     _url: &str,
@@ -2536,6 +2654,23 @@ pub fn http_request_with_options_guarded(
         "NET_PROTOCOL",
         "WASI 运行时未授予原生网络传输能力",
     ))
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn http_request_with_options_and_limits_guarded(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    permissions: &crate::permissions::PermissionSet,
+    budget: HttpRequestBudget,
+) -> Result<HttpResponse, NetworkError> {
+    let HttpRequestBudget {
+        timeout_millis,
+        requested_max_bytes: max_bytes,
+        host_limits,
+    } = budget;
+    let _ = host_limits;
+    http_request_with_options_guarded(method, url, body, timeout_millis, max_bytes, permissions)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -2616,6 +2751,75 @@ mod tests {
         );
         assert!(format_http_date(253_402_300_800_000).is_err());
         assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn binary_http_response_can_cross_the_socket_read_limit_without_truncation() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let body_length = SOCKET_MAX_READ_BYTES as usize + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {body_length}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.write_all(&vec![0xa5; body_length]).unwrap();
+        });
+        let response = http_request_bytes_with_options_guarded(
+            "GET",
+            &format!("http://{address}/large-binary"),
+            &[],
+            None,
+            5_000,
+            body_length as u64,
+            &crate::permissions::PermissionSet::unrestricted(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.body.len(), body_length);
+        assert!(response.body.iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn streaming_http_response_obeys_the_smaller_host_limit() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nyanxu!\r\n0\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let limits = crate::budget::HostResourceLimits::new(8, 5, 4).unwrap();
+        let error = http_request_bytes_with_options_and_limits_guarded(
+            "GET",
+            &format!("http://{address}/stream"),
+            &[],
+            None,
+            &crate::permissions::PermissionSet::unrestricted(),
+            HttpRequestBudget::new(1_000, 64, limits),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.code, "NET_LIMIT");
+        assert!(error.message.contains("宿主 5 字节上限"), "{error}");
+        assert!(error.message.contains("应用请求 64 字节"), "{error}");
     }
 
     #[cfg(not(target_family = "wasm"))]
