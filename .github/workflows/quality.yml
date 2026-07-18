@@ -52,6 +52,34 @@ jobs:
           cargo metadata --locked --format-version 1 --no-deps > "$RUNNER_TEMP/cargo-metadata.json"
           jq -e '[.packages[] | select(.name | startswith("yanxu-native-"))] | length == 2' "$RUNNER_TEMP/cargo-metadata.json" >/dev/null
 
+  coverage:
+    name: 覆盖率门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 安装覆盖率工具
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cargo-llvm-cov@0.8.7
+      - name: 准备 LLVM 覆盖率组件
+        run: rustup component add llvm-tools-preview
+      - name: 运行工作区覆盖率
+        run: cargo llvm-cov --workspace --all-targets --locked --json --output-path "$RUNNER_TEMP/coverage.json"
+      - name: 检查整体与核心模块门槛
+        run: scripts/check-coverage.sh "$RUNNER_TEMP/coverage.json"
+      - name: 生成 LCOV 报告
+        run: cargo llvm-cov report --lcov --output-path "$RUNNER_TEMP/coverage.lcov"
+      - name: 保存覆盖率报告
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: yanxu-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/coverage.json
+            ${{ runner.temp }}/coverage.lcov
+          if-no-files-found: error
+
   rust:
     name: Rust · ${{ matrix.os }}
     strategy:
