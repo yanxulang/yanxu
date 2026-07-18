@@ -1254,37 +1254,35 @@ mod tests {
             "[包]\n格式=2\n名称='索引包'\n版本='1.2.3'\n入口='主.yx'\n许可='MIT'\n",
         );
         write(dependency_root.join("主.yx"), "公 定 值：数 为 1；\n");
-        write(
-            registry.join("索引包/index.json"),
-            serde_json::to_vec_pretty(&json!({
-                "versions": [{
-                    "version": "1.2.3",
-                    "url": "ftp://packages.example.invalid/索引包-1.2.3.tar.gz",
-                    "checksum": "a".repeat(64),
-                    "yanked": true,
-                    "vulnerabilities": [
-                        {
-                            "id": "YXSA-2026-0001",
-                            "severity": "high",
-                            "summary": "可达示例漏洞",
-                            "url": "https://security.example.invalid/YXSA-2026-0001"
-                        },
-                        {
-                            "id": "YXSA-2026-0000",
-                            "severity": "critical",
-                            "summary": "已撤回记录",
-                            "withdrawn": true
-                        },
-                        {
-                            "id": "不安全公告",
-                            "severity": "high",
-                            "summary": "无效标识"
-                        }
-                    ]
-                }]
-            }))
-            .unwrap(),
-        );
+        let index_path = registry.join("索引包/index.json");
+        let mut index = json!({
+            "versions": [{
+                "version": "1.2.3",
+                "url": "ftp://packages.example.invalid/索引包-1.2.3.tar.gz",
+                "checksum": "a".repeat(64),
+                "yanked": false,
+                "vulnerabilities": [
+                    {
+                        "id": "YXSA-2026-0001",
+                        "severity": "high",
+                        "summary": "可达示例漏洞",
+                        "url": "https://security.example.invalid/YXSA-2026-0001"
+                    },
+                    {
+                        "id": "YXSA-2026-0000",
+                        "severity": "critical",
+                        "summary": "已撤回记录",
+                        "withdrawn": true
+                    },
+                    {
+                        "id": "不安全公告",
+                        "severity": "high",
+                        "summary": "无效标识"
+                    }
+                ]
+            }]
+        });
+        write(&index_path, serde_json::to_vec_pretty(&index).unwrap());
         write(
             application.join(package::MANIFEST_NAME),
             format!(
@@ -1293,6 +1291,11 @@ mod tests {
             ),
         );
         write(application.join("主.yx"), "言「应用」；\n");
+
+        let manifest = package::load(application.join(package::MANIFEST_NAME)).unwrap();
+        package::ensure_lock(&manifest, true).unwrap();
+        index["versions"][0]["yanked"] = json!(true);
+        write(&index_path, serde_json::to_vec_pretty(&index).unwrap());
 
         let result = handle(&json!({
             "operation": "audit",

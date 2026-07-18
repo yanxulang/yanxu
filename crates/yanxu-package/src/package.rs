@@ -2650,6 +2650,27 @@ fn select_registry_version(
     requirement: &VersionReq,
     locked: Option<&Version>,
 ) -> Result<Version, ManifestError> {
+    let index_path = package_root.join("index.json");
+    if index_path.is_file() {
+        let index = read_registry_index(&index_path)?;
+        return select_remote_registry_release(
+            index
+                .versions
+                .into_iter()
+                .filter(|release| package_root.join(&release.version).is_dir())
+                .collect(),
+            requirement,
+            locked,
+        )
+        .map(|(version, _)| version)
+        .ok_or_else(|| {
+            manifest_error(
+                package_root,
+                None,
+                format!("索引中没有满足 {requirement} 的未撤回版本"),
+            )
+        });
+    }
     if let Some(locked) = locked {
         if requirement.matches(locked) && package_root.join(locked.to_string()).is_dir() {
             return Ok(locked.clone());
@@ -4043,6 +4064,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected, Version::new(1, 5, 0));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_registry_metadata_skips_yanked_versions_unless_already_locked() {
+        let root = temp("local-registry-yanked");
+        let package_root = root.join("索引/文字");
+        for version in ["1.0.0", "1.1.0"] {
+            let package = package_root.join(version);
+            write(
+                &package.join(MANIFEST_NAME),
+                &format!("[包]\n名='文字'\n版='{version}'\n入口='主.yx'\n"),
+            );
+            write(&package.join("主.yx"), "公 定 名：文 为「文字」；\n");
+        }
+        write(
+            &package_root.join("index.json"),
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "versions": [
+                    {
+                        "version": "1.0.0",
+                        "url": "file:///tmp/文字-1.0.0.tar.gz",
+                        "checksum": "a".repeat(64),
+                        "yanked": false
+                    },
+                    {
+                        "version": "1.1.0",
+                        "url": "file:///tmp/文字-1.1.0.tar.gz",
+                        "checksum": "b".repeat(64),
+                        "yanked": true
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
+
+        let selected = select_registry_version(&package_root, &VersionReq::STAR, None).unwrap();
+        assert_eq!(selected, Version::new(1, 0, 0));
+        let locked = Version::new(1, 1, 0);
+        assert_eq!(
+            select_registry_version(&package_root, &VersionReq::STAR, Some(&locked)).unwrap(),
+            locked
+        );
         fs::remove_dir_all(root).ok();
     }
 
