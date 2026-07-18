@@ -671,7 +671,7 @@ fn audit_registry_dependency(
             format!("索引制品缺少合法的 SHA-256：{}", metadata.checksum),
         ));
     }
-    if metadata.url.starts_with("http://") {
+    if !secure_registry_artifact_source(registry, &metadata.url) {
         findings.push(AuditFinding::new(
             "warning",
             "AUDIT_INSECURE_SOURCE",
@@ -744,6 +744,14 @@ fn audit_registry_dependency(
         ));
     }
     Ok(())
+}
+
+fn secure_registry_artifact_source(registry: &str, source: &str) -> bool {
+    if registry.starts_with("https://") {
+        source.starts_with("https://")
+    } else {
+        source.starts_with("https://") || source.starts_with("file://") || !source.contains("://")
+    }
 }
 
 fn registry_vulnerability_severity(value: &str) -> Option<&'static str> {
@@ -1251,7 +1259,7 @@ mod tests {
             serde_json::to_vec_pretty(&json!({
                 "versions": [{
                     "version": "1.2.3",
-                    "url": "https://packages.example.invalid/索引包-1.2.3.tar.gz",
+                    "url": "ftp://packages.example.invalid/索引包-1.2.3.tar.gz",
                     "checksum": "a".repeat(64),
                     "yanked": true,
                     "vulnerabilities": [
@@ -1299,6 +1307,7 @@ mod tests {
             .filter_map(|finding| finding["code"].as_str())
             .collect::<std::collections::BTreeSet<_>>();
         assert!(codes.contains("AUDIT_YANKED"));
+        assert!(codes.contains("AUDIT_INSECURE_SOURCE"));
         assert!(codes.contains("AUDIT_VULNERABILITY_YXSA_2026_0001"));
         assert!(!codes.contains("AUDIT_VULNERABILITY_YXSA_2026_0000"));
         assert!(codes.contains("AUDIT_VULNERABILITY_METADATA_INVALID"));
@@ -1335,5 +1344,35 @@ mod tests {
             vulnerability_code("YXSA-2026-0002")
         );
         assert!(!valid_vulnerability_id(&"A".repeat(97)));
+    }
+
+    #[test]
+    fn registry_artifact_sources_follow_remote_and_local_transport_boundaries() {
+        assert!(secure_registry_artifact_source(
+            "https://packages.example.invalid/v1",
+            "https://cdn.example.invalid/package.tar.gz"
+        ));
+        for source in [
+            "http://cdn.example.invalid/package.tar.gz",
+            "ftp://cdn.example.invalid/package.tar.gz",
+            "HTTPS://cdn.example.invalid/package.tar.gz",
+        ] {
+            assert!(!secure_registry_artifact_source(
+                "https://packages.example.invalid/v1",
+                source
+            ));
+        }
+        assert!(secure_registry_artifact_source(
+            "file:///tmp/registry",
+            "file:///tmp/package.tar.gz"
+        ));
+        assert!(secure_registry_artifact_source(
+            "/tmp/registry",
+            "../package.tar.gz"
+        ));
+        assert!(!secure_registry_artifact_source(
+            "/tmp/registry",
+            "ftp://cdn.example.invalid/package.tar.gz"
+        ));
     }
 }
