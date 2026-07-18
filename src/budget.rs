@@ -7,19 +7,20 @@ pub struct ExecutionBudget {
     pub max_collection_elements: usize,
 }
 
-pub const MAX_BYTE_VALUE_BYTES: u64 = 16 * 1024 * 1024;
-pub const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-pub const MAX_SOCKET_READ_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_BYTE_VALUE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_SOCKET_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostResourceLimits {
+pub(crate) struct HostResourceLimits {
     max_byte_value_bytes: u64,
     max_http_response_bytes: u64,
     max_socket_read_bytes: u64,
 }
 
 impl HostResourceLimits {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         max_byte_value_bytes: u64,
         max_http_response_bytes: u64,
         max_socket_read_bytes: u64,
@@ -50,19 +51,16 @@ impl HostResourceLimits {
         })
     }
 
-    pub const fn max_byte_value_bytes(self) -> u64 {
+    pub(crate) const fn max_byte_value_bytes(self) -> u64 {
         self.max_byte_value_bytes
     }
 
-    pub const fn max_http_response_bytes(self) -> u64 {
-        self.max_http_response_bytes
-    }
-
-    pub const fn max_socket_read_bytes(self) -> u64 {
+    pub(crate) const fn max_socket_read_bytes(self) -> u64 {
         self.max_socket_read_bytes
     }
 
-    pub const fn effective_http_response_bytes(self, requested: u64) -> u64 {
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) const fn effective_http_response_bytes(self, requested: u64) -> u64 {
         if requested < self.max_http_response_bytes {
             requested
         } else {

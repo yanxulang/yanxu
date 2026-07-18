@@ -18,7 +18,7 @@ use std::fmt;
 use std::rc::Rc;
 
 pub const BYTECODE_FORMAT_VERSION: u32 = 2;
-pub const BYTECODE_FORMAT_UNSUPPORTED_CODE: &str = "BYTECODE_FORMAT_UNSUPPORTED";
+const BYTECODE_FORMAT_UNSUPPORTED_CODE: &str = "BYTECODE_FORMAT_UNSUPPORTED";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Constant {

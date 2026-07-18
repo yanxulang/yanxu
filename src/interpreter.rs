@@ -791,7 +791,7 @@ impl Interpreter {
         self.resources.set_budget(budget);
     }
 
-    pub fn set_host_resource_limits(&mut self, limits: crate::budget::HostResourceLimits) {
+    pub(crate) fn set_host_resource_limits(&mut self, limits: crate::budget::HostResourceLimits) {
         self.resources.set_host_limits(limits);
     }
 

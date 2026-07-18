@@ -139,7 +139,8 @@ impl Engine {
         &self.config
     }
 
-    pub fn set_host_resource_limits(&mut self, limits: crate::budget::HostResourceLimits) {
+    #[cfg(test)]
+    fn set_host_resource_limits(&mut self, limits: crate::budget::HostResourceLimits) {
         self.host_limits = limits;
         match &mut self.runtime {
             Runtime::Tree(interpreter) => interpreter.set_host_resource_limits(limits),
