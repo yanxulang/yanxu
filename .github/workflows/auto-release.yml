@@ -51,8 +51,14 @@ jobs:
               echo "版本 $version 已由另一提交发布；请先更新版本号" >&2
               exit 1
             fi
-            if gh release view "$tag" >/dev/null 2>&1; then
-              should_release=false
+            if release_state="$(gh release view "$tag" \
+              --json isDraft,isPrerelease \
+              --jq '"\(.isDraft) \(.isPrerelease)"' 2>/dev/null)"; then
+              if [[ "$release_state" == "false false" ]]; then
+                should_release=false
+              else
+                should_release=true
+              fi
             else
               should_release=true
             fi
