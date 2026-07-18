@@ -146,7 +146,7 @@ yanbao bundle --manifest-path 我的窗口
 
 ## 从源码构建
 
-需要稳定版工具链的用户应优先安装发行制品。参与核心开发时：
+需要稳定版工具链的用户应优先安装发行制品。参与核心开发需要 Rust 1.89 或更高稳定版本：
 
 ```sh
 git clone https://github.com/YanXuLang/yanxu.git
