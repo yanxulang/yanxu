@@ -380,7 +380,8 @@ jobs:
                and .binary.version_info.build_mode == "release"' \
               "$metadata" >/dev/null
             gh attestation verify "dist/$archive" --repo "$REPOSITORY" \
-              --bundle "$provenance" --source-digest "${{ needs.validate.outputs.commit }}" >/dev/null
+              --signer-repo "$REPOSITORY" --bundle "$provenance" \
+              --source-digest "${{ needs.validate.outputs.commit }}" >/dev/null
           done
           gh release edit "$TAG" --repo "$REPOSITORY" --draft=false --title "言序 $VERSION"
 
