@@ -24,3 +24,40 @@
 - 如已知，建议的修复方向。
 
 维护者会尽快确认收到报告，在理解影响后给出修复与披露计划。请在公开披露前为修复预留合理时间。
+
+## 依赖与许可证门禁
+
+每次主线和拉取请求验收都会执行：
+
+- RustSec 漏洞检查，任何警告都会使门禁失败；
+- Rust 依赖许可证、来源、通配版本和重复版本检查；
+- Tree-sitter npm 依赖的 high、critical 漏洞检查；
+- 工作区及两个原生扩展示例的许可证元数据完整性检查。
+
+可达的 high 或 critical 漏洞不得忽略。上游暂时没有修复版本时，例外必须精确到 advisory，记录代码路径可达性、负责人和到期日期。重复依赖例外必须精确到包版本并说明上游约束，不得用宽泛规则跳过整类依赖。
+
+## 覆盖率与动态检查
+
+普通质量门禁生成工作区 LCOV 和 JSON 报告，并通过`scripts/check-coverage.sh`同时约束整体行、函数、区域及词法器、解析器、格式化器、字节码、应用归档、解释器、虚拟机、工程协议和包核心模块。
+
+定时与 Release 门禁还会使用固定 nightly 执行有界 Miri、AddressSanitizer、C ABI UndefinedBehaviorSanitizer，以及解析、格式化、字节码、YXB、清单、锁文件和工程协议的实际模糊测试。崩溃输入会作为工作流制品保留；修复后必须缩减为固定回归种子。
+
+## 正式发布制品
+
+正式 Release 在公开前必须完成全部质量与动态安全检查，并提供：
+
+- 六个原生目标的归档及 SHA-256；
+- 每个目标的`*.build.json`，记录源提交、标签、目标、编译配置、Rust/Cargo 版本、锁文件摘要、归档摘要和二进制版本信息；
+- 核心、共享包和两个原生扩展示例的 CycloneDX 1.5 SBOM；
+- 构建来源证明和 SBOM 证明的可下载 JSON Lines bundle。
+
+发布工作流会在公开 Release 前重新核对归档、构建元数据、SBOM 和来源证明。下载后可使用同一提交摘要独立复验，例如：
+
+```sh
+gh attestation verify yanxu-<目标>.tar.gz \
+  --repo YanXuLang/yanxu \
+  --bundle yanxu-<版本>.provenance.jsonl \
+  --source-digest <提交摘要>
+```
+
+任一目标安装复验失败时，Release 会被撤销稳定最新版资格并标记为预发布，修复后必须重新通过完整发布流程。
