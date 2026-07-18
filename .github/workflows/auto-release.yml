@@ -59,8 +59,8 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git tag -a "$tag" -m "言序 $version"
             git push origin "$tag"
-            # 标签推送会由 release.yml 的 push 触发器启动唯一一次发布。
-            should_release=false
+            # 仓库令牌创建的标签不会递归触发工作流，直接复用完整发布门禁。
+            should_release=true
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
