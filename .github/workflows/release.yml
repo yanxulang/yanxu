@@ -343,6 +343,18 @@ jobs:
             (cd dist && sha256sum --check "yanxu-$target.sha256")
             metadata="dist/yanxu-$target.build.json"
             test -s "$metadata"
+            extracted="$RUNNER_TEMP/yanxu-release-$target"
+            mkdir -p "$extracted"
+            case "$archive" in
+              *.zip) unzip -q "dist/$archive" -d "$extracted" ;;
+              *) tar -xzf "dist/$archive" -C "$extracted" ;;
+            esac
+            binary_name="yanxu"
+            case "$target" in *windows*) binary_name="yanxu.exe" ;; esac
+            test "$(find "$extracted" -type f -name "$binary_name" | wc -l)" -eq 1
+            binary="$(find "$extracted" -type f -name "$binary_name")"
+            binary_sha="$(sha256sum "$binary" | awk '{print $1}')"
+            binary_bytes="$(wc -c < "$binary" | tr -d ' ')"
             archive_sha="$(sha256sum "dist/$archive" | awk '{print $1}')"
             jq -e \
               --arg version "$VERSION" \
@@ -351,10 +363,15 @@ jobs:
               --arg target "$target" \
               --arg archive "$archive" \
               --arg archive_sha "$archive_sha" \
+              --arg binary "$binary_name" \
+              --arg binary_sha "$binary_sha" \
+              --argjson binary_bytes "$binary_bytes" \
               --arg lock "$lock_sha" \
               '.schema_version == 1 and .version == $version
                and .source.commit_sha == $commit and .source.ref == $ref
                and .artifact.name == $archive and .artifact.sha256 == $archive_sha
+               and .binary.name == $binary
+               and .binary.sha256 == $binary_sha and .binary.bytes == $binary_bytes
                and .build.target == $target and .build.profile == "release" and .build.locked
                and .build.cargo_lock_sha256 == $lock
                and .binary.version_info.version == $version
