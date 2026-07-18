@@ -13,6 +13,45 @@ permissions:
   contents: read
 
 jobs:
+  supply-chain:
+    name: 依赖、许可证与来源
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tree-sitter-yanxu/package-lock.json
+      - name: 安装依赖审计工具
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+      - name: 检查漏洞、许可证、来源与重复依赖
+        run: |
+          cargo audit --file Cargo.lock --deny warnings
+          cargo deny --workspace --locked check advisories bans licenses sources
+      - name: 检查 Tree-sitter 依赖
+        run: npm --prefix tree-sitter-yanxu --registry=https://registry.npmjs.org audit --audit-level=high
+      - name: 核对工作区与原生扩展依赖清单许可
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifests=(
+            Cargo.toml
+            fuzz/Cargo.toml
+            examples/embedding/rust-host/Cargo.toml
+            examples/embedding/wasi-host/Cargo.toml
+          )
+          for manifest in "${manifests[@]}"; do
+            cargo metadata --manifest-path "$manifest" --locked --format-version 1 --no-deps \
+              | jq -e '[.packages[] | select(.source == null and ((.license // "") | length == 0))] | length == 0' >/dev/null
+          done
+          cargo metadata --locked --format-version 1 --no-deps > "$RUNNER_TEMP/cargo-metadata.json"
+          jq -e '[.packages[] | select(.name | startswith("yanxu-native-"))] | length == 2' "$RUNNER_TEMP/cargo-metadata.json" >/dev/null
+
   rust:
     name: Rust · ${{ matrix.os }}
     strategy:
