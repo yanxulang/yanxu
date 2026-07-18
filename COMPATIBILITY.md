@@ -30,3 +30,5 @@
 ## 验证门槛
 
 所有 1.x 发行必须通过`compat/`历史语料、双执行器一致性、资源边界、严格 Clippy、WASI、JSON schema、Cargo 发布包、文档/官网/VS Code 生产构建。公开格式规则见[`spec/language/v1/formats.md`](spec/language/v1/formats.md)。
+
+CI 还会以不可变的`v1.1.15`标签为结构化基线，比较语言关键字与语法、Tree-sitter 节点、标准库 API、清单与锁文件字段、YXB/字节码格式、原生与嵌入 ABI、工程协议、稳定 CLI 和全部 JSON Schema。删除或改变既有契约要求主版本，纯新增公开契约要求次版本，公开面不变才允许补丁版本；浅克隆或缺失基线标签不能通过发布门禁。
