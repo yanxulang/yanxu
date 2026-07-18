@@ -1060,7 +1060,11 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         return Err(manifest_error(
             &path,
             None,
-            format!("1.1.15 仅支持“字节码”构建目标，不支持“{}”", build.target),
+            format!(
+                "言序 {} 仅支持“字节码”构建目标，不支持“{}”",
+                env!("CARGO_PKG_VERSION"),
+                build.target
+            ),
         ));
     }
 
@@ -1302,7 +1306,10 @@ fn parse_native_package(
         return Err(manifest_error(
             manifest_path,
             None,
-            format!("不支持原生扩展 ABI {abi_version}，1.1.15 支持 ABI 1、2"),
+            format!(
+                "不支持原生扩展 ABI {abi_version}，言序 {} 支持 ABI 1、2",
+                env!("CARGO_PKG_VERSION")
+            ),
         ));
     }
     let mut artifacts = BTreeMap::new();
@@ -2845,6 +2852,33 @@ mod tests {
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn format_diagnostics_report_the_running_package_version() {
+        let unsupported_build = parse(
+            "[包]\n格式=2\n名称='示例'\n版本='1.0.0'\n入口='主.yx'\n[构建]\n目标='原生'\n",
+            PathBuf::from(MANIFEST_NAME),
+            PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(
+            unsupported_build
+                .message
+                .contains(&format!("言序 {}", env!("CARGO_PKG_VERSION")))
+        );
+
+        let unsupported_abi = parse(
+            "[包]\n格式=2\n名称='示例'\n版本='1.0.0'\n入口='主.yx'\n[原生]\nABI=3\n",
+            PathBuf::from(MANIFEST_NAME),
+            PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(
+            unsupported_abi
+                .message
+                .contains(&format!("言序 {}", env!("CARGO_PKG_VERSION")))
+        );
     }
 
     fn write_archive(path: &Path, files: &[(&str, &[u8])]) {
