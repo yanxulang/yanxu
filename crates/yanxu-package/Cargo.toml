@@ -6,6 +6,11 @@ rust-version = "1.89"
 description = "言序清单、锁文件、权限与可复现依赖解析核心"
 license = "MIT"
 repository = "https://github.com/YanXuLang/yanxu"
+include = [
+    "/Cargo.toml",
+    "/LICENSE",
+    "/src/**/*.rs",
+]
 
 [dependencies]
 flate2 = "1"
