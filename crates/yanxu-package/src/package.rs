@@ -2144,6 +2144,7 @@ fn resolve_git(
             Command::new("git")
                 .arg("clone")
                 .arg("--quiet")
+                .arg("--")
                 .arg(url)
                 .arg(&cache),
             &cache,
@@ -2205,15 +2206,18 @@ fn resolve_git(
 }
 
 fn secure_git_source(url: &str) -> bool {
-    Path::new(url).exists()
-        || url.starts_with("file://")
-        || url.starts_with("https://")
-        || url.starts_with("ssh://")
-        || url.starts_with("git+ssh://")
-        || (!url.contains("://")
-            && url
-                .split_once(':')
-                .is_some_and(|(authority, path)| authority.contains('@') && !path.is_empty()))
+    !url.is_empty()
+        && !url.starts_with('-')
+        && !url.chars().any(char::is_control)
+        && (Path::new(url).exists()
+            || url.starts_with("file://")
+            || url.starts_with("https://")
+            || url.starts_with("ssh://")
+            || url.starts_with("git+ssh://")
+            || (!url.contains("://")
+                && url
+                    .split_once(':')
+                    .is_some_and(|(authority, path)| authority.contains('@') && !path.is_empty())))
 }
 
 fn resolve_registry(
@@ -3859,6 +3863,13 @@ mod tests {
 
     #[test]
     fn rejects_insecure_remote_sources_before_network_access() {
+        assert!(!secure_git_source("--upload-pack=/tmp/command"));
+        assert!(!secure_git_source(
+            "https://example.invalid/package.git\nnext"
+        ));
+        assert!(secure_git_source("https://example.invalid/package.git"));
+        assert!(secure_git_source("git@example.invalid:group/package.git"));
+
         let git_error =
             resolve_git("http://example.invalid/package.git", "HEAD", false).unwrap_err();
         assert!(git_error.message.contains("HTTPS 或 SSH"));
