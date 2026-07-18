@@ -550,7 +550,8 @@ fn resolve_graph_mode_locked(
     let manifest_checksum = file_checksum(&manifest.path)?;
     let lock_path = manifest.root.join(LOCK_NAME);
     let existing = use_existing
-        .then(|| read_lock(&lock_path).ok())
+        .then(|| read_optional_lock(&lock_path))
+        .transpose()?
         .flatten()
         .filter(|lock| {
             lock.lock_version == LOCK_FORMAT_VERSION
@@ -636,6 +637,15 @@ pub fn update_lock(
 
 pub fn read_lock(path: impl AsRef<Path>) -> Result<LockFile, ManifestError> {
     let path = path.as_ref();
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| manifest_error(path, None, format!("不能检查锁文件：{error}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(manifest_error(
+            path,
+            None,
+            "锁文件必须是普通文件，不得为符号链接或特殊文件",
+        ));
+    }
     let text = fs::read_to_string(path)
         .map_err(|error| manifest_error(path, None, format!("不能读取锁文件：{error}")))?;
     let lock: LockFile = toml::from_str(&text)
@@ -651,6 +661,18 @@ pub fn read_lock(path: impl AsRef<Path>) -> Result<LockFile, ManifestError> {
         ));
     }
     Ok(lock)
+}
+
+fn read_optional_lock(path: &Path) -> Result<Option<LockFile>, ManifestError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => read_lock(path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(manifest_error(
+            path,
+            None,
+            format!("不能检查锁文件：{error}"),
+        )),
+    }
 }
 
 /// 只读检查锁文件与当前清单、目标和格式是否一致，不解析或下载依赖。
@@ -3633,6 +3655,62 @@ mod tests {
         let error = read_lock(&path).unwrap_err();
         assert!(error.message.contains("不支持锁文件版本 3"));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolution_preserves_invalid_and_future_lock_files() {
+        let root = temp("lock-preserve-invalid");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言「应用」；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let lock_path = root.join(LOCK_NAME);
+
+        let future = "lock_version = 3\nmanifest_checksum = 'none'\npackage = []\n";
+        write(&lock_path, future);
+        let future_error = ensure_lock(&manifest, false).unwrap_err();
+        assert!(future_error.message.contains("不支持锁文件版本 3"));
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), future);
+
+        let malformed = "lock_version = [\n";
+        write(&lock_path, malformed);
+        let malformed_error = ensure_lock(&manifest, false).unwrap_err();
+        assert!(malformed_error.message.contains("锁文件格式无效"));
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), malformed);
+
+        fs::remove_file(&lock_path).unwrap();
+        fs::create_dir(&lock_path).unwrap();
+        let directory_error = ensure_lock(&manifest, false).unwrap_err();
+        assert!(directory_error.message.contains("锁文件必须是普通文件"));
+        assert!(lock_path.is_dir());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolution_rejects_lock_file_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("lock-symlink");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言「应用」；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let outside = root.with_extension("outside.lock");
+        write(&outside, "lock_version = 2\n");
+        symlink(&outside, root.join(LOCK_NAME)).unwrap();
+
+        let error = ensure_lock(&manifest, false).unwrap_err();
+        assert!(error.message.contains("不得为符号链接"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "lock_version = 2\n");
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_file(outside).ok();
     }
 
     #[test]
