@@ -4946,6 +4946,25 @@ impl Vm {
     }
 }
 
+impl Drop for Vm {
+    fn drop(&mut self) {
+        self.stack.clear();
+        self.frames.clear();
+        self.module_cache.clear();
+        self.application_module_cache.clear();
+        let environments = self
+            .heap_environments
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for environment in environments {
+            let mut environment = environment.borrow_mut();
+            environment.values.clear();
+            environment.parent = None;
+        }
+    }
+}
+
 impl Default for Vm {
     fn default() -> Self {
         Self::new()
@@ -5707,6 +5726,19 @@ fn mark_value(value: &VmValue, marked: &mut HashSet<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_vm_releases_the_global_environment() {
+        let globals = {
+            let statements = crate::parse("法 恒（）：数 则 归 1；终 定 值：法 为 恒；").unwrap();
+            let chunk = crate::bytecode::compile(&statements).unwrap();
+            let mut vm = Vm::silent();
+            let globals = Rc::downgrade(&vm.globals);
+            vm.execute(&chunk).unwrap();
+            globals
+        };
+        assert!(globals.upgrade().is_none());
+    }
 
     fn run(source: &str) -> Vm {
         let statements = crate::parse(source).unwrap();
