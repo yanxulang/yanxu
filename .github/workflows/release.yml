@@ -67,9 +67,11 @@ jobs:
             echo "CHANGELOG.md 缺少 ## $version" >&2
             exit 1
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "commit=$tag_commit"
+          } >> "$GITHUB_OUTPUT"
 
   quality:
     name: 标签提交完整质量门禁
@@ -182,10 +184,114 @@ jobs:
           if ($stackReserve -lt 8MB) {
             throw "Windows 发行运行时栈只保留 $stackReserve 字节"
           }
+      - name: 生成并上传目标构建元数据
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          YANXU_SOURCE_REF: refs/tags/${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          asset_dir="target/release-metadata/$TARGET"
+          mkdir -p "$asset_dir"
+          gh release download "$TAG" --repo "$REPOSITORY" --pattern "yanxu-$TARGET.*" --dir "$asset_dir"
+          case "$TARGET" in
+            *windows*) archive="$asset_dir/yanxu-$TARGET.zip"; binary="target/$TARGET/release/yanxu.exe" ;;
+            *) archive="$asset_dir/yanxu-$TARGET.tar.gz"; binary="target/$TARGET/release/yanxu" ;;
+          esac
+          checksum="$asset_dir/yanxu-$TARGET.sha256"
+          test -f "$archive"
+          test -f "$checksum"
+          expected="$(awk 'NR == 1 {print $1}' "$checksum" | tr '[:upper:]' '[:lower:]')"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$archive" | awk '{print $1}')"
+          else
+            actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          fi
+          test "$expected" = "$actual"
+          metadata="$asset_dir/yanxu-$TARGET.build.json"
+          scripts/generate-build-metadata.sh "$TARGET" "$archive" "$binary" "$metadata"
+          gh release upload "$TAG" "$metadata" --repo "$REPOSITORY" --clobber
+
+  supply-chain:
+    name: SBOM 与构建证明
+    needs: [validate, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.tag }}
+      - name: 安装 SBOM 工具
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cargo-cyclonedx@0.5.9
+      - name: 汇总目标制品并生成 SBOM
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/release"
+          mkdir -p "$release_dir"
+          gh release download "$TAG" --repo "$REPOSITORY" --dir "$release_dir" \
+            --pattern 'yanxu-*.tar.gz' \
+            --pattern 'yanxu-*.zip' \
+            --pattern 'yanxu-*.sha256' \
+            --pattern 'yanxu-*.build.json'
+          test "$(find "$release_dir" -maxdepth 1 -type f | wc -l)" -eq 18
+          scripts/generate-sbom.sh "$release_dir/yanxu-$VERSION.cdx.json"
+      - name: 创建构建来源证明
+        id: provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/*.tar.gz
+            ${{ runner.temp }}/release/*.zip
+            ${{ runner.temp }}/release/*.build.json
+            ${{ runner.temp }}/release/*.cdx.json
+      - name: 创建 SBOM 证明
+        id: sbom
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/*.tar.gz
+            ${{ runner.temp }}/release/*.zip
+          sbom-path: ${{ runner.temp }}/release/yanxu-${{ needs.validate.outputs.version }}.cdx.json
+      - name: 上传 SBOM 与可下载证明
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/release"
+          provenance="$release_dir/yanxu-$VERSION.provenance.jsonl"
+          sbom_attestation="$release_dir/yanxu-$VERSION.sbom-attestation.jsonl"
+          cp "$PROVENANCE_BUNDLE" "$provenance"
+          cp "$SBOM_BUNDLE" "$sbom_attestation"
+          test -s "$provenance"
+          test -s "$sbom_attestation"
+          gh release upload "$TAG" \
+            "$release_dir/"*.cdx.json \
+            "$provenance" "$sbom_attestation" \
+            --repo "$REPOSITORY" --clobber
 
   publish-release:
     name: 发布完整 Release
-    needs: [validate, binaries]
+    needs: [validate, binaries, supply-chain]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -201,7 +307,29 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           gh release download "$TAG" --repo "$REPOSITORY" --dir dist
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 12
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 24
+          test "$(find dist -maxdepth 1 -name '*.cdx.json' -type f | wc -l)" -eq 4
+          sbom="dist/yanxu-$VERSION.cdx.json"
+          provenance="dist/yanxu-$VERSION.provenance.jsonl"
+          sbom_attestation="dist/yanxu-$VERSION.sbom-attestation.jsonl"
+          test -s "$sbom"
+          test -s "$provenance"
+          test -s "$sbom_attestation"
+          for component_sbom in dist/*.cdx.json; do
+            jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.5" and (.dependencies | length) > 0' \
+              "$component_sbom" >/dev/null
+            if grep -F "$GITHUB_WORKSPACE" "$component_sbom"; then
+              echo "SBOM 含构建机绝对路径：$component_sbom" >&2
+              exit 1
+            fi
+          done
+          lock_sha="$(sha256sum Cargo.lock | awk '{print $1}')"
+          jq -e --arg version "$VERSION" --arg commit "${{ needs.validate.outputs.commit }}" --arg lock "$lock_sha" \
+            '.bomFormat == "CycloneDX" and .specVersion == "1.5"
+             and .metadata.component.version == $version
+             and ([.metadata.properties[] | select(.name == "cdx:yanxu:source:commit" and .value == $commit)] | length) == 1
+             and ([.metadata.properties[] | select(.name == "cdx:yanxu:cargo-lock:sha256" and .value == $lock)] | length) == 1' \
+            "$sbom" >/dev/null
           targets=(
             x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
             x86_64-apple-darwin aarch64-apple-darwin
@@ -212,6 +340,29 @@ jobs:
             test -f "dist/$archive"
             test -f "dist/yanxu-$target.sha256"
             (cd dist && sha256sum --check "yanxu-$target.sha256")
+            metadata="dist/yanxu-$target.build.json"
+            test -s "$metadata"
+            archive_sha="$(sha256sum "dist/$archive" | awk '{print $1}')"
+            jq -e \
+              --arg version "$VERSION" \
+              --arg commit "${{ needs.validate.outputs.commit }}" \
+              --arg ref "refs/tags/$TAG" \
+              --arg target "$target" \
+              --arg archive "$archive" \
+              --arg archive_sha "$archive_sha" \
+              --arg lock "$lock_sha" \
+              '.schema_version == 1 and .version == $version
+               and .source.commit_sha == $commit and .source.ref == $ref
+               and .artifact.name == $archive and .artifact.sha256 == $archive_sha
+               and .build.target == $target and .build.profile == "release" and .build.locked
+               and .build.cargo_lock_sha256 == $lock
+               and .binary.version_info.version == $version
+               and .binary.version_info.commit_sha == $commit
+               and .binary.version_info.build_target == $target
+               and .binary.version_info.build_mode == "release"' \
+              "$metadata" >/dev/null
+            gh attestation verify "dist/$archive" --repo "$REPOSITORY" \
+              --bundle "$provenance" --source-digest "${{ needs.validate.outputs.commit }}" >/dev/null
           done
           gh release edit "$TAG" --repo "$REPOSITORY" --draft=false --title "言序 $VERSION"
 

@@ -28,7 +28,7 @@ jobs:
       - name: 安装依赖审计工具
         uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
         with:
-          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-cyclonedx@0.5.9
       - name: 检查漏洞、许可证、来源与重复依赖
         run: |
           cargo audit --file Cargo.lock --deny warnings
@@ -51,6 +51,19 @@ jobs:
           done
           cargo metadata --locked --format-version 1 --no-deps > "$RUNNER_TEMP/cargo-metadata.json"
           jq -e '[.packages[] | select(.name | startswith("yanxu-native-"))] | length == 2' "$RUNNER_TEMP/cargo-metadata.json" >/dev/null
+      - name: 验证可复现 SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu") | .version')"
+          first="$RUNNER_TEMP/sbom-first"
+          second="$RUNNER_TEMP/sbom-second"
+          mkdir -p "$first" "$second"
+          scripts/generate-sbom.sh "$first/yanxu-$version.cdx.json"
+          scripts/generate-sbom.sh "$second/yanxu-$version.cdx.json"
+          test "$(find "$first" -maxdepth 1 -name '*.cdx.json' -type f | wc -l)" -eq 4
+          test "$(find "$second" -maxdepth 1 -name '*.cdx.json' -type f | wc -l)" -eq 4
+          diff -ru "$first" "$second"
 
   coverage:
     name: 覆盖率门禁
@@ -261,6 +274,29 @@ jobs:
         run: |
           cargo package -p yanxu-package --locked
           cargo build -p yanxu --release --locked
+      - name: 验证目标构建元数据
+        shell: bash
+        env:
+          YANXU_SOURCE_REF: ${{ inputs.ref || github.sha }}
+        run: |
+          set -euo pipefail
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu") | .version')"
+          archive="$RUNNER_TEMP/yanxu-$target.tar.gz"
+          metadata="$RUNNER_TEMP/yanxu-$target.build.json"
+          tar -czf "$archive" -C target/release yanxu
+          scripts/generate-build-metadata.sh "$target" "$archive" target/release/yanxu "$metadata"
+          jq -e --arg version "$version" --arg target "$target" \
+            '.schema_version == 1 and .version == $version and .build.target == $target
+             and .binary.version_info.version == $version
+             and .binary.version_info.build_target == $target
+             and .binary.version_info.build_mode == "release"' \
+            "$metadata" >/dev/null
+          if scripts/generate-build-metadata.sh \
+            invalid-target "$archive" target/release/yanxu "$RUNNER_TEMP/invalid.build.json"; then
+            echo "构建元数据不应接受与二进制不一致的目标" >&2
+            exit 1
+          fi
       - name: 安装 Tree-sitter 工具
         run: npm --prefix tree-sitter-yanxu ci
       - name: 生成并测试 Tree-sitter
