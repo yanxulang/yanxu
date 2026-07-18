@@ -772,11 +772,20 @@ fn vulnerability_code(id: &str) -> String {
 }
 
 fn valid_vulnerability_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 96
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    if id.is_empty() || id.len() > 96 {
+        return false;
+    }
+    let mut previous_was_separator = true;
+    for byte in id.bytes() {
+        if byte.is_ascii_uppercase() || byte.is_ascii_digit() {
+            previous_was_separator = false;
+        } else if byte == b'-' && !previous_was_separator {
+            previous_was_separator = true;
+        } else {
+            return false;
+        }
+    }
+    !previous_was_separator
 }
 
 fn exact_git_revision(revision: &str) -> bool {
@@ -1295,5 +1304,33 @@ mod tests {
         assert!(codes.contains("AUDIT_VULNERABILITY_METADATA_INVALID"));
         assert!(!codes.contains("AUDIT_VULNERABILITY_METADATA_MISSING"));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vulnerability_ids_keep_diagnostic_codes_unambiguous_and_bounded() {
+        for id in ["CVE-2026-1234", "GHSA-2345-6789-ABCD", "RUSTSEC-2026-0001"] {
+            assert!(valid_vulnerability_id(id));
+            assert!(vulnerability_code(id).len() <= 128);
+        }
+        for id in [
+            "cve-2026-1234",
+            "YXSA_2026_0001",
+            "YXSA.2026.0001",
+            "YXSA:2026:0001",
+            "-YXSA-2026-0001",
+            "YXSA--2026-0001",
+            "YXSA-2026-0001-",
+        ] {
+            assert!(!valid_vulnerability_id(id));
+        }
+        assert_eq!(
+            vulnerability_code("YXSA-2026-0001"),
+            "AUDIT_VULNERABILITY_YXSA_2026_0001"
+        );
+        assert_ne!(
+            vulnerability_code("YXSA-2026-0001"),
+            vulnerability_code("YXSA-2026-0002")
+        );
+        assert!(!valid_vulnerability_id(&"A".repeat(97)));
     }
 }
