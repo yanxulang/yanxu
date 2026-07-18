@@ -250,16 +250,41 @@ pub struct LockedPackage {
     pub minimum_yanxu: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RegistryIndex {
     versions: Vec<RegistryRelease>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RegistryRelease {
     version: String,
     url: String,
     checksum: String,
+    #[serde(default)]
+    yanked: Option<bool>,
+    #[serde(default)]
+    vulnerabilities: Option<Vec<RegistryVulnerability>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[doc(hidden)]
+pub struct RegistryVulnerability {
+    pub id: String,
+    pub severity: String,
+    pub summary: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub withdrawn: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct RegistryReleaseMetadata {
+    pub url: String,
+    pub checksum: String,
+    pub yanked: Option<bool>,
+    pub vulnerabilities: Option<Vec<RegistryVulnerability>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2079,6 +2104,13 @@ fn resolve_git(
     revision: &str,
     offline: bool,
 ) -> Result<(PathBuf, String), ManifestError> {
+    if url.starts_with("http://") || url.starts_with("git://") {
+        return Err(manifest_error(
+            Path::new(url),
+            None,
+            "远程 Git 依赖须使用 HTTPS 或 SSH",
+        ));
+    }
     if revision.is_empty()
         || revision.starts_with('-')
         || revision.chars().any(|character| character.is_control())
@@ -2173,17 +2205,17 @@ fn resolve_registry(
     locked_checksum: Option<&str>,
     offline: bool,
 ) -> Result<(PathBuf, Version), ManifestError> {
-    let registry_path = registry
-        .strip_prefix("file://")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let path = PathBuf::from(registry);
-            path.is_dir().then_some(path)
-        });
-    if let Some(registry_path) = registry_path {
+    if let Some(registry_path) = local_registry_path(registry) {
         let package_root = registry_path.join(name);
         let version = select_registry_version(&package_root, requirement, locked.as_ref())?;
         return Ok((package_root.join(version.to_string()), version));
+    }
+    if !registry.starts_with("https://") {
+        return Err(manifest_error(
+            Path::new(registry),
+            None,
+            "远程包索引须使用 HTTPS",
+        ));
     }
     if offline && locked.is_none() {
         return Err(manifest_error(
@@ -2214,11 +2246,7 @@ fn resolve_registry(
         &format!("{}/{name}/index.json", registry.trim_end_matches('/')),
         &index_path,
     )?;
-    let index_text = fs::read_to_string(&index_path).map_err(|error| {
-        manifest_error(&index_path, None, format!("不能读取索引元数据：{error}"))
-    })?;
-    let index: RegistryIndex = serde_json::from_str(&index_text)
-        .map_err(|error| manifest_error(&index_path, None, format!("索引元数据无效：{error}")))?;
+    let index = read_registry_index(&index_path)?;
     let mut candidates = index
         .versions
         .into_iter()
@@ -2237,11 +2265,25 @@ fn resolve_registry(
             format!("远程索引中没有满足 {requirement} 的“{name}”版本"),
         )
     })?;
+    if !valid_sha256(&release.checksum) {
+        return Err(manifest_error(
+            &index_path,
+            None,
+            format!("索引版本 {version} 缺少合法的制品 SHA-256"),
+        ));
+    }
+    if !release.url.starts_with("https://") {
+        return Err(manifest_error(
+            &index_path,
+            None,
+            format!("索引版本 {version} 的制品地址须使用 HTTPS"),
+        ));
+    }
     let destination = registry_cache.join(name).join(version.to_string());
     let archive = registry_cache.join(format!("{name}-{version}.tar.gz"));
     download(&release.url, &archive)?;
     let actual_checksum = file_checksum(&archive)?;
-    if !release.checksum.is_empty() && actual_checksum != release.checksum {
+    if !actual_checksum.eq_ignore_ascii_case(&release.checksum) {
         return Err(manifest_error(
             &archive,
             None,
@@ -2277,6 +2319,75 @@ fn resolve_registry(
     fs::remove_dir_all(&temporary).ok();
     fs::remove_file(&archive).ok();
     Ok((destination, version))
+}
+
+#[doc(hidden)]
+pub fn registry_release_metadata(
+    registry: &str,
+    name: &str,
+    version: &Version,
+    offline: bool,
+) -> Result<Option<RegistryReleaseMetadata>, ManifestError> {
+    let index_path = if let Some(registry_path) = local_registry_path(registry) {
+        registry_path.join(name).join("index.json")
+    } else {
+        if !registry.starts_with("https://") {
+            return Err(manifest_error(
+                Path::new(registry),
+                None,
+                "远程包索引须使用 HTTPS",
+            ));
+        }
+        let registry_cache = cache_root().join("registry").join(short_hash(registry));
+        if !offline {
+            fs::create_dir_all(&registry_cache).map_err(|error| {
+                manifest_error(&registry_cache, None, format!("不能创建索引缓存：{error}"))
+            })?;
+        }
+        let index_path = registry_cache.join(format!("{}-index.json", short_hash(name)));
+        if !offline {
+            download(
+                &format!("{}/{name}/index.json", registry.trim_end_matches('/')),
+                &index_path,
+            )?;
+        }
+        index_path
+    };
+    if !index_path.is_file() {
+        return Ok(None);
+    }
+    let index = read_registry_index(&index_path)?;
+    Ok(index
+        .versions
+        .into_iter()
+        .find(|release| release.version == version.to_string())
+        .map(|release| RegistryReleaseMetadata {
+            url: release.url,
+            checksum: release.checksum,
+            yanked: release.yanked,
+            vulnerabilities: release.vulnerabilities,
+        }))
+}
+
+fn local_registry_path(registry: &str) -> Option<PathBuf> {
+    registry
+        .strip_prefix("file://")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let path = PathBuf::from(registry);
+            path.is_dir().then_some(path)
+        })
+}
+
+fn read_registry_index(path: &Path) -> Result<RegistryIndex, ManifestError> {
+    let index_text = fs::read_to_string(path)
+        .map_err(|error| manifest_error(path, None, format!("不能读取索引元数据：{error}")))?;
+    serde_json::from_str(&index_text)
+        .map_err(|error| manifest_error(path, None, format!("索引元数据无效：{error}")))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn reusable_registry_cache(
@@ -2725,22 +2836,49 @@ fn cache_root() -> PathBuf {
 }
 
 fn download(url: &str, destination: &Path) -> Result<(), ManifestError> {
-    run_command(
-        Command::new("curl")
-            .arg("--fail")
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("--location")
-            .arg("--max-time")
-            .arg("30")
-            .arg("--max-filesize")
-            .arg(ARCHIVE_MAX_COMPRESSED_BYTES.to_string())
-            .arg("--output")
-            .arg(destination)
-            .arg(url),
-        destination,
-        "下载索引资源",
-    )
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| manifest_error(destination, None, format!("不能创建下载目录：{error}")))?;
+    let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "registry-download".into());
+    let temporary = parent.join(format!(
+        ".{file_name}.download-{}-{sequence}",
+        std::process::id()
+    ));
+    let result = (|| {
+        run_command(
+            Command::new("curl")
+                .arg("--proto")
+                .arg("=https")
+                .arg("--proto-redir")
+                .arg("=https")
+                .arg("--tlsv1.2")
+                .arg("--fail")
+                .arg("--silent")
+                .arg("--show-error")
+                .arg("--location")
+                .arg("--max-time")
+                .arg("30")
+                .arg("--max-filesize")
+                .arg(ARCHIVE_MAX_COMPRESSED_BYTES.to_string())
+                .arg("--output")
+                .arg(&temporary)
+                .arg(url),
+            destination,
+            "下载索引资源",
+        )?;
+        let bytes = fs::read(&temporary).map_err(|error| {
+            manifest_error(destination, None, format!("不能读取下载结果：{error}"))
+        })?;
+        crate::storage::atomic_write(destination, &bytes).map_err(|error| {
+            manifest_error(destination, None, format!("不能原子保存下载结果：{error}"))
+        })
+    })();
+    fs::remove_file(temporary).ok();
+    result
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), ManifestError> {
@@ -3599,6 +3737,109 @@ mod tests {
         .unwrap();
         assert_eq!(selected, Version::new(1, 5, 0));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reads_explicit_registry_security_metadata_without_network_access() {
+        let root = temp("registry-audit-metadata");
+        let registry = root.join("索引");
+        write(
+            &registry.join("示例/index.json"),
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "versions": [
+                    {
+                        "version": "1.2.3",
+                        "url": "https://packages.example.invalid/示例-1.2.3.tar.gz",
+                        "checksum": "a".repeat(64),
+                        "yanked": true,
+                        "vulnerabilities": [
+                            {
+                                "id": "YXSA-2026-0001",
+                                "severity": "high",
+                                "summary": "示例漏洞",
+                                "url": "https://security.example.invalid/YXSA-2026-0001"
+                            },
+                            {
+                                "id": "YXSA-2026-0000",
+                                "severity": "low",
+                                "summary": "已撤回记录",
+                                "withdrawn": true
+                            }
+                        ]
+                    },
+                    {
+                        "version": "1.2.4",
+                        "url": "https://packages.example.invalid/示例-1.2.4.tar.gz",
+                        "checksum": "B".repeat(64)
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
+
+        let metadata = registry_release_metadata(
+            registry.to_str().unwrap(),
+            "示例",
+            &Version::new(1, 2, 3),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(metadata.yanked, Some(true));
+        assert_eq!(metadata.checksum, "a".repeat(64));
+        let vulnerabilities = metadata.vulnerabilities.unwrap();
+        assert_eq!(vulnerabilities.len(), 2);
+        assert_eq!(vulnerabilities[0].id, "YXSA-2026-0001");
+        assert!(vulnerabilities[1].withdrawn);
+        let unspecified = registry_release_metadata(
+            registry.to_str().unwrap(),
+            "示例",
+            &Version::new(1, 2, 4),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(unspecified.yanked, None);
+        assert_eq!(unspecified.vulnerabilities, None);
+        assert!(valid_sha256(&unspecified.checksum));
+        assert!(
+            registry_release_metadata(
+                registry.to_str().unwrap(),
+                "示例",
+                &Version::new(9, 9, 9),
+                true,
+            )
+            .unwrap()
+            .is_none()
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_insecure_remote_sources_before_network_access() {
+        let git_error =
+            resolve_git("http://example.invalid/package.git", "HEAD", false).unwrap_err();
+        assert!(git_error.message.contains("HTTPS 或 SSH"));
+
+        let registry_error = resolve_registry(
+            "示例",
+            &VersionReq::STAR,
+            "http://packages.example.invalid/v1",
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(registry_error.message.contains("索引须使用 HTTPS"));
+
+        let metadata_error = registry_release_metadata(
+            "http://packages.example.invalid/v1",
+            "示例",
+            &Version::new(1, 0, 0),
+            true,
+        )
+        .unwrap_err();
+        assert!(metadata_error.message.contains("索引须使用 HTTPS"));
     }
 
     #[test]
