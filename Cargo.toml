@@ -1,6 +1,6 @@
 [package]
 name = "yanxu"
-version = "1.1.15"
+version = "1.1.16"
 edition = "2024"
 description = "言序：以 Rust 编写的文言风格解释型编程语言"
 license = "MIT"
@@ -71,7 +71,7 @@ sha2 = "0.10"
 toml = "0.8"
 tar = "0.4"
 url = "2"
-yanxu-package = { path = "crates/yanxu-package", version = "1.1.15" }
+yanxu-package = { path = "crates/yanxu-package", version = "1.1.16" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8"
