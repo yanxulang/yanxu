@@ -1,5 +1,30 @@
 # 变更记录
 
+## 1.1.16
+
+### CIDR 网络授权
+
+- 包清单的`网络`列表支持 IPv4 与 IPv6 CIDR，例如`198.18.0.0/15`和`fd00::/8`。
+- HTTP 与套接字在 DNS 解析后使用同一 CIDR 规则复核真实地址；`*`仍不会隐式授权敏感地址。
+- 宿主与应用权限求交集时，CIDR/CIDR、CIDR/单 IP 与 CIDR/带端口 IP 均保留更窄授权，互不相交的范围保持拒绝。
+- `本地网络 = true`的范围不变；VPN fake-IP 等特殊网段必须由应用显式声明，不会自动开放给其他应用。
+
+### 兼容与升级
+
+- 不改变语言规范、标准库签名、原生 ABI v1/v2、清单格式、锁文件格式、YXB 或 Bundle 格式。
+- 需要 CIDR 授权的应用须声明最低言序 1.1.16 并重新构建；既有主机、单 IP 与端口授权语义保持兼容。
+
+### 安装
+
+macOS 与 Linux 可固定安装本版本：
+
+```sh
+curl -fsSL https://get.yanxu.dev | YANXU_VERSION=1.1.16 sh
+```
+
+Windows PowerShell 可先设置`$env:YANXU_VERSION = "1.1.16"`，再运行
+`irm https://get.yanxu.dev/windows | iex`。
+
 ## 1.1.15
 
 ### 显式本地网络权限
