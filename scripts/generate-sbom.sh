@@ -9,6 +9,14 @@ sha256_file() {
   fi
 }
 
+sha256_text() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+  else
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  fi
+}
+
 if [ "$#" -ne 1 ]; then
   echo "用法：scripts/generate-sbom.sh <输出>" >&2
   exit 2
@@ -40,6 +48,14 @@ normalize_bom() {
   destination=$2
   expected_name=$3
   expected_version=$4
+  serial_hex=$(sha256_text "$commit_sha:$expected_name:$expected_version")
+  serial_number=$(printf '%s\n' "$serial_hex" | sed -E \
+    's/^(.{8})(.{4}).(.{3}).(.{3})(.{12}).*$/urn:uuid:\1-\2-8\3-a\4-\5/')
+  if ! printf '%s\n' "$serial_number" | grep -Eq \
+    '^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'; then
+    echo "不能从组件身份生成 CycloneDX 序列号" >&2
+    exit 1
+  fi
   test -s "$input"
   mv "$input" "$destination"
   jq \
@@ -47,6 +63,7 @@ normalize_bom() {
     --arg package_version "$package_version" \
     --arg native_v1_version "$native_v1_version" \
     --arg native_v2_version "$native_v2_version" \
+    --arg serial_number "$serial_number" \
     --arg commit "$commit_sha" \
     --arg lock_sha "$lock_sha" \
     '
@@ -67,6 +84,7 @@ normalize_bom() {
           sub("\\?download_url=file://.*$"; "")
         else . end;
       walk(if type == "string" then normalize_workspace else . end)
+      | .serialNumber = $serial_number
       | .metadata.properties += [
           {name: "cdx:yanxu:source:commit", value: $commit},
           {name: "cdx:yanxu:cargo-lock:sha256", value: $lock_sha},
@@ -78,9 +96,11 @@ normalize_bom() {
   jq -e \
     --arg name "$expected_name" \
     --arg expected_version "$expected_version" \
+    --arg serial_number "$serial_number" \
     --arg commit "$commit_sha" \
     --arg lock_sha "$lock_sha" \
     '.bomFormat == "CycloneDX" and .specVersion == "1.5"
+     and .serialNumber == $serial_number
      and .metadata.component.name == $name and .metadata.component.version == $expected_version
      and (.dependencies | length) > 0
      and ([.metadata.properties[] | select(.name == "cdx:yanxu:source:commit" and .value == $commit)] | length) == 1

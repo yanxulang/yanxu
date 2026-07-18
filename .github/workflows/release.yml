@@ -317,7 +317,9 @@ jobs:
           test -s "$provenance"
           test -s "$sbom_attestation"
           for component_sbom in dist/*.cdx.json; do
-            jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.5" and (.dependencies | length) > 0' \
+            jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.5"
+              and (.serialNumber | test("^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))
+              and (.dependencies | length) > 0' \
               "$component_sbom" >/dev/null
             if grep -F "$GITHUB_WORKSPACE" "$component_sbom"; then
               echo "SBOM 含构建机绝对路径：$component_sbom" >&2
