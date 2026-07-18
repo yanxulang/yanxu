@@ -682,6 +682,40 @@ fn network_standard_module_matches_both_runtimes() {
 }
 
 #[test]
+fn binary_http_response_budget_is_distinct_from_socket_reads_in_both_runtimes() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let body_length = yanxu::stdlib::SOCKET_MAX_READ_BYTES as usize + 1;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {body_length}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.write_all(&vec![0x5a; body_length]).unwrap();
+        }
+    });
+    let source = format!(
+        r#"
+        引「标准:网络」为 网络；引「标准:字节」为 字节；
+        定 应：典<文,任意> 为 网络.请求字节（「GET」，「http://{address}/large」，{{}}，空，5000，8388608）；
+        言 字节.长度（应【「正文」】）；
+        "#
+    );
+    let (tree, vm) = execute_both(&source, Path::new("."));
+    assert_eq!(tree, [body_length.to_string()]);
+    assert_eq!(tree, vm);
+    server.join().unwrap();
+}
+
+#[test]
 fn file_standard_module_mutations_match_in_isolated_directories() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

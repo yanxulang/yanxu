@@ -1809,6 +1809,18 @@ mod tests {
     }
 
     #[test]
+    fn yxb_execution_obeys_the_host_byte_value_limit() {
+        let (root, archive) =
+            compile_test_application("引「标准:字节」为 字节；字节.从文字（「123456」）；\n", "");
+        let mut vm = crate::vm::Vm::silent();
+        vm.set_host_resource_limits(crate::budget::HostResourceLimits::new(5, 5, 4).unwrap());
+        let error = vm.execute_application(&archive).unwrap_err();
+        assert!(error.to_string().contains("BYTES_LIMIT"), "{error}");
+        assert!(error.to_string().contains("宿主 5 字节上限"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn yxb_rejects_invalid_structure_resources_and_imports() {
         let (root, archive) =
             compile_test_application("引「标准:环境」为 环境；言 1；\n", "环境=[]");

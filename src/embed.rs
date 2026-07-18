@@ -54,6 +54,7 @@ impl Default for EngineConfig {
 
 pub struct Engine {
     config: EngineConfig,
+    host_limits: crate::budget::HostResourceLimits,
     runtime: Runtime,
     type_history: Vec<crate::ast::Stmt>,
 }
@@ -97,15 +98,20 @@ impl std::error::Error for EngineError {}
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
-        let runtime = Self::build_runtime(&config);
+        let host_limits = crate::budget::HostResourceLimits::default();
+        let runtime = Self::build_runtime(&config, host_limits);
         Self {
             config,
+            host_limits,
             runtime,
             type_history: Vec::new(),
         }
     }
 
-    fn build_runtime(config: &EngineConfig) -> Runtime {
+    fn build_runtime(
+        config: &EngineConfig,
+        host_limits: crate::budget::HostResourceLimits,
+    ) -> Runtime {
         let mut runtime = match config.backend {
             Backend::Tree => Runtime::Tree(Box::new(Interpreter::silent_with_permissions(
                 config.permissions.clone(),
@@ -117,10 +123,12 @@ impl Engine {
         match &mut runtime {
             Runtime::Tree(interpreter) => {
                 interpreter.set_budget(config.budget);
+                interpreter.set_host_resource_limits(host_limits);
                 interpreter.set_arguments(config.arguments.clone());
             }
             Runtime::Bytecode(vm) => {
                 vm.set_budget(config.budget);
+                vm.set_host_resource_limits(host_limits);
                 vm.set_arguments(config.arguments.clone());
             }
         }
@@ -131,9 +139,17 @@ impl Engine {
         &self.config
     }
 
+    pub fn set_host_resource_limits(&mut self, limits: crate::budget::HostResourceLimits) {
+        self.host_limits = limits;
+        match &mut self.runtime {
+            Runtime::Tree(interpreter) => interpreter.set_host_resource_limits(limits),
+            Runtime::Bytecode(vm) => vm.set_host_resource_limits(limits),
+        }
+    }
+
     /// 清空持久运行时、类型历史、输出与所有尚未释放的宿主资源。
     pub fn reset(&mut self) {
-        self.runtime = Self::build_runtime(&self.config);
+        self.runtime = Self::build_runtime(&self.config, self.host_limits);
         self.type_history.clear();
     }
 
@@ -272,6 +288,26 @@ mod tests {
             assert_eq!(execution.output, ["2"]);
             assert_eq!(execution.value_type, "字节串");
             assert_eq!(execution.value_bytes, Some(vec![0, 255, 128]));
+        }
+    }
+
+    #[test]
+    fn embedded_host_byte_limits_apply_to_both_backends_and_survive_reset() {
+        for backend in [Backend::Tree, Backend::Bytecode] {
+            let mut engine = Engine::new(EngineConfig::sandboxed(backend));
+            engine
+                .set_host_resource_limits(crate::budget::HostResourceLimits::new(5, 5, 4).unwrap());
+            let error = engine
+                .run("引「标准:字节」为 字节；字节.从文字（「123456」）；")
+                .unwrap_err();
+            assert_eq!(error.kind, EngineErrorKind::Runtime);
+            assert!(error.message.contains("BYTES_LIMIT"), "{error}");
+            assert!(error.message.contains("宿主 5 字节上限"), "{error}");
+
+            let execution = engine
+                .run("引「标准:字节」为 字节；字节.从文字（「12345」）；")
+                .unwrap();
+            assert_eq!(execution.value_bytes, Some(b"12345".to_vec()));
         }
     }
 
