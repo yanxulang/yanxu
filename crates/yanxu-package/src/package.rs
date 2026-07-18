@@ -366,10 +366,17 @@ fn acquire_project_lock(root: &Path) -> Result<crate::storage::ProjectLock, Mani
 
 pub fn discover(start: impl AsRef<Path>) -> Result<Option<Manifest>, ManifestError> {
     let start = start.as_ref();
-    let mut directory = if start.is_dir() {
+    let absolute_start = if start.is_absolute() {
         start.to_path_buf()
     } else {
-        start
+        std::env::current_dir()
+            .map_err(|error| manifest_error(start, None, format!("不能定位当前目录：{error}")))?
+            .join(start)
+    };
+    let mut directory = if absolute_start.is_dir() {
+        absolute_start
+    } else {
+        absolute_start
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf()
@@ -3029,6 +3036,29 @@ mod tests {
                 .message
                 .contains(&format!("言序 {}", env!("CARGO_PKG_VERSION")))
         );
+    }
+
+    #[test]
+    fn discovers_relative_projects_with_absolute_manifest_identity() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let relative_root = PathBuf::from(format!(".yanxu-relative-discovery-{unique}"));
+        write(
+            &relative_root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='相对工程'\n版本='1.0.0'\n入口='src/主.yx'\n",
+        );
+        write(&relative_root.join("src/主.yx"), "言「相对工程」；\n");
+
+        let manifest = discover(relative_root.join("src/主.yx")).unwrap().unwrap();
+        assert!(manifest.root.is_absolute());
+        assert!(manifest.path.is_absolute());
+        assert_eq!(
+            manifest.root,
+            std::env::current_dir().unwrap().join(&relative_root)
+        );
+        fs::remove_dir_all(relative_root).unwrap();
     }
 
     fn write_archive(path: &Path, files: &[(&str, &[u8])]) {
