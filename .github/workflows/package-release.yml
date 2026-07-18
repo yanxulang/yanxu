@@ -46,8 +46,8 @@ jobs:
           git fetch origin main --tags
           tag_commit="$(git rev-list -n 1 "$tag")"
           main_commit="$(git rev-parse origin/main)"
-          if [[ "$tag_commit" != "$main_commit" ]]; then
-            echo "共享包标签必须精确指向 origin/main 验收提交" >&2
+          if ! git merge-base --is-ancestor "$tag_commit" "$main_commit"; then
+            echo "共享包标签提交不属于 origin/main 主线" >&2
             exit 1
           fi
           grep -Fqx "## $version" CHANGELOG.md

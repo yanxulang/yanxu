@@ -37,6 +37,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          git fetch origin main --no-tags
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "自动发布只能从 main 分支触发，当前为 $GITHUB_REF" >&2
+            exit 1
+          fi
+          main_commit="$(git rev-parse origin/main)"
+          if [[ "$GITHUB_SHA" != "$main_commit" ]]; then
+            echo "验收提交 $GITHUB_SHA 已不是 origin/main 最新提交 $main_commit" >&2
+            exit 1
+          fi
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yanxu") | .version')"
           tag="v$version"
           if ! grep -Fqx "## $version" CHANGELOG.md; then
@@ -51,14 +61,24 @@ jobs:
               echo "版本 $version 已由另一提交发布；请先更新版本号" >&2
               exit 1
             fi
-            if release_state="$(gh release view "$tag" \
-              --json isDraft,isPrerelease \
-              --jq '"\(.isDraft) \(.isPrerelease)"' 2>/dev/null)"; then
-              if [[ "$release_state" == "false false" ]]; then
-                should_release=false
-              else
-                should_release=true
-              fi
+            # GraphQL variables must reach gh literally.
+            # shellcheck disable=SC2016
+            release_state="$(gh api graphql \
+              -f owner="$GITHUB_REPOSITORY_OWNER" \
+              -f name="${GITHUB_REPOSITORY#*/}" \
+              -f tag="$tag" \
+              -f query='query($owner: String!, $name: String!, $tag: String!) {
+                repository(owner: $owner, name: $name) {
+                  release(tagName: $tag) { isDraft isPrerelease }
+                }
+              }' \
+              --jq '.data.repository.release |
+                if . == null then "missing"
+                elif .isDraft then "draft"
+                elif .isPrerelease then "prerelease"
+                else "stable" end')"
+            if [[ "$release_state" == "stable" ]]; then
+              should_release=false
             else
               should_release=true
             fi
