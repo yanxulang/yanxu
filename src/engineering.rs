@@ -772,7 +772,7 @@ fn vulnerability_code(id: &str) -> String {
 }
 
 fn valid_vulnerability_id(id: &str) -> bool {
-    if id.is_empty() || id.len() > 96 {
+    if id.is_empty() || id.len() > 96 || id == "METADATA" || id.starts_with("METADATA-") {
         return false;
     }
     let mut previous_was_separator = true;
@@ -1317,6 +1317,9 @@ mod tests {
             "YXSA_2026_0001",
             "YXSA.2026.0001",
             "YXSA:2026:0001",
+            "METADATA",
+            "METADATA-INVALID",
+            "METADATA-MISSING",
             "-YXSA-2026-0001",
             "YXSA--2026-0001",
             "YXSA-2026-0001-",
