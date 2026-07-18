@@ -609,16 +609,13 @@ unsafe extern "C" fn native_host_pump(
         write_native_host_error(error);
         return native_abi_v2::NATIVE_V2_ERROR;
     };
-    if state.pumping.replace(true) {
-        write_native_host_error(error);
-        *state.last_pump_error.borrow_mut() = Some(VmError {
-            code: "GUI_REENTRANT_CALL",
-            message: "宿主事件泵不可嵌套进入".into(),
-            span: Span::synthetic(),
-            frames: Vec::new(),
-        });
-        return native_abi_v2::NATIVE_V2_ERROR;
+    // Native callbacks may synchronously request another pump while the owner
+    // thread is already draining the queue. The request is already covered by
+    // the outer pump, so treat a nested request as a successful no-op.
+    if state.pumping.get() {
+        return native_abi_v2::NATIVE_V2_OK;
     }
+    state.pumping.set(true);
     let vm = state.vm.get();
     if vm.is_null() {
         state.pumping.set(false);
@@ -5717,6 +5714,16 @@ mod tests {
         let mut vm = Vm::silent();
         vm.execute(&chunk).unwrap();
         vm
+    }
+
+    #[test]
+    fn nested_host_pump_is_a_successful_noop() {
+        let state = VmHostState::new(crate::permissions::PermissionSet::sandboxed());
+        state.pumping.set(true);
+        let mut error = std::mem::MaybeUninit::<native_abi_v2::YanxuNativeErrorV2>::zeroed();
+        let status = unsafe { native_host_pump(state.host.context, 1, error.as_mut_ptr()) };
+        assert_eq!(status, native_abi_v2::NATIVE_V2_OK);
+        assert!(state.pumping.get());
     }
 
     #[test]

@@ -1,5 +1,27 @@
 # 变更记录
 
+## 1.1.17
+
+### 网络权限与宿主事件泵
+
+- 保留并完善 IPv4/IPv6 CIDR 网络授权，支持 VPN fake-IP 等特殊网段的最小范围声明；宿主与应用权限求交集时继续收窄到更具体的网段或端点。
+- DNS 解析后的敏感地址复核与 URL 预检共用 CIDR 规则，`*`仍不会隐式放行敏感网段。
+- 原生宿主事件回调在事件泵已经运行时再次请求泵处理改为成功 no-op，避免嵌套回调把外层 GUI 调用错误化。
+
+### 兼容与安装
+
+- 继续使用 1.1.x 补丁版本；不改变语言规范、标准库签名、清单/锁文件、YXB、字节码或原生 ABI 公开格式。
+- 需要 CIDR 授权的应用应声明最低言序 1.1.17 并重新构建；其他 1.x 源码与制品无需迁移。
+
+macOS 与 Linux 可固定安装本版本：
+
+```sh
+curl -fsSL https://get.yanxu.dev | YANXU_VERSION=1.1.17 sh
+```
+
+Windows PowerShell 可先设置`$env:YANXU_VERSION = "1.1.17"`，再运行
+`irm https://get.yanxu.dev/windows | iex`。
+
 ## 1.1.16
 
 ### 二进制值与 HTTP 响应预算
