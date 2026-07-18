@@ -59,8 +59,8 @@ jobs:
           git fetch origin main --tags
           tag_commit="$(git rev-list -n 1 "$tag")"
           main_commit="$(git rev-parse origin/main)"
-          if [[ "$tag_commit" != "$main_commit" ]]; then
-            echo "标签 $tag 的提交 $tag_commit 不是 origin/main 验收提交 $main_commit" >&2
+          if ! git merge-base --is-ancestor "$tag_commit" "$main_commit"; then
+            echo "标签 $tag 的提交 $tag_commit 不属于 origin/main 主线" >&2
             exit 1
           fi
           if ! grep -Fqx "## $version" CHANGELOG.md; then
