@@ -19,11 +19,31 @@ pub(super) const ARCHIVE_LIMITS: ArchiveLimits = ArchiveLimits {
     path_bytes: ARCHIVE_MAX_PATH_BYTES,
 };
 
+#[cfg(test)]
 pub(super) fn extract_archive_safely(
     archive: &Path,
     destination: &Path,
 ) -> Result<(), ManifestError> {
     extract_archive_with_limits(archive, destination, ARCHIVE_LIMITS)
+}
+
+/// 展开调用方已经完整快照并校验过的归档字节。
+///
+/// registry 下载先把受压缩量上限约束的文件读入内存，再对同一份字节同时
+/// 计算制品摘要并解包，避免“按路径验签、再按路径打开”之间被替换。
+pub(super) fn extract_archive_bytes_safely(
+    bytes: &[u8],
+    archive: &Path,
+    destination: &Path,
+) -> Result<(), ManifestError> {
+    let compressed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    extract_archive_reader_with_limits(
+        io::Cursor::new(bytes),
+        compressed_bytes,
+        archive,
+        destination,
+        ARCHIVE_LIMITS,
+    )
 }
 
 /// 只读验证既有文件是否为本生产器可安全覆盖的 YXP 制品。
@@ -153,6 +173,7 @@ pub(super) fn validate_existing_package_archive(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn extract_archive_with_limits(
     archive: &Path,
     destination: &Path,
@@ -173,7 +194,27 @@ pub(super) fn extract_archive_with_limits(
     }
     let file = fs::File::open(archive)
         .map_err(|error| manifest_error(archive, None, format!("不能打开索引制品：{error}")))?;
-    let decoder = flate2::read::GzDecoder::new(file);
+    extract_archive_reader_with_limits(file, compressed_bytes, archive, destination, limits)
+}
+
+fn extract_archive_reader_with_limits<R: Read>(
+    reader: R,
+    compressed_bytes: u64,
+    archive: &Path,
+    destination: &Path,
+    limits: ArchiveLimits,
+) -> Result<(), ManifestError> {
+    if compressed_bytes > limits.compressed_bytes {
+        return Err(manifest_error(
+            archive,
+            None,
+            format!(
+                "索引制品压缩后为 {compressed_bytes} 字节，超过 {} 字节上限",
+                limits.compressed_bytes
+            ),
+        ));
+    }
+    let decoder = flate2::read::GzDecoder::new(reader);
     let mut tar = tar::Archive::new(decoder);
     let entries = tar.entries().map_err(|error| {
         manifest_error(archive, None, format!("索引制品不是有效 tar.gz：{error}"))
