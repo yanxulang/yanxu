@@ -310,8 +310,7 @@ struct FunctionDefinition<'a> {
 }
 
 impl Function {
-    fn bind(&self, instance: Rc<RefCell<YanxuInstance>>) -> Self {
-        let closure = Environment::child(self.closure.clone());
+    fn bind(&self, instance: Rc<RefCell<YanxuInstance>>, closure: EnvRef) -> Self {
         closure
             .borrow_mut()
             .define_unchecked("此".into(), Value::Instance(instance), false);
@@ -664,8 +663,161 @@ fn debug_value(value: &Value) -> String {
     }
 }
 
+#[derive(Default)]
+struct InterpreterMarks {
+    environments: HashSet<usize>,
+    objects: HashSet<(u8, usize)>,
+}
+
+impl InterpreterMarks {
+    fn visit<T>(&mut self, kind: u8, object: *const T) -> bool {
+        self.objects.insert((kind, object as usize))
+    }
+}
+
+fn mark_interpreter_environment(environment: &EnvRef, marks: &mut InterpreterMarks) {
+    let id = Rc::as_ptr(environment) as usize;
+    if !marks.environments.insert(id) {
+        return;
+    }
+    let environment = environment.borrow();
+    if let Some(enclosing) = &environment.enclosing {
+        mark_interpreter_environment(enclosing, marks);
+    }
+    for binding in environment.values.values() {
+        mark_interpreter_value(&binding.value, marks);
+    }
+}
+
+fn mark_interpreter_function(function: &Rc<Function>, marks: &mut InterpreterMarks) {
+    if marks.visit(1, Rc::as_ptr(function)) {
+        mark_interpreter_environment(&function.closure, marks);
+    }
+}
+
+fn mark_interpreter_class(class: &Rc<YanxuClass>, marks: &mut InterpreterMarks) {
+    if !marks.visit(2, Rc::as_ptr(class)) {
+        return;
+    }
+    if let Some(superclass) = &class.superclass {
+        mark_interpreter_class(superclass, marks);
+    }
+    for method in class.methods.values() {
+        mark_interpreter_function(&method.function, marks);
+    }
+    for field in class.fields.values() {
+        mark_interpreter_environment(&field.type_env, marks);
+        if let Some(initial) = &field.initial {
+            mark_interpreter_value(initial, marks);
+        }
+    }
+    for value in class.static_fields.borrow().values() {
+        mark_interpreter_value(value, marks);
+    }
+}
+
+fn mark_interpreter_value(value: &Value, marks: &mut InterpreterMarks) {
+    match value {
+        Value::Function(function) => mark_interpreter_function(function, marks),
+        Value::Class(class) => mark_interpreter_class(class, marks),
+        Value::Instance(instance) => {
+            if !marks.visit(3, Rc::as_ptr(instance)) {
+                return;
+            }
+            let instance = instance.borrow();
+            mark_interpreter_class(&instance.class, marks);
+            for value in instance.fields.values() {
+                mark_interpreter_value(value, marks);
+            }
+        }
+        Value::Module(module) => mark_interpreter_environment(&module.environment, marks),
+        Value::List(items) => {
+            if !marks.visit(4, Rc::as_ptr(items)) {
+                return;
+            }
+            for value in items.borrow().iter() {
+                mark_interpreter_value(value, marks);
+            }
+        }
+        Value::Tuple(items) => {
+            if !marks.visit(5, Rc::as_ptr(items)) {
+                return;
+            }
+            for value in items.iter() {
+                mark_interpreter_value(value, marks);
+            }
+        }
+        Value::Map(map) => {
+            if !marks.visit(6, Rc::as_ptr(map)) {
+                return;
+            }
+            for (key, value) in &map.borrow().entries {
+                mark_interpreter_value(key, marks);
+                mark_interpreter_value(value, marks);
+            }
+        }
+        Value::Iterator(iterator) => {
+            if !marks.visit(7, Rc::as_ptr(iterator)) {
+                return;
+            }
+            match &*iterator.borrow() {
+                YanxuIterator::List { source, .. } => {
+                    mark_interpreter_value(&Value::List(source.clone()), marks)
+                }
+                YanxuIterator::Tuple { source, .. } => {
+                    mark_interpreter_value(&Value::Tuple(source.clone()), marks)
+                }
+                YanxuIterator::MapKeys { source, .. } => {
+                    mark_interpreter_value(&Value::Map(source.clone()), marks)
+                }
+                YanxuIterator::Object { source } => {
+                    mark_interpreter_value(&Value::Instance(source.clone()), marks)
+                }
+                YanxuIterator::Mapped { source, mapper } => {
+                    mark_interpreter_value(&Value::Iterator(source.clone()), marks);
+                    mark_interpreter_value(mapper, marks);
+                }
+                YanxuIterator::Filtered { source, predicate } => {
+                    mark_interpreter_value(&Value::Iterator(source.clone()), marks);
+                    mark_interpreter_value(predicate, marks);
+                }
+                YanxuIterator::String { .. } | YanxuIterator::Range { .. } => {}
+            }
+        }
+        Value::Task(task) => {
+            if !marks.visit(8, Rc::as_ptr(task)) {
+                return;
+            }
+            match &task.borrow().state {
+                YanxuTaskState::Pending {
+                    function,
+                    arguments,
+                } => {
+                    mark_interpreter_function(function, marks);
+                    for value in arguments {
+                        mark_interpreter_value(value, marks);
+                    }
+                }
+                YanxuTaskState::Completed(value) => mark_interpreter_value(value, marks),
+                YanxuTaskState::Running | YanxuTaskState::Failed(_) | YanxuTaskState::Cancelled => {
+                }
+            }
+        }
+        Value::Number(_)
+        | Value::String(_)
+        | Value::Bytes(_)
+        | Value::Bool(_)
+        | Value::Nil
+        | Value::Native(_)
+        | Value::Protocol(_)
+        | Value::Error(_)
+        | Value::Socket(_) => {}
+    }
+}
+
 pub struct Interpreter {
     globals: EnvRef,
+    heap_environments: Vec<Weak<RefCell<Environment>>>,
     output: Vec<String>,
     echo: bool,
     current_dir: PathBuf,
@@ -700,6 +852,23 @@ enum Control {
 impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Interpreter {
+    fn drop(&mut self) {
+        self.debug_frames.clear();
+        self.module_cache.clear();
+        let environments = self
+            .heap_environments
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for environment in environments {
+            let mut environment = environment.borrow_mut();
+            environment.values.clear();
+            environment.enclosing = None;
+        }
     }
 }
 
@@ -761,7 +930,8 @@ impl Interpreter {
         define_intrinsic(&globals, "任务状态", 1, NativeKind::TaskStatus);
         define_intrinsic(&globals, "并候", 1, NativeKind::JoinTasks);
         Self {
-            globals,
+            globals: globals.clone(),
+            heap_environments: vec![Rc::downgrade(&globals)],
             output: Vec::new(),
             echo,
             current_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -870,7 +1040,56 @@ impl Interpreter {
             self.package_module_roots = previous;
         }
         self.current_module_id = previous_module_id;
+        self.collect_garbage(result.as_ref().ok());
         result
+    }
+
+    fn child_env(&mut self, enclosing: EnvRef) -> EnvRef {
+        let environment = Environment::child(enclosing);
+        self.heap_environments.push(Rc::downgrade(&environment));
+        environment
+    }
+
+    fn bind_function(
+        &mut self,
+        function: &Function,
+        instance: Rc<RefCell<YanxuInstance>>,
+    ) -> Function {
+        let closure = self.child_env(function.closure.clone());
+        function.bind(instance, closure)
+    }
+
+    fn collect_garbage(&mut self, result: Option<&Value>) {
+        let mut marks = InterpreterMarks::default();
+        mark_interpreter_environment(&self.globals, &mut marks);
+        for module in self.module_cache.values() {
+            mark_interpreter_environment(&module.environment, &mut marks);
+        }
+        for frame in &self.debug_frames {
+            mark_interpreter_environment(&frame.environment, &mut marks);
+        }
+        if let Some(result) = result {
+            mark_interpreter_value(result, &mut marks);
+        }
+
+        let unreachable = self
+            .heap_environments
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|environment| {
+                !marks
+                    .environments
+                    .contains(&(Rc::as_ptr(environment) as usize))
+            })
+            .collect::<Vec<_>>();
+        for environment in &unreachable {
+            let mut environment = environment.borrow_mut();
+            environment.values.clear();
+            environment.enclosing = None;
+        }
+        drop(unreachable);
+        self.heap_environments
+            .retain(|environment| environment.strong_count() > 0);
     }
 
     pub fn output(&self) -> &[String] {
@@ -1018,15 +1237,18 @@ impl Interpreter {
                 else_branch,
             } => {
                 if self.evaluate(condition, env.clone())?.truthy() {
-                    self.execute_statements(then_branch, Environment::child(env))
+                    let branch_env = self.child_env(env);
+                    self.execute_statements(then_branch, branch_env)
                 } else {
-                    self.execute_statements(else_branch, Environment::child(env))
+                    let branch_env = self.child_env(env);
+                    self.execute_statements(else_branch, branch_env)
                 }
             }
             StmtKind::While { condition, body } => {
                 while self.evaluate(condition, env.clone())?.truthy() {
+                    let body_env = self.child_env(env.clone());
                     if let returned @ Control::Return(_) =
-                        self.execute_statements(body, Environment::child(env.clone()))?
+                        self.execute_statements(body, body_env)?
                     {
                         return Ok(returned);
                     }
@@ -1042,7 +1264,7 @@ impl Interpreter {
                 let iterable = self.evaluate(iterable, env.clone())?;
                 let iterator = self.make_iterator(iterable)?;
                 while let Some(item) = self.next_iterator(&iterator)? {
-                    let iteration_env = Environment::child(env.clone());
+                    let iteration_env = self.child_env(env.clone());
                     self.define_variable(
                         iteration_env.clone(),
                         name.clone(),
@@ -1222,23 +1444,28 @@ impl Interpreter {
                 try_branch,
                 error_name,
                 catch_branch,
-            } => match self.execute_statements(try_branch, Environment::child(env.clone())) {
-                Ok(control) => Ok(control),
-                Err(error) => {
-                    let catch_env = Environment::child(env);
-                    let error_value = Value::Error(Rc::new(YanxuErrorValue {
-                        code: error.code,
-                        category: error.category().into(),
-                        message: error.message,
-                        frames: error.frames,
-                        span: error.span,
-                    }));
-                    catch_env
-                        .borrow_mut()
-                        .define_unchecked(error_name.clone(), error_value, false);
-                    self.execute_statements(catch_branch, catch_env)
+            } => {
+                let try_env = self.child_env(env.clone());
+                match self.execute_statements(try_branch, try_env) {
+                    Ok(control) => Ok(control),
+                    Err(error) => {
+                        let catch_env = self.child_env(env);
+                        let error_value = Value::Error(Rc::new(YanxuErrorValue {
+                            code: error.code,
+                            category: error.category().into(),
+                            message: error.message,
+                            frames: error.frames,
+                            span: error.span,
+                        }));
+                        catch_env.borrow_mut().define_unchecked(
+                            error_name.clone(),
+                            error_value,
+                            false,
+                        );
+                        self.execute_statements(catch_branch, catch_env)
+                    }
                 }
-            },
+            }
             StmtKind::Throw(expr) => {
                 let value = self.evaluate(expr, env)?;
                 match value {
@@ -1324,7 +1551,9 @@ impl Interpreter {
                         "父类私法“{method}”不可由子类调用"
                     )));
                 }
-                Ok(Value::Function(Rc::new(spec.function.bind(instance))))
+                Ok(Value::Function(Rc::new(
+                    self.bind_function(&spec.function, instance),
+                )))
             }
             ExprKind::List(items) => {
                 let values = items
@@ -1492,7 +1721,7 @@ impl Interpreter {
                     fields: class.initial_fields(),
                 }));
                 if let Some(initializer) = class.method("初始化") {
-                    let bound = initializer.bind(instance.clone());
+                    let bound = self.bind_function(&initializer, instance.clone());
                     if bound.is_async {
                         return Err(RuntimeError::new("初始化不可为异法"));
                     }
@@ -1951,7 +2180,7 @@ impl Interpreter {
                 arguments.len(),
             ));
         }
-        let env = Environment::child(function.closure.clone());
+        let env = self.child_env(function.closure.clone());
         let frame = format!("法“{}”（{}）", function.name, function.span);
         for (parameter, value) in function.params.iter().zip(arguments) {
             self.define_variable(
@@ -1996,7 +2225,7 @@ impl Interpreter {
         Ok(value)
     }
 
-    fn get_property(&self, object: Value, name: &str) -> Result<Value, RuntimeError> {
+    fn get_property(&mut self, object: Value, name: &str) -> Result<Value, RuntimeError> {
         match object {
             Value::Instance(instance) => {
                 let class = instance.borrow().class.clone();
@@ -2015,8 +2244,9 @@ impl Interpreter {
                 if !self.can_access(method.visibility, &method.owner) {
                     return Err(RuntimeError::new(format!("私法“{name}”不可从类外调用")));
                 }
+                let function = method.function.clone();
                 Ok(Value::Function(Rc::new(
-                    method.function.bind(instance.clone()),
+                    self.bind_function(&function, instance),
                 )))
             }
             Value::Class(class) => {
@@ -2476,7 +2706,8 @@ impl Interpreter {
             Value::Instance(source) => {
                 let start = source.borrow().class.method("遍始");
                 if let Some(start) = start {
-                    let started = self.call_function(&start.bind(source.clone()), Vec::new())?;
+                    let bound = self.bind_function(&start, source.clone());
+                    let started = self.call_function(&bound, Vec::new())?;
                     if matches!(&started, Value::Instance(instance) if Rc::ptr_eq(instance, &source))
                     {
                         if source.borrow().class.method("遍次").is_none() {
@@ -2548,7 +2779,8 @@ impl Interpreter {
                 let next = source.borrow().class.method("遍次").ok_or_else(|| {
                     RuntimeError::new(format!("{}未实现“遍次”", source.borrow().class.name))
                 })?;
-                let result = self.call_function(&next.bind(source.clone()), Vec::new())?;
+                let bound = self.bind_function(&next, source.clone());
+                let result = self.call_function(&bound, Vec::new())?;
                 parse_iterator_result(result)
             }
             YanxuIterator::Mapped { source, mapper } => self
@@ -2737,7 +2969,7 @@ impl Interpreter {
         crate::resolver::resolve(&statements)
             .map_err(|error| RuntimeError::new(error.message).at(error.span))?;
 
-        let module_env = Environment::child(self.globals.clone());
+        let module_env = self.child_env(self.globals.clone());
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
         let previous = std::mem::replace(&mut self.current_dir, directory.to_path_buf());
         let module_id = ModuleId::for_path(path);
@@ -5216,6 +5448,89 @@ mod tests {
     use super::*;
     use crate::run_with;
     use std::io::Read;
+
+    #[test]
+    fn dropping_interpreter_releases_the_global_environment() {
+        let globals = {
+            let mut interpreter = Interpreter::silent();
+            let globals = Rc::downgrade(&interpreter.globals);
+            run_with(
+                &mut interpreter,
+                "法 恒（）：数 则 归 1；终 定 值：法 为 恒；",
+            )
+            .unwrap();
+            globals
+        };
+        assert!(globals.upgrade().is_none());
+    }
+
+    #[test]
+    fn persistent_interpreter_collects_replaced_closure_environments() {
+        let mut interpreter = Interpreter::silent();
+        run_with(
+            &mut interpreter,
+            r#"
+                法 外层（甲：数）：法 则
+                    法 内层（乙：数）：数 则 归 甲 加 乙；终
+                    归 内层；
+                终
+                法 清理（）：空 则
+                    法 自环（）：法 则 归 自环；终
+                    归 空；
+                终
+                令 加值：法 为 外层（10）；
+                清理（）；
+                言 加值（5）；
+            "#,
+        )
+        .unwrap();
+        let global_id = Rc::as_ptr(&interpreter.globals);
+        let escaped = interpreter
+            .heap_environments
+            .iter()
+            .find(|environment| environment.as_ptr() != global_id && environment.strong_count() > 0)
+            .cloned()
+            .expect("逃逸闭包环境应保持存活");
+        assert_eq!(
+            interpreter
+                .heap_environments
+                .iter()
+                .filter(|environment| environment.strong_count() > 0)
+                .count(),
+            2
+        );
+
+        run_with(&mut interpreter, "置 加值 为 外层（20）；言 加值（1）；").unwrap();
+        assert!(escaped.upgrade().is_none());
+        assert_eq!(interpreter.output(), &["15", "21"]);
+    }
+
+    #[test]
+    fn persistent_interpreter_collects_bound_method_cycles() {
+        let mut interpreter = Interpreter::silent();
+        run_with(
+            &mut interpreter,
+            r#"
+                类 盒 则
+                    法 取（）：数 则 归 1；终
+                终
+                令 盒子 为 盒（）；
+                令 绑定 为 盒子.取；
+                置 盒子.回调 为 绑定；
+            "#,
+        )
+        .unwrap();
+        let global_id = Rc::as_ptr(&interpreter.globals);
+        let bound_environment = interpreter
+            .heap_environments
+            .iter()
+            .find(|environment| environment.as_ptr() != global_id && environment.strong_count() > 0)
+            .cloned()
+            .expect("绑定方法环境应登记并保持存活");
+
+        run_with(&mut interpreter, "置 盒子 为 空；置 绑定 为 空；").unwrap();
+        assert!(bound_environment.upgrade().is_none());
+    }
 
     #[test]
     fn runs_loop_and_function() {
