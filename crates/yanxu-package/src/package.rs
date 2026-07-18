@@ -2233,18 +2233,16 @@ fn resolve_git(
 }
 
 fn secure_git_source(url: &str) -> bool {
-    !url.is_empty()
-        && !url.starts_with('-')
-        && !url.chars().any(char::is_control)
-        && (Path::new(url).exists()
-            || url.starts_with("file://")
-            || url.starts_with("https://")
-            || url.starts_with("ssh://")
-            || url.starts_with("git+ssh://")
-            || (!url.contains("://")
-                && url
-                    .split_once(':')
-                    .is_some_and(|(authority, path)| authority.contains('@') && !path.is_empty())))
+    if url.is_empty() || url.starts_with('-') || url.chars().any(char::is_control) {
+        return false;
+    }
+    if let Some((scheme, _)) = url.split_once("://") {
+        return matches!(scheme, "file" | "https" | "ssh" | "git+ssh");
+    }
+    Path::new(url).exists()
+        || url
+            .split_once(':')
+            .is_some_and(|(authority, path)| authority.contains('@') && !path.is_empty())
 }
 
 fn resolve_registry(
@@ -4165,6 +4163,18 @@ mod tests {
         ));
         assert!(secure_git_source("https://example.invalid/package.git"));
         assert!(secure_git_source("git@example.invalid:group/package.git"));
+
+        #[cfg(unix)]
+        {
+            let unique = format!("yanxu-insecure-source-{}", std::process::id());
+            let local_shape = Path::new("http:").join(&unique).join("package.git");
+            fs::create_dir_all(&local_shape).unwrap();
+            let disguised = format!("http://{unique}/package.git");
+            assert!(Path::new(&disguised).exists());
+            assert!(!secure_git_source(&disguised));
+            fs::remove_dir_all(Path::new("http:").join(unique)).unwrap();
+            fs::remove_dir("http:").ok();
+        }
 
         let git_error =
             resolve_git("http://example.invalid/package.git", "HEAD", false).unwrap_err();
