@@ -11,6 +11,7 @@
 类型现在必须写成`导入别名.类型`；这是本版本唯一有意收紧的源码行为。
 完整迁移规则与示例见[模块限定类型迁移](migration-module-qualified-types.md)。
 
-字节码块格式升级为 2，旧 YXB 应从源码重新构建；YXB 外层格式、包清单、
+字节码块格式升级为 2，旧 YXB 应从源码重新构建；1.1.16 起运行旧制品会以
+`YXB_BYTECODE_UNSUPPORTED`列出检测格式、当前格式和完整重建命令。YXB 外层格式、包清单、
 锁文件、标准库 API 和原生 ABI v1/v2 保持不变。`yanxu 文 --json`输出的模块
 API 清单升级为 v2，机器消费者应按[模块 API v2](module-api-v2.md)迁移。

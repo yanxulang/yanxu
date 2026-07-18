@@ -18,6 +18,7 @@ use std::fmt;
 use std::rc::Rc;
 
 pub const BYTECODE_FORMAT_VERSION: u32 = 2;
+pub const BYTECODE_FORMAT_UNSUPPORTED_CODE: &str = "BYTECODE_FORMAT_UNSUPPORTED";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Constant {
@@ -227,9 +228,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Chunk, ArchiveError> {
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| archive_error("缺少整数 format_version"))?;
     if version != u64::from(BYTECODE_FORMAT_VERSION) {
-        return Err(archive_error(format!(
-            "不支持格式版本 {version}，本运行时仅支持版本 {BYTECODE_FORMAT_VERSION}"
-        )));
+        return Err(unsupported_format_error(version));
     }
     let chunk: Chunk = serde_json::from_value(document)
         .map_err(|error| archive_error(format!("结构无效：{error}")))?;
@@ -243,10 +242,7 @@ pub fn validate_format(chunk: &Chunk) -> Result<(), ArchiveError> {
 
 fn validate_chunk(chunk: &Chunk, parent_module: Option<&ModuleId>) -> Result<(), ArchiveError> {
     if chunk.format_version != BYTECODE_FORMAT_VERSION {
-        return Err(archive_error(format!(
-            "不支持格式版本 {}，本运行时仅支持版本 {BYTECODE_FORMAT_VERSION}",
-            chunk.format_version
-        )));
+        return Err(unsupported_format_error(u64::from(chunk.format_version)));
     }
     if !chunk.module_id.is_valid() {
         return Err(archive_error(format!(
@@ -367,6 +363,12 @@ fn archive_error(message: impl Into<String>) -> ArchiveError {
     ArchiveError {
         message: message.into(),
     }
+}
+
+fn unsupported_format_error(detected: u64) -> ArchiveError {
+    archive_error(format!(
+        "[{BYTECODE_FORMAT_UNSUPPORTED_CODE}] 检测到字节码格式 {detected}；当前支持字节码格式 {BYTECODE_FORMAT_VERSION}；安全自动迁移：否。请用当前言序从源码重新编译"
+    ))
 }
 
 pub fn compile(statements: &[Stmt]) -> Result<Chunk, CompileError> {
@@ -1060,7 +1062,10 @@ mod tests {
         let mut document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         document["format_version"] = serde_json::json!(1);
         let error = deserialize(&serde_json::to_vec(&document).unwrap()).unwrap_err();
-        assert!(error.message.contains("不支持格式版本 1"));
+        assert!(error.message.contains("检测到字节码格式 1"));
+        assert!(error.message.contains(BYTECODE_FORMAT_UNSUPPORTED_CODE));
+        assert!(error.message.contains("当前支持字节码格式 2"));
+        assert!(error.message.contains("安全自动迁移：否"));
         assert!(deserialize(b"not-json").is_err());
     }
 
