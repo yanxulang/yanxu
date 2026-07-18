@@ -90,8 +90,8 @@ jobs:
           notes="crates/yanxu-package/RELEASE_NOTES_$VERSION.md"
           test -f "$notes"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --title "yanxu-package $VERSION" \
+            gh release create "$TAG" --draft --latest=false --title "yanxu-package $VERSION" \
               --notes-file "$notes"
           fi
           gh release upload "$TAG" "$crate" "$crate.sha256" --clobber
-          gh release edit "$TAG" --draft=false --title "yanxu-package $VERSION"
+          gh release edit "$TAG" --draft=false --latest=false --title "yanxu-package $VERSION"
