@@ -1656,13 +1656,13 @@ impl Checker {
         }
         let current_dir = self.current_dir.clone()?;
         let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            match crate::package::resolve_dependency_scoped(
+            match crate::package::resolve_dependency_scoped_with_capabilities(
                 self.package_root.as_deref(),
                 &current_dir,
                 name,
             ) {
-                Ok(dependency) => {
-                    if let Err(error) = self.package_module_roots.insert(&dependency.root) {
+                Ok((dependency, capabilities)) => {
+                    if let Err(error) = capabilities.extend(&mut self.package_module_roots) {
                         self.package_path_error(error, import_span.clone());
                         return None;
                     }

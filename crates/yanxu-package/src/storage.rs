@@ -26,6 +26,10 @@ impl ProjectLock {
             .create(true)
             .truncate(false)
             .open(directory.join(LOCK_NAME))?;
+        Self::acquire_opened(file)
+    }
+
+    pub(crate) fn acquire_opened(file: fs::File) -> io::Result<Self> {
         #[cfg(not(target_os = "wasi"))]
         {
             fs2::FileExt::lock_exclusive(&file)?;

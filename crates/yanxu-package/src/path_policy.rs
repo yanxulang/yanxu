@@ -1357,6 +1357,98 @@ impl TrustedPackageRoots {
         self.roots.iter().map(|root| root.canonical.as_path())
     }
 
+    /// 合并另一组已经打开并验证过的根能力，不再根据路径重新打开目录。
+    #[doc(hidden)]
+    pub fn extend_opened(&mut self, other: &Self) -> Result<(), PackagePathError> {
+        for candidate in &other.roots {
+            if let Some(existing) = self
+                .roots
+                .iter_mut()
+                .find(|existing| existing.canonical == candidate.canonical)
+            {
+                #[cfg(not(target_os = "wasi"))]
+                let same = same_opened_directory_identity(
+                    existing.directory.as_ref(),
+                    candidate.directory.as_ref(),
+                )
+                .map_err(|error| PackagePathError {
+                    code: PACKAGE_ROOT_INVALID_CODE,
+                    message: format!(
+                        "不能合并可信包根“{}”的目录能力：{error}。",
+                        candidate.canonical.display()
+                    ),
+                    path: candidate.canonical.clone(),
+                    component: None,
+                    suggestion: "请重新执行依赖解析并建立单一内容 generation。".into(),
+                })?;
+                #[cfg(target_os = "wasi")]
+                let same = existing
+                    .directory
+                    .stable_identity()
+                    .and_then(|existing| {
+                        candidate
+                            .directory
+                            .stable_identity()
+                            .map(|candidate| existing == candidate)
+                    })
+                    .map_err(|error| PackagePathError {
+                        code: PACKAGE_ROOT_INVALID_CODE,
+                        message: format!(
+                            "不能合并可信包根“{}”的目录能力：{error}。",
+                            candidate.canonical.display()
+                        ),
+                        path: candidate.canonical.clone(),
+                        component: None,
+                        suggestion: "请使用能够提供稳定目录身份的 WASI 宿主。".into(),
+                    })?;
+                if !same {
+                    return Err(PackagePathError {
+                        code: PACKAGE_ROOT_INVALID_CODE,
+                        message: format!(
+                            "可信包根“{}”对应两个不同的目录 generation。",
+                            candidate.canonical.display()
+                        ),
+                        path: candidate.canonical.clone(),
+                        component: None,
+                        suggestion: "请终止当前操作并从新的依赖解析会话重试。".into(),
+                    });
+                }
+                for alias in &candidate.aliases {
+                    if !existing.aliases.contains(alias) {
+                        existing.aliases.push(alias.clone());
+                    }
+                }
+                continue;
+            }
+            self.roots.push(candidate.clone());
+        }
+        self.roots.sort_by(|left, right| {
+            right
+                .canonical
+                .components()
+                .count()
+                .cmp(&left.canonical.components().count())
+                .then_with(|| left.canonical.cmp(&right.canonical))
+        });
+        Ok(())
+    }
+
+    /// 重新按当前路径打开根目录，并与保存的目录身份比较。
+    #[doc(hidden)]
+    pub fn revalidate_exact_root(&self, root: &Path) -> Result<bool, PackagePathError> {
+        let Some(expected) = self.exact_root_identity(root).map(Path::to_path_buf) else {
+            return Ok(false);
+        };
+        let mut probe = self.clone();
+        if probe.insert(root).is_err() {
+            return Ok(false);
+        }
+        Ok(probe.len() == self.len()
+            && probe
+                .exact_root_identity(root)
+                .is_some_and(|current| current == expected))
+    }
+
     pub(crate) fn exact_root_identity(&self, root: &Path) -> Option<&Path> {
         let (_, root) = ambient_root_paths(root).ok()?;
         self.roots

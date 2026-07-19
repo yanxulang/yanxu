@@ -2946,14 +2946,15 @@ impl Interpreter {
             return standard_module(name);
         }
         let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            let dependency = crate::package::resolve_dependency_scoped(
-                self.package_root.as_deref(),
-                &self.current_dir,
-                name,
-            )
-            .map_err(RuntimeError::package)?;
-            self.package_module_roots
-                .insert(&dependency.root)
+            let (dependency, capabilities) =
+                crate::package::resolve_dependency_scoped_with_capabilities(
+                    self.package_root.as_deref(),
+                    &self.current_dir,
+                    name,
+                )
+                .map_err(RuntimeError::package)?;
+            capabilities
+                .extend(&mut self.package_module_roots)
                 .map_err(RuntimeError::package_path)?;
             (dependency.entry, true)
         } else {
