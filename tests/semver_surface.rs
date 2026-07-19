@@ -372,6 +372,46 @@ fn reviewed_patch_changes_require_exact_paths_and_values() {
     let mut changes = Vec::new();
     compare_values(&baseline, &current, &mut wrong_path, &mut changes);
     assert_eq!(changes[0].bump, RequiredBump::Major);
+
+    let capability_path = "engineering_protocol/handshake/operation_capabilities"
+        .split('/')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let capability = normalized(json!({
+        "audit": {
+            "schema_version": 1,
+            "checks": [
+                "lock_checksum_sha256",
+                "source_transport",
+                "git_exact_revision",
+                "spdx_license",
+                "registry_yanked",
+                "registry_vulnerabilities",
+                "duplicate_versions",
+                "target_match",
+                "native_abi",
+                "native_target",
+                "native_checksum",
+                "native_provenance",
+            ],
+        },
+    }));
+    assert_eq!(
+        addition_bump(&capability_path, &capability),
+        RequiredBump::Patch
+    );
+    let mut expanded = capability.clone();
+    expanded["audit"]["checks"]["string:future_check"] = json!("future_check");
+    assert_eq!(
+        addition_bump(&capability_path, &expanded),
+        RequiredBump::Minor
+    );
+    let mut wrong_capability_path = capability_path;
+    *wrong_capability_path.last_mut().unwrap() = "other_capabilities".into();
+    assert_eq!(
+        addition_bump(&wrong_capability_path, &capability),
+        RequiredBump::Minor
+    );
 }
 
 #[test]
@@ -2409,7 +2449,9 @@ fn reviewed_patch_change(path: &[String], baseline: &Value, current: &Value) -> 
 }
 
 fn addition_bump(path: &[String], current: &Value) -> RequiredBump {
-    if path
+    if reviewed_patch_addition(path, current) {
+        RequiredBump::Patch
+    } else if path
         .iter()
         .any(|segment| segment == "required" || segment == "required_fields")
         || current
@@ -2421,6 +2463,45 @@ fn addition_bump(path: &[String], current: &Value) -> RequiredBump {
         RequiredBump::Major
     } else {
         RequiredBump::Minor
+    }
+}
+
+fn reviewed_patch_addition(path: &[String], current: &Value) -> bool {
+    let path = display_path(path);
+    match path.as_str() {
+        "/engineering_protocol/handshake/operation_capabilities" => {
+            current
+                == &normalized(json!({
+                    "audit": {
+                        "schema_version": 1,
+                        "checks": [
+                            "lock_checksum_sha256",
+                            "source_transport",
+                            "git_exact_revision",
+                            "spdx_license",
+                            "registry_yanked",
+                            "registry_vulnerabilities",
+                            "duplicate_versions",
+                            "target_match",
+                            "native_abi",
+                            "native_target",
+                            "native_checksum",
+                            "native_provenance",
+                        ],
+                    },
+                }))
+        }
+        "/engineering_protocol/response_fields/audit/string:audit_capabilities" => {
+            current == "audit_capabilities"
+        }
+        "/engineering_protocol/response_fields/handshake/string:audit" => current == "audit",
+        "/engineering_protocol/response_fields/handshake/string:operation_capabilities" => {
+            current == "operation_capabilities"
+        }
+        "/engineering_protocol/response_fields/audit_capabilities" => {
+            current == &normalized(json!(["checks", "schema_version"]))
+        }
+        _ => false,
     }
 }
 

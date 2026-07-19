@@ -9,3 +9,5 @@
 Git 依赖缓存迁移到`YANXU_CACHE/git/v2/<来源SHA-256>`：每个来源使用加锁的 bare 对象库，每个 40 位精确提交发布独立、只读的`tree-v1` generation。旧的共享可变 checkout 不再作为可信输入；首次升级后请联网执行一次`yanbao install`或`yanbao update`填充新缓存。离线解析只接受锁文件中的 40 位精确提交，不再根据分支、标签或其他符号修订切换共享工作树。Git 包的内容来自该提交的确定性归档；依赖外部 smudge 过滤器或未提交 Git LFS 内容的项目，应先把运行所需字节纳入可复现的包制品。
 
 旧注册表目录`YANXU_CACHE/registry/<索引身份>/<包>/<版本>`不再直接进入依赖解析。锁文件含有效内容 SHA-256 时，1.1.18 会在对应包版本锁内复验旧目录，把同一内容捕获并原子发布到`.snapshots/tree-v1`下的只读 generation，然后只消费 generation；旧目录会保留，不会在迁移或失败恢复时被删除。迁移成功后可按普通缓存维护策略清理旧目录；迁移失败时请保留诊断并联网重新执行`yanbao install`，不要手工把旧目录移动到`.snapshots`。
+
+工程协议仍使用版本 1，但`handshake`现在通过`operation_capabilities.audit`声明审计能力 Schema 1 和十二项稳定检查标识；`audit`响应以`audit_capabilities`逐值回显同一能力。审计消费端应先验证 Schema 与所需检查覆盖，并忽略未知的扩展操作或检查；缺少能力字段的旧核心不能被当作完成了全量安全审计。
