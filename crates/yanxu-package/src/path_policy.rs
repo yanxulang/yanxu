@@ -39,6 +39,9 @@ pub const PACKAGE_PATH_COLLISION_CODE: &str = "PACKAGE_PATH_COLLISION";
 const RESERVED_COMPONENTS: &[&str] = &[".git", ".yanxu", ".DS_Store", "target", "build", "vendor"];
 const LOCK_NAME: &str = "言序.lock";
 const TRUSTED_DIRECTORY_MAX_ENTRIES: usize = 100_000;
+const TOOLING_DIRECTORY_MAX_ENTRIES: usize = 4_096;
+const TOOLING_TREE_MAX_ENTRIES: usize = 100_000;
+const TOOLING_TREE_MAX_DEPTH: usize = 128;
 
 const RESERVED_MODULE_SUGGESTION: &str = "请将模块移至普通源码目录，并更新入口、导出或导入声明。";
 const NON_PORTABLE_SUGGESTION: &str =
@@ -664,6 +667,20 @@ pub struct ResolvedPackageFile {
     file: fs::File,
 }
 
+/// 工具目录发现阶段绑定的普通模块文件身份。
+///
+/// 令牌只保存稳定根能力、相对路径与平台文件身份，不长期占用每个源码文件的
+/// 描述符。读取前必须调用 [`Self::open`]；若目录项在发现后被同名替换，打开
+/// 会失败而不会读取替换内容。
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct ResolvedPackageFileSnapshot {
+    path: PathBuf,
+    portable_key: String,
+    roots: Arc<TrustedPackageRoots>,
+    identity: ResolvedFileIdentity,
+}
+
 /// 从已打开目录能力取得的一项稳定、可移植目录快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
@@ -1001,6 +1018,122 @@ impl ResolvedPackageFile {
     #[doc(hidden)]
     pub fn into_file(self) -> fs::File {
         self.file
+    }
+}
+
+#[cfg(all(unix, not(target_os = "wasi")))]
+type ResolvedFileIdentity = (u64, u64);
+#[cfg(windows)]
+type ResolvedFileIdentity = (u64, [u8; 16]);
+#[cfg(target_os = "wasi")]
+type ResolvedFileIdentity = (u64, u64);
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
+type ResolvedFileIdentity = ();
+
+#[cfg(all(unix, not(target_os = "wasi")))]
+fn resolved_file_identity(file: &fs::File) -> io::Result<ResolvedFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.dev() == 0 || metadata.ino() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "宿主未提供可验证的普通文件身份",
+        ));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn resolved_file_identity(file: &fs::File) -> io::Result<ResolvedFileIdentity> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = MaybeUninit::<FILE_ID_INFO>::zeroed();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            information.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok((
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    ))
+}
+
+#[cfg(target_os = "wasi")]
+fn resolved_file_identity(file: &fs::File) -> io::Result<ResolvedFileIdentity> {
+    let metadata = fstat(file).map_err(io::Error::from)?;
+    WasiPackageDirectory::required_identity(
+        &metadata,
+        RustixFileType::RegularFile,
+        "模块源码必须是身份可验证的普通文件",
+    )
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
+fn resolved_file_identity(_file: &fs::File) -> io::Result<ResolvedFileIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "当前宿主不能提供稳定普通文件身份",
+    ))
+}
+
+impl ResolvedPackageFileSnapshot {
+    fn new(
+        path: PathBuf,
+        portable_key: String,
+        roots: Arc<TrustedPackageRoots>,
+        file: &fs::File,
+    ) -> Result<Self, PackagePathError> {
+        let identity = resolved_file_identity(file).map_err(|error| {
+            invalid_path_error(&path, &format!("不能记录工具模块文件身份：{error}"))
+        })?;
+        Ok(Self {
+            path,
+            portable_key,
+            roots,
+            identity,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 复制发现阶段已经打开的根集合，供后续导入继续使用同一批目录能力。
+    #[doc(hidden)]
+    pub fn opened_roots(&self) -> TrustedPackageRoots {
+        self.roots.as_ref().clone()
+    }
+
+    /// 从发现阶段的同一根能力重新打开文件，并拒绝任何对象身份漂移。
+    #[doc(hidden)]
+    pub fn open(self) -> Result<ResolvedPackageFile, PackagePathError> {
+        let resolved = self
+            .roots
+            .resolve_existing_module_file(&self.path)?
+            .ok_or_else(|| invalid_path_error(&self.path, "工具模块不属于发现阶段的根能力"))?;
+        let identity = resolved_file_identity(&resolved.file).map_err(|error| {
+            invalid_path_error(&self.path, &format!("不能复验工具模块文件身份：{error}"))
+        })?;
+        if identity != self.identity {
+            return Err(invalid_path_error(
+                &self.path,
+                "模块文件在目录发现后被同名替换",
+            ));
+        }
+        Ok(resolved)
     }
 }
 
@@ -1577,6 +1710,66 @@ impl TrustedPackageRoots {
             .strip_prefix(root.prefix)
             .expect("matching root is a path prefix");
         list_existing_directory_from_root(root, relative, purpose).map(Some)
+    }
+
+    /// 记录一个模块文件的根能力、规范路径和平台对象身份，但不长期保留文件句柄。
+    #[doc(hidden)]
+    pub fn snapshot_existing_module_file(
+        &self,
+        requested_or_joined: &Path,
+    ) -> Result<Option<ResolvedPackageFileSnapshot>, PackagePathError> {
+        let Some(resolved) = self.resolve_existing_module_file(requested_or_joined)? else {
+            return Ok(None);
+        };
+        let path = resolved.path().to_path_buf();
+        let requested = lexical_absolute(&path)?;
+        let root = self
+            .matching(&requested)
+            .ok_or_else(|| invalid_path_error(&path, "工具模块不属于已经打开的可信根"))?;
+        let relative = requested
+            .strip_prefix(root.prefix)
+            .expect("matching root is a path prefix");
+        let portable_key = portable_package_path(relative)?;
+        ResolvedPackageFileSnapshot::new(path, portable_key, Arc::new(self.clone()), &resolved.file)
+            .map(Some)
+    }
+
+    /// 从同一已打开根目录递归发现模块，并为每个普通文件记录可复验身份。
+    #[doc(hidden)]
+    pub fn snapshot_module_directory(
+        &self,
+        requested_or_joined: &Path,
+    ) -> Result<Option<Vec<ResolvedPackageFileSnapshot>>, PackagePathError> {
+        if self.roots.is_empty() {
+            return Ok(None);
+        }
+        let requested = lexical_absolute(requested_or_joined)?;
+        let Some(root) = self.matching(&requested) else {
+            return Ok(None);
+        };
+        let relative = requested
+            .strip_prefix(root.prefix)
+            .expect("matching root is a path prefix");
+        let mut walker = ToolingModuleSnapshotWalker::new(root.identity, Arc::new(self.clone()));
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let (directory, actual_relative) = resolve_capability_package_directory_from_root(
+                root,
+                relative,
+                PackagePathPurpose::YxpEntry,
+            )?;
+            walker.snapshot_capability_directory(&directory, &actual_relative, 0)?;
+        }
+        #[cfg(target_os = "wasi")]
+        {
+            let (directory, actual_relative) = resolve_wasi_package_directory_from_root(
+                root,
+                relative,
+                PackagePathPurpose::YxpEntry,
+            )?;
+            walker.snapshot_wasi_directory(&directory, &actual_relative, 0)?;
+        }
+        Ok(Some(walker.finish()))
     }
 
     fn matching(&self, path: &Path) -> Option<TrustedRootMatch<'_>> {
@@ -2375,6 +2568,198 @@ fn list_existing_directory_from_root(
     Ok(result)
 }
 
+struct ToolingModuleSnapshotWalker {
+    root_identity: PathBuf,
+    scanned_entries: usize,
+    portable_paths: PortablePackagePaths,
+    roots: Arc<TrustedPackageRoots>,
+    files: Vec<ResolvedPackageFileSnapshot>,
+}
+
+impl ToolingModuleSnapshotWalker {
+    fn new(root_identity: &Path, roots: Arc<TrustedPackageRoots>) -> Self {
+        Self {
+            root_identity: root_identity.to_path_buf(),
+            scanned_entries: 0,
+            portable_paths: PortablePackagePaths::default(),
+            roots,
+            files: Vec::new(),
+        }
+    }
+
+    fn record_entry(&mut self, relative: &Path) -> Result<(), PackagePathError> {
+        self.scanned_entries = self
+            .scanned_entries
+            .checked_add(1)
+            .filter(|count| *count <= TOOLING_TREE_MAX_ENTRIES)
+            .ok_or_else(|| {
+                invalid_path_error(
+                    relative,
+                    &format!("工具目录项不得超过 {TOOLING_TREE_MAX_ENTRIES} 个"),
+                )
+            })?;
+        Ok(())
+    }
+
+    fn enter_directory(&self, relative: &Path, depth: usize) -> Result<(), PackagePathError> {
+        if depth > TOOLING_TREE_MAX_DEPTH {
+            return Err(invalid_path_error(
+                relative,
+                &format!("工具模块目录深度不得超过 {TOOLING_TREE_MAX_DEPTH} 层"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_directory_entry(
+        &mut self,
+        relative: &Path,
+        index: usize,
+    ) -> Result<(), PackagePathError> {
+        if index >= TOOLING_DIRECTORY_MAX_ENTRIES {
+            return Err(invalid_path_error(
+                relative,
+                &format!("单个工具目录不得超过 {TOOLING_DIRECTORY_MAX_ENTRIES} 项"),
+            ));
+        }
+        self.record_entry(relative)
+    }
+
+    fn finish(mut self) -> Vec<ResolvedPackageFileSnapshot> {
+        self.files
+            .sort_by(|left, right| left.portable_key.cmp(&right.portable_key));
+        self.files
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    fn snapshot_capability_directory(
+        &mut self,
+        directory: &cap_std::fs::Dir,
+        relative: &Path,
+        depth: usize,
+    ) -> Result<(), PackagePathError> {
+        self.enter_directory(relative, depth)?;
+        let entries = directory.entries().map_err(|error| {
+            invalid_path_error(relative, &format!("不能从稳定句柄枚举工具目录：{error}"))
+        })?;
+        let mut discovered = Vec::new();
+        for (index, entry) in entries.enumerate() {
+            self.record_directory_entry(relative, index)?;
+            let entry = entry.map_err(|error| {
+                invalid_path_error(relative, &format!("不能读取工具目录项：{error}"))
+            })?;
+            let name = PathBuf::from(entry.file_name());
+            let entry_relative = relative.join(&name);
+            match package_path_decision(&entry_relative, PackagePathPurpose::YxpEntry)? {
+                PackagePathDecision::Include => {}
+                PackagePathDecision::Exclude(_) => continue,
+            }
+            let file_type = entry.file_type().map_err(|error| {
+                invalid_path_error(&entry_relative, &format!("不能检查工具目录项：{error}"))
+            })?;
+            if file_type.is_symlink() || (!file_type.is_file() && !file_type.is_dir()) {
+                return Err(invalid_path_error(
+                    &entry_relative,
+                    "工具目录不得包含符号链接、Windows 重解析点或特殊文件",
+                ));
+            }
+            if file_type.is_dir() {
+                self.portable_paths.insert_directory(&entry_relative)?;
+            } else {
+                self.portable_paths.insert(&entry_relative)?;
+            }
+            let portable_name = portable_package_path(&name)?;
+            discovered.push((
+                portable_name,
+                CapabilityPackageDirectoryEntry {
+                    name,
+                    is_directory: file_type.is_dir(),
+                    is_file: file_type.is_file(),
+                    is_symlink: file_type.is_symlink(),
+                },
+                entry_relative,
+            ));
+        }
+        discovered.sort_by(|left, right| left.0.cmp(&right.0));
+
+        for (portable_name, entry, entry_relative) in discovered {
+            if entry.is_directory {
+                let child = open_capability_package_directory(
+                    directory,
+                    &entry,
+                    &entry_relative,
+                    &portable_name,
+                    &entry_relative,
+                )?;
+                self.snapshot_capability_directory(&child, &entry_relative, depth + 1)?;
+                continue;
+            }
+            let file =
+                open_capability_package_file(directory, &entry, &entry_relative, &portable_name)?;
+            if entry
+                .name
+                .extension()
+                .is_some_and(|extension| extension == "yx")
+            {
+                self.files.push(ResolvedPackageFileSnapshot::new(
+                    self.root_identity.join(&entry_relative),
+                    portable_package_path(&entry_relative)?,
+                    self.roots.clone(),
+                    &file,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "wasi")]
+    fn snapshot_wasi_directory(
+        &mut self,
+        directory: &WasiPackageDirectory,
+        relative: &Path,
+        depth: usize,
+    ) -> Result<(), PackagePathError> {
+        self.enter_directory(relative, depth)?;
+        let entries = directory
+            .entries(TOOLING_DIRECTORY_MAX_ENTRIES)
+            .map_err(|error| {
+                invalid_path_error(relative, &format!("不能从稳定句柄枚举工具目录：{error}"))
+            })?;
+        for (index, entry) in entries.into_iter().enumerate() {
+            self.record_directory_entry(relative, index)?;
+            let entry_relative = relative.join(entry.name());
+            match package_path_decision(&entry_relative, PackagePathPurpose::YxpEntry)? {
+                PackagePathDecision::Include => {}
+                PackagePathDecision::Exclude(_) => continue,
+            }
+            match directory.open_entry_nofollow(&entry).map_err(|error| {
+                invalid_path_error(&entry_relative, &format!("不能安全打开工具目录项：{error}"))
+            })? {
+                WasiPackageEntry::Directory(child) => {
+                    self.portable_paths.insert_directory(&entry_relative)?;
+                    self.snapshot_wasi_directory(&child, &entry_relative, depth + 1)?;
+                }
+                WasiPackageEntry::File(file) => {
+                    self.portable_paths.insert(&entry_relative)?;
+                    if entry
+                        .name()
+                        .extension()
+                        .is_some_and(|extension| extension == "yx")
+                    {
+                        self.files.push(ResolvedPackageFileSnapshot::new(
+                            self.root_identity.join(&entry_relative),
+                            portable_package_path(&entry_relative)?,
+                            self.roots.clone(),
+                            &file,
+                        )?);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(not(target_os = "wasi"))]
 fn resolve_existing_file_from_root(
     root: TrustedRootMatch<'_>,
@@ -3113,6 +3498,100 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, PACKAGE_PATH_NON_PORTABLE_CODE);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovered_module_snapshot_rejects_same_name_file_replacement() {
+        use std::io::Read as _;
+
+        let root = temporary_directory("tooling-file-replacement");
+        let module = root.join("模块.yx");
+        let original = root.join("原模块.yx");
+        fs::write(&module, "言「发现时」；\n").unwrap();
+        let mut roots = TrustedPackageRoots::default();
+        roots.insert(&root).unwrap();
+        let mut files = roots.snapshot_module_directory(&root).unwrap().unwrap();
+        assert_eq!(files.len(), 1);
+
+        fs::rename(&module, &original).unwrap();
+        fs::write(&module, "言「替换后」；\n").unwrap();
+        let error = files.remove(0).open().unwrap_err();
+        assert_eq!(error.code, PACKAGE_PATH_INVALID_CODE);
+        assert!(error.message.contains("同名替换"), "{error}");
+
+        let snapshot = roots
+            .snapshot_existing_module_file(&module)
+            .unwrap()
+            .unwrap();
+        let mut source = String::new();
+        snapshot
+            .open()
+            .unwrap()
+            .into_file()
+            .read_to_string(&mut source)
+            .unwrap();
+        assert_eq!(source, "言「替换后」；\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn discovered_module_snapshot_keeps_the_opened_root_identity() {
+        use std::io::Read as _;
+
+        let root = temporary_directory("tooling-root-replacement");
+        let backup = root.with_extension("original");
+        fs::write(root.join("模块.yx"), "言「原根」；\n").unwrap();
+        let mut roots = TrustedPackageRoots::default();
+        roots.insert(&root).unwrap();
+        let mut files = roots.snapshot_module_directory(&root).unwrap().unwrap();
+
+        fs::rename(&root, &backup).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("模块.yx"), "言「替换根」；\n").unwrap();
+
+        let mut source = String::new();
+        files
+            .remove(0)
+            .open()
+            .unwrap()
+            .into_file()
+            .read_to_string(&mut source)
+            .unwrap();
+        assert_eq!(source, "言「原根」；\n");
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
+    }
+
+    #[test]
+    fn tooling_snapshot_budgets_accept_the_boundary_and_reject_one_more() {
+        let roots = Arc::new(TrustedPackageRoots::default());
+        let mut directory = ToolingModuleSnapshotWalker::new(Path::new("/工具根"), roots.clone());
+        assert!(
+            directory
+                .enter_directory(Path::new("深目录"), TOOLING_TREE_MAX_DEPTH)
+                .is_ok()
+        );
+        let depth = directory
+            .enter_directory(Path::new("过深目录"), TOOLING_TREE_MAX_DEPTH + 1)
+            .unwrap_err();
+        assert!(depth.message.contains("目录深度"), "{depth}");
+        for index in 0..TOOLING_DIRECTORY_MAX_ENTRIES {
+            directory
+                .record_directory_entry(Path::new("宽目录"), index)
+                .unwrap();
+        }
+        let width = directory
+            .record_directory_entry(Path::new("宽目录"), TOOLING_DIRECTORY_MAX_ENTRIES)
+            .unwrap_err();
+        assert!(width.message.contains("单个工具目录"), "{width}");
+
+        let mut tree = ToolingModuleSnapshotWalker::new(Path::new("/工具根"), roots);
+        for _ in 0..TOOLING_TREE_MAX_ENTRIES {
+            tree.record_entry(Path::new("工具树")).unwrap();
+        }
+        let total = tree.record_entry(Path::new("工具树")).unwrap_err();
+        assert!(total.message.contains("工具目录项"), "{total}");
     }
 
     #[test]

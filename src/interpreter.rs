@@ -842,6 +842,7 @@ pub struct Interpreter {
     current_dir: PathBuf,
     package_root: Option<PathBuf>,
     package_module_roots: crate::package::TrustedPackageRoots,
+    opened_module_roots_only: bool,
     module_cache: HashMap<PathBuf, Rc<YanxuModule>>,
     loading_modules: Vec<PathBuf>,
     initialization_order: Vec<PathBuf>,
@@ -956,6 +957,7 @@ impl Interpreter {
             current_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             package_root: None,
             package_module_roots: crate::package::TrustedPackageRoots::default(),
+            opened_module_roots_only: false,
             module_cache: HashMap::new(),
             loading_modules: Vec::new(),
             initialization_order: Vec::new(),
@@ -1002,7 +1004,7 @@ impl Interpreter {
     }
 
     pub fn execute(&mut self, statements: &[Stmt]) -> Result<Value, RuntimeError> {
-        self.execute_at(statements, None)
+        self.execute_at(statements, None, None)
     }
 
     pub fn execute_in_directory(
@@ -1010,13 +1012,23 @@ impl Interpreter {
         statements: &[Stmt],
         directory: &Path,
     ) -> Result<Value, RuntimeError> {
-        self.execute_at(statements, Some(directory))
+        self.execute_at(statements, Some(directory), None)
+    }
+
+    pub(crate) fn execute_in_directory_with_opened_roots(
+        &mut self,
+        statements: &[Stmt],
+        directory: &Path,
+        opened_roots: &crate::package::TrustedPackageRoots,
+    ) -> Result<Value, RuntimeError> {
+        self.execute_at(statements, Some(directory), Some(opened_roots))
     }
 
     fn execute_at(
         &mut self,
         statements: &[Stmt],
         directory: Option<&Path>,
+        opened_roots: Option<&crate::package::TrustedPackageRoots>,
     ) -> Result<Value, RuntimeError> {
         self.resources.reset();
         let execution_directory = directory.map(|directory| {
@@ -1027,24 +1039,37 @@ impl Interpreter {
                     .unwrap_or_else(|_| PathBuf::from("."))
                     .join(directory)
             };
-            fs::canonicalize(&absolute).unwrap_or(absolute)
+            if opened_roots.is_some() {
+                absolute
+            } else {
+                fs::canonicalize(&absolute).unwrap_or(absolute)
+            }
         });
-        let package_root = execution_directory
-            .as_deref()
-            .map(|directory| crate::package::discover(directory).map_err(RuntimeError::package))
-            .transpose()?
-            .flatten()
-            .map(|manifest| {
-                fs::canonicalize(&manifest.root).map_err(|error| {
-                    RuntimeError::new(format!(
-                        "不能定位包根目录“{}”：{error}",
-                        manifest.root.display()
-                    ))
+        let package_root = if let Some(opened_roots) = opened_roots {
+            execution_directory
+                .as_deref()
+                .and_then(|directory| opened_roots.matching_root(directory))
+                .map(Path::to_path_buf)
+        } else {
+            execution_directory
+                .as_deref()
+                .map(|directory| crate::package::discover(directory).map_err(RuntimeError::package))
+                .transpose()?
+                .flatten()
+                .map(|manifest| {
+                    fs::canonicalize(&manifest.root).map_err(|error| {
+                        RuntimeError::new(format!(
+                            "不能定位包根目录“{}”：{error}",
+                            manifest.root.display()
+                        ))
+                    })
                 })
-            })
-            .transpose()?;
-        let mut package_module_roots = crate::package::TrustedPackageRoots::default();
-        if let Some(root) = &package_root {
+                .transpose()?
+        };
+        let mut package_module_roots = opened_roots.cloned().unwrap_or_default();
+        if opened_roots.is_none()
+            && let Some(root) = &package_root
+        {
             package_module_roots
                 .insert(root)
                 .map_err(RuntimeError::package_path)?;
@@ -1060,6 +1085,8 @@ impl Interpreter {
             directory.map(|_| std::mem::replace(&mut self.package_root, package_root));
         let previous_package_module_roots = directory
             .map(|_| std::mem::replace(&mut self.package_module_roots, package_module_roots));
+        let previous_opened_module_roots_only = directory
+            .map(|_| std::mem::replace(&mut self.opened_module_roots_only, opened_roots.is_some()));
         let owns_debug_frame = self.debug_hook.is_some() && self.debug_frames.is_empty();
         if owns_debug_frame {
             self.debug_frames.push(ActiveDebugFrame {
@@ -1086,6 +1113,9 @@ impl Interpreter {
         }
         if let Some(previous) = previous_package_module_roots {
             self.package_module_roots = previous;
+        }
+        if let Some(previous) = previous_opened_module_roots_only {
+            self.opened_module_roots_only = previous;
         }
         self.current_module_id = previous_module_id;
         self.collect_garbage(result.as_ref().ok());
@@ -2950,13 +2980,21 @@ impl Interpreter {
             return standard_module(name);
         }
         let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            let (dependency, capabilities) =
+            let (dependency, capabilities) = if self.opened_module_roots_only {
+                crate::package::resolve_dependency_scoped_with_opened_capabilities(
+                    &self.package_module_roots,
+                    self.package_root.as_deref(),
+                    &self.current_dir,
+                    name,
+                )
+            } else {
                 crate::package::resolve_dependency_scoped_with_capabilities(
                     self.package_root.as_deref(),
                     &self.current_dir,
                     name,
                 )
-                .map_err(RuntimeError::package)?;
+            }
+            .map_err(RuntimeError::package)?;
             capabilities
                 .extend(&mut self.package_module_roots)
                 .map_err(RuntimeError::package_path)?;
@@ -2974,10 +3012,17 @@ impl Interpreter {
                 .check_file(&joined)
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
         }
-        let (resolved, authority) = self
-            .package_module_roots
-            .resolve_import_file(&self.current_dir, &joined, package_import)
-            .map_err(RuntimeError::package)?;
+        let (resolved, authority) = if self.opened_module_roots_only {
+            self.package_module_roots
+                .resolve_import_file_from_opened_roots(&self.current_dir, &joined, package_import)
+        } else {
+            self.package_module_roots.resolve_import_file(
+                &self.current_dir,
+                &joined,
+                package_import,
+            )
+        }
+        .map_err(RuntimeError::package)?;
         let canonical = resolved.path().to_path_buf();
         if let Err(error) = self.permissions.check_file(&canonical)
             && !authority.is_verified()

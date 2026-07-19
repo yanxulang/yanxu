@@ -71,13 +71,21 @@ impl CompatibilityReport {
 }
 
 pub fn run(root: impl AsRef<Path>) -> Result<CompatibilityReport, String> {
+    run_with_hook(root, || Ok(()))
+}
+
+fn run_with_hook(
+    root: impl AsRef<Path>,
+    after_discovery: impl FnOnce() -> Result<(), String>,
+) -> Result<CompatibilityReport, String> {
     let requested = root.as_ref();
     let (root, paths) = crate::testing::discover_with_root(requested)?;
     if paths.is_empty() {
         return Err(format!("未在“{}”找到兼容语料", root.display()));
     }
+    after_discovery()?;
     let cases = paths
-        .iter()
+        .into_iter()
         .map(|path| run_case(&root, path))
         .collect::<Vec<_>>();
     Ok(CompatibilityReport {
@@ -88,10 +96,12 @@ pub fn run(root: impl AsRef<Path>) -> Result<CompatibilityReport, String> {
     })
 }
 
-fn run_case(root: &Path, path: &Path) -> CompatibilityCase {
+fn run_case(root: &Path, file: crate::package::ResolvedPackageFileSnapshot) -> CompatibilityCase {
+    let path = file.path().to_path_buf();
+    let opened_roots = file.opened_roots();
     let display_path = path
         .strip_prefix(root)
-        .unwrap_or(path)
+        .unwrap_or(&path)
         .to_string_lossy()
         .into_owned();
     let failed = |detail: String| CompatibilityCase {
@@ -101,17 +111,22 @@ fn run_case(root: &Path, path: &Path) -> CompatibilityCase {
         tree: frontend_failure(&detail),
         bytecode: frontend_failure(&detail),
     };
-    let (canonical, source) = match crate::read_module_source_file(path) {
-        Ok(source) => source,
-        Err(error) => return failed(error),
+    let resolved = match file.open() {
+        Ok(resolved) => resolved,
+        Err(error) => return failed(error.to_string()),
     };
-    let statements = match crate::parse_named(&source, canonical.display().to_string()) {
+    let source = match crate::package::read_resolved_module_source_snapshot(resolved) {
+        Ok(source) => source,
+        Err(error) => return failed(format!("不能读取“{}”：{error}", path.display())),
+    };
+    let statements = match crate::parse_named(&source, path.display().to_string()) {
         Ok(statements) => statements,
         Err(error) => return failed(error.to_string()),
     };
-    let directory = canonical.parent().unwrap_or_else(|| Path::new("."));
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let mut interpreter = Interpreter::silent();
-    let tree_result = interpreter.execute_in_directory(&statements, directory);
+    let tree_result =
+        interpreter.execute_in_directory_with_opened_roots(&statements, directory, &opened_roots);
     let tree = RuntimeOutcome {
         succeeded: tree_result.is_ok(),
         value: tree_result.as_ref().ok().map(ToString::to_string),
@@ -122,7 +137,8 @@ fn run_case(root: &Path, path: &Path) -> CompatibilityCase {
     let mut vm = Vm::silent();
     let bytecode = match bytecode::compile(&statements) {
         Ok(chunk) => {
-            let result = vm.execute_in_directory(&chunk, directory);
+            let result =
+                vm.execute_in_directory_with_opened_roots(&chunk, directory, &opened_roots);
             RuntimeOutcome {
                 succeeded: result.is_ok(),
                 value: result.as_ref().ok().map(ToString::to_string),
@@ -158,6 +174,10 @@ fn frontend_failure(message: &str) -> RuntimeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    use std::fs;
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn shipped_corpus_matches_both_runtimes_and_has_versioned_json() {
@@ -167,5 +187,79 @@ mod tests {
         assert!(report.cases.len() >= 7);
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["schema_version"], COMPATIBILITY_SCHEMA_VERSION);
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn compatibility_run_uses_the_discovered_root_snapshot() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yanxu-compat-snapshot-{unique}"));
+        let backup = root.with_extension("original");
+        fs::create_dir_all(root.join("子目录")).unwrap();
+        fs::write(
+            root.join("子目录/用例.yx"),
+            "引「辅助.yx」为 辅助；\n言 辅助.值；\n",
+        )
+        .unwrap();
+        fs::write(root.join("子目录/辅助.yx"), "公 定 值：文 为「原根」；\n").unwrap();
+        fs::write(root.join("子目录/包用例.yx"), "引「包:不存在」为 工具；\n").unwrap();
+
+        let report = run_with_hook(&root, || {
+            fs::rename(&root, &backup).map_err(|error| error.to_string())?;
+            fs::create_dir_all(root.join("子目录")).map_err(|error| error.to_string())?;
+            fs::write(
+                root.join("子目录/言序.toml"),
+                "[包]\n格式 = 2\n名称 = \"替换包\"\n版本 = \"0.1.0\"\n言序 = \">=1.1.15\"\n入口 = \"用例.yx\"\n\n[依赖]\n",
+            )
+            .map_err(|error| error.to_string())?;
+            fs::write(
+                root.join("子目录/用例.yx"),
+                "引「辅助.yx」为 辅助；\n言 辅助.值；\n",
+            )
+            .map_err(|error| error.to_string())?;
+            fs::write(
+                root.join("子目录/辅助.yx"),
+                "公 定 值：文 为「替换根」；\n",
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        let case = report
+            .cases
+            .iter()
+            .find(|case| case.path.ends_with("子目录/用例.yx"))
+            .unwrap();
+        assert!(case.passed, "{case:#?}");
+        assert_eq!(case.tree.output, ["原根"]);
+        assert_eq!(case.bytecode.output, ["原根"]);
+        let package_case = report
+            .cases
+            .iter()
+            .find(|case| case.path.ends_with("子目录/包用例.yx"))
+            .unwrap();
+        assert!(!package_case.tree.succeeded, "{package_case:#?}");
+        assert!(!package_case.bytecode.succeeded, "{package_case:#?}");
+        assert!(
+            package_case
+                .tree
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("工具包根在目录发现后被替换")),
+            "{package_case:#?}"
+        );
+        assert!(
+            package_case
+                .bytecode
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("工具包根在目录发现后被替换")),
+            "{package_case:#?}"
+        );
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
     }
 }

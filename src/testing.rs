@@ -3,7 +3,7 @@
 use crate::interpreter::Interpreter;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -85,12 +85,17 @@ pub struct TestCaseResult {
 }
 
 pub fn discover(path: impl AsRef<Path>) -> Result<Vec<PathBuf>, String> {
-    discover_with_root(path).map(|(_, files)| files)
+    discover_with_root(path).map(|(_, files)| {
+        files
+            .into_iter()
+            .map(|file| file.path().to_path_buf())
+            .collect()
+    })
 }
 
 pub(crate) fn discover_with_root(
     path: impl AsRef<Path>,
-) -> Result<(PathBuf, Vec<PathBuf>), String> {
+) -> Result<(PathBuf, Vec<crate::package::ResolvedPackageFileSnapshot>), String> {
     let requested = path.as_ref();
     if fs::symlink_metadata(requested).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(format!("测试入口不得为符号链接“{}”", requested.display()));
@@ -129,30 +134,37 @@ pub(crate) fn discover_with_root(
     roots
         .insert_discovered(&path)
         .map_err(|error| error.to_string())?;
-    if path.is_file() {
+    let is_file = path.is_file();
+    if roots.matching_root(&path).is_none() {
+        let explicit_root = if is_file {
+            path.parent().unwrap_or_else(|| Path::new("."))
+        } else {
+            &path
+        };
+        roots
+            .insert(explicit_root)
+            .map_err(|error| error.to_string())?;
+    }
+    if is_file {
         roots
             .authorize_module(&requested_absolute, &path)
             .map_err(|error| error.to_string())?;
-        return Ok((path.clone(), vec![path]));
+        let file = roots
+            .snapshot_existing_module_file(&path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("测试文卷不属于已打开的目录“{}”", path.display()))?;
+        return Ok((path, vec![file]));
     }
     if roots.roots().all(|root| root != path) {
         roots
             .authorize_module(&requested_absolute, &path)
             .map_err(|error| error.to_string())?;
     }
-    let mut files = Vec::new();
-    let mut portable_paths = BTreeMap::new();
-    visit(&path, &roots, &mut portable_paths, &mut files)?;
-    files.sort_by_key(|file| testing_path_key(&roots, file));
+    let files = roots
+        .snapshot_module_directory(&path)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("测试目录不属于已打开的根能力“{}”", path.display()))?;
     Ok((path, files))
-}
-
-fn testing_path_key(roots: &crate::package::TrustedPackageRoots, path: &Path) -> String {
-    roots
-        .matching_root(path)
-        .and_then(|root| path.strip_prefix(root).ok())
-        .and_then(|relative| crate::package::portable_package_path(relative).ok())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 pub fn run(path: impl AsRef<Path>) -> Result<Vec<TestCaseResult>, String> {
@@ -169,9 +181,9 @@ pub fn run_with_options(
     if options.timeout.is_zero() {
         return Err("超时须大于零".into());
     }
-    let mut paths = discover(path)?;
+    let (_, mut paths) = discover_with_root(path)?;
     if let Some(filter) = options.filter.as_deref() {
-        paths.retain(|path| path.to_string_lossy().contains(filter));
+        paths.retain(|path| path.path().to_string_lossy().contains(filter));
     }
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -253,20 +265,26 @@ pub fn machine_report(results: &[TestCaseResult]) -> Value {
     })
 }
 
-fn run_case_with_timeout(path: PathBuf, timeout: Duration) -> Result<TestCaseResult, String> {
+fn run_case_with_timeout(
+    file: crate::package::ResolvedPackageFileSnapshot,
+    timeout: Duration,
+) -> Result<TestCaseResult, String> {
     #[cfg(test)]
     let _active = ActiveTestExecution::begin();
+    let path = file.path().to_path_buf();
     let started = Instant::now();
-    let result =
-        std::panic::catch_unwind(|| run_case(&path, started, timeout)).unwrap_or_else(|_| {
-            Ok(TestCaseResult {
-                path: path.clone(),
-                passed: false,
-                status: TestStatus::Failed,
-                detail: "测试执行时发生内部恐慌".into(),
-                duration_ms: 0,
-            })
-        });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_case(file, started, timeout)
+    }))
+    .unwrap_or_else(|_| {
+        Ok(TestCaseResult {
+            path: path.clone(),
+            passed: false,
+            status: TestStatus::Failed,
+            detail: "测试执行时发生内部恐慌".into(),
+            duration_ms: 0,
+        })
+    });
     let elapsed = started.elapsed();
     if elapsed >= timeout {
         Ok(TestCaseResult {
@@ -284,8 +302,16 @@ fn run_case_with_timeout(path: PathBuf, timeout: Duration) -> Result<TestCaseRes
     }
 }
 
-fn run_case(path: &Path, started: Instant, timeout: Duration) -> Result<TestCaseResult, String> {
-    let (canonical, source) = crate::read_module_source_file(path)?;
+fn run_case(
+    file: crate::package::ResolvedPackageFileSnapshot,
+    started: Instant,
+    timeout: Duration,
+) -> Result<TestCaseResult, String> {
+    let canonical = file.path().to_path_buf();
+    let opened_roots = file.opened_roots();
+    let resolved = file.open().map_err(|error| error.to_string())?;
+    let source = crate::package::read_resolved_module_source_snapshot(resolved)
+        .map_err(|error| format!("不能读取“{}”：{error}", canonical.display()))?;
     let expected = expectations(&source);
     let expected_failure = expected_failure(&source);
     let mut interpreter = Interpreter::silent();
@@ -299,9 +325,10 @@ fn run_case(path: &Path, started: Instant, timeout: Duration) -> Result<TestCase
             }
             interpreter.set_time_limit(remaining);
             interpreter
-                .execute_in_directory(
+                .execute_in_directory_with_opened_roots(
                     &statements,
                     canonical.parent().unwrap_or_else(|| Path::new(".")),
+                    &opened_roots,
                 )
                 .map_err(crate::YanxuError::Runtime)
         }
@@ -343,7 +370,7 @@ fn run_case(path: &Path, started: Instant, timeout: Duration) -> Result<TestCase
         (None, false) => (false, TestStatus::Failed, detail),
     };
     Ok(TestCaseResult {
-        path: path.to_path_buf(),
+        path: canonical,
         passed,
         status,
         detail,
@@ -357,55 +384,6 @@ fn testing_package_roots(path: &Path) -> Result<crate::package::TrustedPackageRo
         .insert_discovered(path)
         .map_err(|error| error.to_string())?;
     Ok(roots)
-}
-
-fn visit(
-    path: &Path,
-    roots: &crate::package::TrustedPackageRoots,
-    portable_paths: &mut BTreeMap<PathBuf, crate::package::PortablePackagePaths>,
-    files: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    let entries =
-        fs::read_dir(path).map_err(|error| format!("不能读取目录“{}”：{error}", path.display()))?;
-    for entry in entries {
-        let path = entry.map_err(|error| error.to_string())?.path();
-        if let Some(root) = roots.matching_root(&path) {
-            let relative = path.strip_prefix(root).expect("matching package root");
-            match crate::package::package_path_decision(
-                relative,
-                crate::package::PackagePathPurpose::YxpEntry,
-            )
-            .map_err(|error| error.to_string())?
-            {
-                crate::package::PackagePathDecision::Include => {}
-                crate::package::PackagePathDecision::Exclude(_) => continue,
-            }
-            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-            let paths = portable_paths.entry(root.to_path_buf()).or_default();
-            if metadata.is_dir() {
-                paths
-                    .insert_directory(relative)
-                    .map_err(|error| error.to_string())?;
-            } else {
-                paths.insert(relative).map_err(|error| error.to_string())?;
-            }
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!("测试目录不得包含符号链接“{}”", path.display()));
-        }
-        let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
-        if metadata.is_dir() {
-            visit(&canonical, roots, portable_paths, files)?;
-        } else if metadata.is_file() && path.extension().is_some_and(|extension| extension == "yx")
-        {
-            roots
-                .authorize_module(&path, &canonical)
-                .map_err(|error| error.to_string())?;
-            files.push(canonical);
-        }
-    }
-    Ok(())
 }
 
 fn expectations(source: &str) -> Vec<String> {
@@ -485,6 +463,90 @@ mod tests {
         assert_eq!(report["summary"]["expectedFailures"], 1);
         assert_eq!(report["tests"][0]["status"], "expected_failure");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn discovered_test_uses_the_opened_root_after_path_replacement() {
+        let _run = RUN_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yanxu-test-snapshot-{unique}"));
+        let backup = root.with_extension("original");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("用例.yx"),
+            "引「辅助.yx」为 辅助；\n# 期：原根\n言 辅助.值；\n",
+        )
+        .unwrap();
+        fs::write(root.join("辅助.yx"), "公 定 值：文 为「原根」；\n").unwrap();
+        let (_, mut files) = discover_with_root(&root).unwrap();
+        assert_eq!(files.len(), 2);
+
+        fs::rename(&root, &backup).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("用例.yx"),
+            "引「辅助.yx」为 辅助；\n# 期：替换根\n言 辅助.值；\n",
+        )
+        .unwrap();
+        fs::write(root.join("辅助.yx"), "公 定 值：文 为「替换根」；\n").unwrap();
+
+        let index = files
+            .iter()
+            .position(|file| file.path().ends_with("用例.yx"))
+            .unwrap();
+        let result = run_case_with_timeout(files.remove(index), Duration::from_secs(1)).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(result.status, TestStatus::Passed);
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn discovered_test_does_not_trust_a_replacement_nested_package_root() {
+        let _run = RUN_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yanxu-test-nested-snapshot-{unique}"));
+        let backup = root.with_extension("original");
+        fs::create_dir_all(root.join("子目录")).unwrap();
+        fs::write(
+            root.join("子目录/用例.yx"),
+            "引「辅助.yx」为 辅助；\n# 期：原根\n言 辅助.值；\n",
+        )
+        .unwrap();
+        fs::write(root.join("子目录/辅助.yx"), "公 定 值：文 为「原根」；\n").unwrap();
+        let (_, mut files) = discover_with_root(&root).unwrap();
+
+        fs::rename(&root, &backup).unwrap();
+        fs::create_dir_all(root.join("子目录")).unwrap();
+        fs::write(
+            root.join("子目录/言序.toml"),
+            "[包]\n格式 = 2\n名称 = \"替换包\"\n版本 = \"0.1.0\"\n言序 = \">=1.1.15\"\n入口 = \"用例.yx\"\n\n[依赖]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("子目录/用例.yx"),
+            "引「辅助.yx」为 辅助；\n# 期：替换根\n言 辅助.值；\n",
+        )
+        .unwrap();
+        fs::write(root.join("子目录/辅助.yx"), "公 定 值：文 为「替换根」；\n").unwrap();
+
+        let index = files
+            .iter()
+            .position(|file| file.path().ends_with("子目录/用例.yx"))
+            .unwrap();
+        let result = run_case_with_timeout(files.remove(index), Duration::from_secs(1)).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(result.status, TestStatus::Passed);
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
     }
 
     #[test]
