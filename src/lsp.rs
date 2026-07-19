@@ -257,7 +257,9 @@ fn package_member_completion_items(
         return Vec::new();
     };
     // Language servers must never introduce network I/O while completing.
-    let Ok(graph) = crate::package::resolve_graph(&manifest, true) else {
+    let Ok((graph, capabilities)) =
+        crate::package::resolve_graph_with_capabilities(&manifest, true)
+    else {
         return Vec::new();
     };
     let (dependency_alias, export_name) = package_path
@@ -276,7 +278,7 @@ fn package_member_completion_items(
     };
     let module_path = dependency.root.join(export);
     let mut trusted_package_roots = crate::package::TrustedPackageRoots::default();
-    if trusted_package_roots.insert(&dependency.root).is_err()
+    if capabilities.extend(&mut trusted_package_roots).is_err()
         || trusted_package_roots
             .validate_requested_import(&dependency.root, &module_path, true)
             .is_err()
@@ -687,10 +689,11 @@ impl LspModuleGraph {
             return Ok(ModuleId::standard(name));
         }
         let (path, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            let dependency = crate::package::resolve_dependency_scoped(None, directory, name)
-                .map_err(|error| error.to_string())?;
-            self.trusted_package_roots
-                .insert(&dependency.root)
+            let (dependency, capabilities) =
+                crate::package::resolve_dependency_scoped_with_capabilities(None, directory, name)
+                    .map_err(|error| error.to_string())?;
+            capabilities
+                .extend(&mut self.trusted_package_roots)
                 .map_err(|error| error.to_string())?;
             (dependency.entry, true)
         } else {

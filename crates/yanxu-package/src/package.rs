@@ -61,6 +61,7 @@ const REGISTRY_RELEASE_URL_MAX_BYTES: usize = 4_096;
 const REGISTRY_VULNERABILITY_MAX_COUNT: usize = 1_024;
 const REGISTRY_VULNERABILITY_ID_MAX_BYTES: usize = 256;
 const REGISTRY_VULNERABILITY_SUMMARY_MAX_BYTES: usize = 8_192;
+const RESOLUTION_GENERATION_LAYOUT: &str = "tree-v1";
 const MANIFEST_TOML_SYNTAX_ERROR: &str = "TOML 格式无效；请检查对应行的语法";
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -325,8 +326,10 @@ pub struct RegistryReleaseMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDependency {
     pub locked: LockedPackage,
-    /// 已经规范化并通过清单、版本与内容校验的包根目录。
+    /// 已经规范化并通过清单、版本与内容校验的不可变内容 generation。
+    /// 来源位置保留在 [`Self::locked`]；调用方不得假定本路径等于原路径依赖目录。
     pub root: PathBuf,
+    /// 位于同一不可变 generation 中的默认导出入口。
     pub entry: PathBuf,
 }
 
@@ -336,6 +339,45 @@ pub struct ResolutionGraph {
     pub root_dev_dependencies: BTreeMap<String, String>,
     pub packages: BTreeMap<String, ResolvedDependency>,
     pub target: String,
+}
+
+/// 一次解析中与公开依赖图逐项对应的已打开根能力。
+#[derive(Debug, Clone, Default)]
+#[doc(hidden)]
+pub struct ResolutionCapabilities {
+    roots: TrustedPackageRoots,
+}
+
+impl ResolutionCapabilities {
+    /// 把解析阶段已经打开的根合并到模块加载上下文，不再按路径重新打开。
+    pub fn extend(&self, destination: &mut TrustedPackageRoots) -> Result<(), PackagePathError> {
+        destination.extend_opened(&self.roots)
+    }
+
+    pub fn roots(&self) -> &TrustedPackageRoots {
+        &self.roots
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolutionInputFingerprint {
+    package_id: String,
+    source_root: PathBuf,
+    source_roots: TrustedPackageRoots,
+    generation_root: PathBuf,
+    generation_roots: TrustedPackageRoots,
+    checksum: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedGraphBundle {
+    graph: ResolutionGraph,
+    capabilities: ResolutionCapabilities,
+    application_root: PathBuf,
+    application_roots: TrustedPackageRoots,
+    manifest_checksum: String,
+    lock_checksum: Option<String>,
+    inputs: Vec<ResolutionInputFingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -754,6 +796,28 @@ pub fn load(path: impl AsRef<Path>) -> Result<Manifest, ManifestError> {
     parse(&text, path, root)
 }
 
+/// 从解析阶段已经打开的根能力读取规范清单，不根据 generation 路径重新打开。
+#[doc(hidden)]
+pub fn load_manifest_from_roots(
+    roots: &TrustedPackageRoots,
+    root: &Path,
+) -> Result<Manifest, ManifestError> {
+    let canonical_root = roots
+        .exact_root_identity(root)
+        .ok_or_else(|| manifest_error(root, None, "包根不属于解析阶段的目录能力"))?
+        .to_path_buf();
+    let path = canonical_root.join(MANIFEST_NAME);
+    let resolved = roots
+        .resolve_existing_file(&path, PackagePathPurpose::ManifestReference)
+        .map_err(|error| package_path_manifest_error(&path, error))?
+        .ok_or_else(|| manifest_error(&path, None, "规范包清单不属于已打开的包根"))?;
+    let bytes =
+        read_resolved_regular_file_snapshot(resolved, PACKAGE_TREE_MAX_FILE_BYTES, "规范包清单")?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| manifest_error(&path, None, format!("规范包清单不是 UTF-8：{error}")))?;
+    parse(text, path, canonical_root)
+}
+
 pub fn resolve_dependency(base: &Path, name: &str) -> Result<PathBuf, ManifestError> {
     resolve_dependency_info(base, name).map(|dependency| dependency.entry)
 }
@@ -782,6 +846,17 @@ pub fn resolve_dependency_scoped(
     current_base: &Path,
     name: &str,
 ) -> Result<ResolvedDependency, ManifestError> {
+    resolve_dependency_scoped_with_capabilities(package_root, current_base, name)
+        .map(|(dependency, _)| dependency)
+}
+
+/// 解析依赖并返回与缓存校验、内容 generation 相同的已打开目录能力。
+#[doc(hidden)]
+pub fn resolve_dependency_scoped_with_capabilities(
+    package_root: Option<&Path>,
+    current_base: &Path,
+    name: &str,
+) -> Result<(ResolvedDependency, ResolutionCapabilities), ManifestError> {
     let manifest = match package_root {
         Some(root) => discover(root)?,
         None => discover(current_base)?,
@@ -794,7 +869,8 @@ pub fn resolve_dependency_scoped(
         )
     })?;
     let offline = std::env::var_os("YANXU_OFFLINE").is_some();
-    let graph = cached_or_resolve_graph(&manifest, offline)?;
+    let resolved = cached_or_resolve_graph(&manifest, offline)?;
+    let graph = &resolved.graph;
     let canonical_base =
         fs::canonicalize(current_base).unwrap_or_else(|_| current_base.to_path_buf());
     let canonical_manifest_root =
@@ -807,12 +883,29 @@ pub fn resolve_dependency_scoped(
         .packages
         .values()
         .filter(|dependency| {
-            canonical_base.starts_with(&dependency.root)
+            let source_root = resolved
+                .inputs
+                .iter()
+                .find(|input| input.package_id == dependency.locked.id)
+                .map_or(dependency.root.as_path(), |input| {
+                    input.source_root.as_path()
+                });
+            (canonical_base.starts_with(&dependency.root)
+                || canonical_base.starts_with(source_root))
                 && (!current_is_application_source
-                    || (dependency.root != canonical_manifest_root
-                        && dependency.root.starts_with(&canonical_manifest_root)))
+                    || (source_root != canonical_manifest_root
+                        && source_root.starts_with(&canonical_manifest_root)))
         })
-        .max_by_key(|dependency| dependency.root.components().count())
+        .max_by_key(|dependency| {
+            resolved
+                .inputs
+                .iter()
+                .find(|input| input.package_id == dependency.locked.id)
+                .map_or_else(
+                    || dependency.root.components().count(),
+                    |input| input.source_root.components().count(),
+                )
+        })
         .map_or(&graph.root_dependencies, |dependency| {
             &dependency.locked.dependencies
         });
@@ -850,31 +943,27 @@ pub fn resolve_dependency_scoped(
     })?;
     package_path_decision(Path::new(exported), PackagePathPurpose::ModuleSource)
         .map_err(|error| package_path_manifest_error(&dependency.root, error))?;
-    let entry = resolve_existing_package_path(
-        &dependency.root,
-        Path::new(exported),
-        PackagePathPurpose::ModuleSource,
-    )
-    .map_err(|error| package_path_manifest_error(&dependency.root, error))?;
-    let metadata = fs::symlink_metadata(&entry).map_err(|error| {
-        manifest_error(&entry, None, format!("不能检查锁定包导出模块：{error}"))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(manifest_error(
-            &entry,
-            None,
-            "锁定包导出模块必须是普通文件，不得为目录、符号链接或特殊文件",
-        ));
-    }
     let mut roots = TrustedPackageRoots::default();
-    roots
-        .insert(&dependency.root)
-        .map_err(|error| package_path_manifest_error(&entry, error))?;
+    resolved
+        .capabilities
+        .extend(&mut roots)
+        .map_err(|error| package_path_manifest_error(&dependency.root, error))?;
+    let requested_entry = dependency.root.join(exported);
+    let entry = roots
+        .resolve_existing_module_path(&requested_entry)
+        .map_err(|error| package_path_manifest_error(&requested_entry, error))?
+        .ok_or_else(|| {
+            manifest_error(
+                &requested_entry,
+                None,
+                "锁定包导出模块不属于解析阶段的不可变 generation",
+            )
+        })?;
     roots
         .authorize_module(&entry, &entry)
         .map_err(|error| package_path_manifest_error(&entry, error))?;
     dependency.entry = entry;
-    Ok(dependency)
+    Ok((dependency, resolved.capabilities))
 }
 
 /// 解析全部依赖并写入或验证 `言序.lock`。
@@ -882,8 +971,9 @@ pub fn ensure_lock(
     manifest: &Manifest,
     offline: bool,
 ) -> Result<BTreeMap<String, ResolvedDependency>, ManifestError> {
-    let graph = resolve_graph(manifest, offline)?;
-    cache_graph(manifest, graph.clone());
+    let resolved = resolve_graph_mode(manifest, offline, true, true)?;
+    let graph = resolved.graph.clone();
+    cache_graph(manifest, resolved);
     direct_dependencies(&graph, &graph.root_dependencies, &manifest.path)
 }
 
@@ -891,18 +981,29 @@ pub fn ensure_lock_with_dev(
     manifest: &Manifest,
     offline: bool,
 ) -> Result<ResolutionGraph, ManifestError> {
-    let graph = resolve_graph(manifest, offline)?;
-    cache_graph(manifest, graph.clone());
+    let resolved = resolve_graph_mode(manifest, offline, true, true)?;
+    let graph = resolved.graph.clone();
+    cache_graph(manifest, resolved);
     Ok(graph)
 }
 
 pub fn resolve_graph(manifest: &Manifest, offline: bool) -> Result<ResolutionGraph, ManifestError> {
-    resolve_graph_mode(manifest, offline, true, true)
+    resolve_graph_mode(manifest, offline, true, true).map(|resolved| resolved.graph)
+}
+
+/// 解析公开依赖图并同时返回其 generation 的已打开目录能力。
+#[doc(hidden)]
+pub fn resolve_graph_with_capabilities(
+    manifest: &Manifest,
+    offline: bool,
+) -> Result<(ResolutionGraph, ResolutionCapabilities), ManifestError> {
+    let resolved = resolve_graph_mode(manifest, offline, true, true)?;
+    Ok((resolved.graph, resolved.capabilities))
 }
 
 /// 在不改写锁文件和运行时图缓存的前提下重新选择依赖，用于更新预演。
 pub fn plan_update(manifest: &Manifest, offline: bool) -> Result<ResolutionGraph, ManifestError> {
-    resolve_graph_mode(manifest, offline, false, false)
+    resolve_graph_mode(manifest, offline, false, false).map(|resolved| resolved.graph)
 }
 
 fn resolve_graph_mode(
@@ -910,7 +1011,7 @@ fn resolve_graph_mode(
     offline: bool,
     use_existing: bool,
     write: bool,
-) -> Result<ResolutionGraph, ManifestError> {
+) -> Result<ResolvedGraphBundle, ManifestError> {
     let _project_lock = write
         .then(|| acquire_project_lock(&manifest.root))
         .transpose()?;
@@ -922,14 +1023,17 @@ fn resolve_graph_mode_locked(
     offline: bool,
     use_existing: bool,
     write: bool,
-) -> Result<ResolutionGraph, ManifestError> {
-    let manifest_checksum = file_checksum(&manifest.path)?;
+) -> Result<ResolvedGraphBundle, ManifestError> {
+    let (application_root, application_roots, manifest_checksum) =
+        bind_resolution_manifest(manifest)?;
     resolve_graph_mode_locked_with_checksum(
         manifest,
         offline,
         use_existing,
         write,
         manifest_checksum,
+        application_root,
+        application_roots,
     )
 }
 
@@ -939,7 +1043,9 @@ fn resolve_graph_mode_locked_with_checksum(
     use_existing: bool,
     write: bool,
     manifest_checksum: String,
-) -> Result<ResolutionGraph, ManifestError> {
+    application_root: PathBuf,
+    application_roots: TrustedPackageRoots,
+) -> Result<ResolvedGraphBundle, ManifestError> {
     let lock_path = manifest.root.join(LOCK_NAME);
     let existing = use_existing
         .then(|| read_optional_lock(&lock_path))
@@ -982,7 +1088,7 @@ fn resolve_graph_mode_locked_with_checksum(
     packages.sort_by(|left, right| left.id.cmp(&right.id));
     let lock = LockFile {
         lock_version: LOCK_FORMAT_VERSION,
-        manifest_checksum,
+        manifest_checksum: manifest_checksum.clone(),
         target: graph.target.clone(),
         generator: package_core_version(),
         root_dependencies: graph.root_dependencies.clone(),
@@ -992,7 +1098,14 @@ fn resolve_graph_mode_locked_with_checksum(
     if write && existing.as_ref() != Some(&lock) {
         write_lock(&lock_path, &lock)?;
     }
-    Ok(graph)
+    freeze_resolution_graph(
+        manifest,
+        graph,
+        manifest_checksum,
+        application_root,
+        application_roots,
+        write.then_some(&lock),
+    )
 }
 
 /// 在项目跨进程锁的整个生命周期内解析依赖并执行构建操作。
@@ -1009,20 +1122,37 @@ where
     E: From<ManifestError>,
 {
     let _project_lock = acquire_project_lock(&manifest.root).map_err(E::from)?;
-    let graph = resolve_graph_mode_locked(manifest, offline, true, true).map_err(E::from)?;
-    cache_graph(manifest, graph.clone());
+    let resolved = resolve_graph_mode_locked(manifest, offline, true, true).map_err(E::from)?;
+    let graph = resolved.graph.clone();
+    cache_graph(manifest, resolved);
     operation(graph)
+}
+
+/// 与项目锁一起把解析图和同一批已打开 generation 能力交给构建消费者。
+#[doc(hidden)]
+pub fn with_locked_resolution_capabilities<T, E>(
+    manifest: &Manifest,
+    offline: bool,
+    operation: impl FnOnce(ResolutionGraph, ResolutionCapabilities) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<ManifestError>,
+{
+    let _project_lock = acquire_project_lock(&manifest.root).map_err(E::from)?;
+    let resolved = resolve_graph_mode_locked(manifest, offline, true, true).map_err(E::from)?;
+    let graph = resolved.graph.clone();
+    let capabilities = resolved.capabilities.clone();
+    cache_graph(manifest, resolved);
+    operation(graph, capabilities)
 }
 
 pub fn update_lock(
     manifest: &Manifest,
     offline: bool,
 ) -> Result<BTreeMap<String, ResolvedDependency>, ManifestError> {
-    let graph = resolve_graph_mode(manifest, offline, false, true)?;
-    graph_cache()
-        .lock()
-        .expect("graph cache poisoned")
-        .insert(graph_cache_key(&manifest.root), graph.clone());
+    let resolved = resolve_graph_mode(manifest, offline, false, true)?;
+    let graph = resolved.graph.clone();
+    cache_graph(manifest, resolved);
     direct_dependencies(&graph, &graph.root_dependencies, &manifest.path)
 }
 
@@ -1039,7 +1169,11 @@ pub fn read_lock(path: impl AsRef<Path>) -> Result<LockFile, ManifestError> {
     }
     let text = fs::read_to_string(path)
         .map_err(|error| manifest_error(path, None, format!("不能读取锁文件：{error}")))?;
-    let lock: LockFile = toml::from_str(&text)
+    parse_lock_text(path, &text)
+}
+
+fn parse_lock_text(path: &Path, text: &str) -> Result<LockFile, ManifestError> {
+    let lock: LockFile = toml::from_str(text)
         .map_err(|_| manifest_error(path, None, "锁文件格式无效；请检查或重新生成锁文件"))?;
     validate_lock_source_security(path, &lock)?;
     if !SUPPORTED_LOCK_FORMATS.contains(&lock.lock_version) {
@@ -1360,9 +1494,9 @@ fn direct_dependencies(
         .collect()
 }
 
-static GRAPH_CACHE: OnceLock<Mutex<HashMap<PathBuf, ResolutionGraph>>> = OnceLock::new();
+static GRAPH_CACHE: OnceLock<Mutex<HashMap<PathBuf, ResolvedGraphBundle>>> = OnceLock::new();
 
-fn graph_cache() -> &'static Mutex<HashMap<PathBuf, ResolutionGraph>> {
+fn graph_cache() -> &'static Mutex<HashMap<PathBuf, ResolvedGraphBundle>> {
     GRAPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1370,28 +1504,345 @@ fn graph_cache_key(root: &Path) -> PathBuf {
     fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
-fn cache_graph(manifest: &Manifest, graph: ResolutionGraph) {
+fn cache_graph(manifest: &Manifest, resolved: ResolvedGraphBundle) {
     graph_cache()
         .lock()
         .expect("graph cache poisoned")
-        .insert(graph_cache_key(&manifest.root), graph);
+        .insert(graph_cache_key(&manifest.root), resolved);
 }
 
 fn cached_or_resolve_graph(
     manifest: &Manifest,
     offline: bool,
-) -> Result<ResolutionGraph, ManifestError> {
-    if let Some(graph) = graph_cache()
+) -> Result<ResolvedGraphBundle, ManifestError> {
+    let key = graph_cache_key(&manifest.root);
+    let cached = graph_cache()
         .lock()
         .expect("graph cache poisoned")
-        .get(&graph_cache_key(&manifest.root))
-        .cloned()
-    {
-        return Ok(graph);
+        .get(&key)
+        .cloned();
+    if let Some(resolved) = cached {
+        if validate_cached_resolution(&resolved)? {
+            return Ok(resolved);
+        }
+        return Err(manifest_error(
+            &manifest.path,
+            None,
+            "依赖图缓存的应用根、清单、锁文件、目标、来源树或不可变 generation 已改变；请显式运行 yanbao install 或 yanbao update",
+        ));
     }
-    let graph = resolve_graph(manifest, offline)?;
-    cache_graph(manifest, graph.clone());
-    Ok(graph)
+    let current = load(&manifest.path)?;
+    let resolved = resolve_graph_mode(&current, offline, true, true)?;
+    cache_graph(&current, resolved.clone());
+    Ok(resolved)
+}
+
+fn bound_file_snapshot(
+    roots: &TrustedPackageRoots,
+    path: &Path,
+    purpose: PackagePathPurpose,
+    kind: &str,
+) -> Result<Vec<u8>, ManifestError> {
+    let resolved = roots
+        .resolve_existing_file(path, purpose)
+        .map_err(|error| package_path_manifest_error(path, error))?
+        .ok_or_else(|| manifest_error(path, None, format!("{kind}不属于已打开的包根")))?;
+    read_resolved_regular_file_snapshot(resolved, PACKAGE_TREE_MAX_FILE_BYTES, kind)
+}
+
+fn bound_file_checksum(
+    roots: &TrustedPackageRoots,
+    path: &Path,
+    purpose: PackagePathPurpose,
+    kind: &str,
+) -> Result<String, ManifestError> {
+    let bytes = bound_file_snapshot(roots, path, purpose, kind)?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn bind_resolution_manifest(
+    manifest: &Manifest,
+) -> Result<(PathBuf, TrustedPackageRoots, String), ManifestError> {
+    let mut application_roots = TrustedPackageRoots::new();
+    application_roots
+        .insert(&manifest.root)
+        .map_err(|error| package_path_manifest_error(&manifest.path, error))?;
+    let application_root = application_roots
+        .exact_root_identity(&manifest.root)
+        .ok_or_else(|| manifest_error(&manifest.root, None, "不能绑定应用包根能力"))?
+        .to_path_buf();
+    let bound_manifest_path = application_root.join(MANIFEST_NAME);
+    let caller_manifest_path = fs::canonicalize(&manifest.path).map_err(|error| {
+        manifest_error(
+            &manifest.path,
+            None,
+            format!("不能定位调用方包清单：{error}"),
+        )
+    })?;
+    let canonical_manifest_path = fs::canonicalize(&bound_manifest_path).map_err(|error| {
+        manifest_error(
+            &bound_manifest_path,
+            None,
+            format!("不能定位规范包清单：{error}"),
+        )
+    })?;
+    if caller_manifest_path != canonical_manifest_path {
+        return Err(manifest_error(
+            &manifest.path,
+            None,
+            format!("依赖解析只能使用包根目录中的规范清单 {MANIFEST_NAME}"),
+        ));
+    }
+    let bytes = bound_file_snapshot(
+        &application_roots,
+        &bound_manifest_path,
+        PackagePathPurpose::ManifestReference,
+        "包清单",
+    )?;
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        manifest_error(
+            &bound_manifest_path,
+            None,
+            format!("规范包清单不是 UTF-8：{error}"),
+        )
+    })?;
+    let current = parse(
+        text,
+        manifest.path.clone(),
+        manifest.root.clone(),
+    )?;
+    if current != *manifest {
+        return Err(manifest_error(
+            &manifest.path,
+            None,
+            "包清单在调用方读取后发生变化；请重新加载清单并重试",
+        ));
+    }
+    Ok((
+        application_root,
+        application_roots,
+        format!("{:x}", Sha256::digest(&bytes)),
+    ))
+}
+
+fn freeze_resolution_graph(
+    manifest: &Manifest,
+    mut graph: ResolutionGraph,
+    manifest_checksum: String,
+    application_root: PathBuf,
+    application_roots: TrustedPackageRoots,
+    expected_lock: Option<&LockFile>,
+) -> Result<ResolvedGraphBundle, ManifestError> {
+    let bound_manifest_path = application_root.join(MANIFEST_NAME);
+    let bound_manifest_bytes = bound_file_snapshot(
+        &application_roots,
+        &bound_manifest_path,
+        PackagePathPurpose::ManifestReference,
+        "包清单",
+    )?;
+    let bound_manifest_checksum = format!("{:x}", Sha256::digest(&bound_manifest_bytes));
+    if bound_manifest_checksum != manifest_checksum {
+        return Err(manifest_error(
+            &manifest.path,
+            None,
+            "包清单在依赖解析期间发生变化；请重试",
+        ));
+    }
+    let bound_manifest_text = std::str::from_utf8(&bound_manifest_bytes).map_err(|error| {
+        manifest_error(
+            &bound_manifest_path,
+            None,
+            format!("规范包清单不是 UTF-8：{error}"),
+        )
+    })?;
+    let bound_manifest = parse(
+        bound_manifest_text,
+        manifest.path.clone(),
+        manifest.root.clone(),
+    )?;
+    if bound_manifest != *manifest {
+        return Err(manifest_error(
+            &manifest.path,
+            None,
+            "包清单在依赖解析期间改变了结构；请重试",
+        ));
+    }
+
+    let lock_path = application_root.join(LOCK_NAME);
+    let lock_checksum = match expected_lock {
+        Some(expected) => {
+            let bytes = bound_file_snapshot(
+                &application_roots,
+                &lock_path,
+                PackagePathPurpose::YxpEntry,
+                "锁文件",
+            )?;
+            let text = std::str::from_utf8(&bytes).map_err(|error| {
+                manifest_error(&lock_path, None, format!("锁文件不是 UTF-8：{error}"))
+            })?;
+            let current = parse_lock_text(&lock_path, text)?;
+            if &current != expected {
+                return Err(manifest_error(
+                    &lock_path,
+                    None,
+                    "锁文件在依赖解析期间改变了结构；请重试",
+                ));
+            }
+            Some(format!("{:x}", Sha256::digest(&bytes)))
+        }
+        None => None,
+    };
+
+    let mut capabilities = application_roots.clone();
+    let mut inputs = Vec::with_capacity(graph.packages.len());
+    for (package_id, dependency) in &mut graph.packages {
+        let source_root = dependency.root.clone();
+        let source_entry = dependency.entry.clone();
+        let mut source_roots = TrustedPackageRoots::new();
+        source_roots
+            .insert(&source_root)
+            .map_err(|error| package_path_manifest_error(&source_root, error))?;
+        let snapshot = capture_package_tree_in(
+            &source_roots,
+            &source_root,
+            PackagePathPurpose::TreeChecksum,
+            PackageTreeCaptureLimits::dependency(),
+            None,
+        )?;
+        if !tree_snapshot_checksum_matches(&snapshot, &dependency.locked.checksum)? {
+            return Err(manifest_error(
+                &source_root,
+                None,
+                format!(
+                    "依赖“{}”在锁定校验后发生变化；拒绝创建可执行 generation",
+                    dependency.locked.name
+                ),
+            ));
+        }
+        let checksum = portable_tree_snapshot_checksum(&snapshot)?;
+        let generation_root = publish_resolution_generation(&snapshot, &checksum)?;
+        let generation_roots = validate_resolution_generation(
+            &generation_root,
+            &checksum,
+            &dependency.locked,
+            &graph.target,
+        )?;
+        let entry_relative = source_entry.strip_prefix(&source_root).map_err(|_| {
+            manifest_error(&source_entry, None, "锁定导出入口不属于经过校验的依赖根")
+        })?;
+        dependency.root.clone_from(&generation_root);
+        dependency.entry = generation_root.join(entry_relative);
+        capabilities
+            .extend_opened(&generation_roots)
+            .map_err(|error| package_path_manifest_error(&generation_root, error))?;
+        inputs.push(ResolutionInputFingerprint {
+            package_id: package_id.clone(),
+            source_root,
+            source_roots,
+            generation_root,
+            generation_roots,
+            checksum,
+        });
+    }
+
+    if !application_roots
+        .revalidate_exact_root(&application_root)
+        .unwrap_or(false)
+    {
+        return Err(manifest_error(
+            &application_root,
+            None,
+            "应用包根在依赖解析期间被替换；请重试",
+        ));
+    }
+
+    Ok(ResolvedGraphBundle {
+        graph,
+        capabilities: ResolutionCapabilities {
+            roots: capabilities,
+        },
+        application_root,
+        application_roots,
+        manifest_checksum,
+        lock_checksum,
+        inputs,
+    })
+}
+
+fn validate_cached_resolution(resolved: &ResolvedGraphBundle) -> Result<bool, ManifestError> {
+    if resolved.graph.target != current_target()
+        || !resolved
+            .application_roots
+            .revalidate_exact_root(&resolved.application_root)
+            .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let manifest_path = resolved.application_root.join(MANIFEST_NAME);
+    if bound_file_checksum(
+        &resolved.application_roots,
+        &manifest_path,
+        PackagePathPurpose::ManifestReference,
+        "包清单",
+    )
+    .ok()
+    .as_deref()
+        != Some(resolved.manifest_checksum.as_str())
+    {
+        return Ok(false);
+    }
+    let lock_path = resolved.application_root.join(LOCK_NAME);
+    let current_lock = bound_file_checksum(
+        &resolved.application_roots,
+        &lock_path,
+        PackagePathPurpose::YxpEntry,
+        "锁文件",
+    )
+    .ok();
+    if current_lock != resolved.lock_checksum {
+        return Ok(false);
+    }
+    for input in &resolved.inputs {
+        if !input
+            .source_roots
+            .revalidate_exact_root(&input.source_root)
+            .unwrap_or(false)
+            || !input
+                .generation_roots
+                .revalidate_exact_root(&input.generation_root)
+                .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        let source = capture_package_tree_in(
+            &input.source_roots,
+            &input.source_root,
+            PackagePathPurpose::TreeChecksum,
+            PackageTreeCaptureLimits::dependency(),
+            None,
+        );
+        let generation = capture_package_tree_in(
+            &input.generation_roots,
+            &input.generation_root,
+            PackagePathPurpose::TreeChecksum,
+            PackageTreeCaptureLimits::dependency(),
+            None,
+        );
+        if source
+            .and_then(|snapshot| portable_tree_snapshot_checksum(&snapshot))
+            .ok()
+            .as_deref()
+            != Some(input.checksum.as_str())
+            || generation
+                .and_then(|snapshot| portable_tree_snapshot_checksum(&snapshot))
+                .ok()
+                .as_deref()
+                != Some(input.checksum.as_str())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestError> {
@@ -4482,9 +4933,17 @@ fn pack_package_with_limits_and_hook(
     validate_pack_output_conflicts(manifest, in_tree_output.as_deref())?;
     validate_package_manifest_paths(manifest)?;
     let manifest_checksum = format!("{:x}", Sha256::digest(&manifest_bytes));
-    let graph =
-        resolve_graph_mode_locked_with_checksum(manifest, false, true, true, manifest_checksum)?;
-    if let Some(dependency) = graph
+    let resolved = resolve_graph_mode_locked_with_checksum(
+        manifest,
+        false,
+        true,
+        true,
+        manifest_checksum,
+        expected_root,
+        trusted_root.clone(),
+    )?;
+    if let Some(dependency) = resolved
+        .graph
         .packages
         .values()
         .find(|dependency| locked_source_is_machine_local(&dependency.locked.source))
@@ -4499,7 +4958,7 @@ fn pack_package_with_limits_and_hook(
             ),
         ));
     }
-    cache_graph(manifest, graph);
+    cache_graph(manifest, resolved);
     before_archive(manifest)?;
     let snapshot = capture_package_tree_in(
         &trusted_root,
@@ -5546,6 +6005,704 @@ fn capture_package_tree_in(
     Ok(snapshot)
 }
 
+fn resolution_generation_cache_root() -> Result<PathBuf, ManifestError> {
+    let cache = cache_root();
+    fs::create_dir_all(&cache).map_err(|error| {
+        manifest_error(
+            &cache,
+            None,
+            format!("不能创建依赖 generation 缓存根：{error}"),
+        )
+    })?;
+    let cache_metadata = fs::symlink_metadata(&cache).map_err(|error| {
+        manifest_error(
+            &cache,
+            None,
+            format!("不能检查依赖 generation 缓存根：{error}"),
+        )
+    })?;
+    if cache_metadata.file_type().is_symlink()
+        || !cache_metadata.is_dir()
+        || standard_metadata_is_reparse(&cache_metadata)
+    {
+        return Err(manifest_error(
+            &cache,
+            None,
+            "依赖 generation 缓存根不得为链接、重解析点或特殊文件",
+        ));
+    }
+    let mut directory = cache.clone();
+    for component in ["resolution", RESOLUTION_GENERATION_LAYOUT] {
+        directory.push(component);
+        match fs::create_dir(&directory) {
+            Ok(()) => sync_registry_directory_parent(&directory)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(manifest_error(
+                    &directory,
+                    None,
+                    format!("不能创建依赖 generation 缓存目录：{error}"),
+                ));
+            }
+        }
+        let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            manifest_error(
+                &directory,
+                None,
+                format!("不能检查依赖 generation 缓存目录：{error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || standard_metadata_is_reparse(&metadata)
+        {
+            return Err(manifest_error(
+                &directory,
+                None,
+                "依赖 generation 缓存目录不得为链接、重解析点或特殊文件",
+            ));
+        }
+    }
+    let canonical_cache = fs::canonicalize(&cache)
+        .map_err(|error| manifest_error(&cache, None, format!("不能定位依赖缓存根：{error}")))?;
+    let canonical_directory = fs::canonicalize(&directory).map_err(|error| {
+        manifest_error(
+            &directory,
+            None,
+            format!("不能定位依赖 generation 缓存目录：{error}"),
+        )
+    })?;
+    if !canonical_directory.starts_with(canonical_cache) {
+        return Err(manifest_error(
+            &directory,
+            None,
+            "依赖 generation 缓存目录越出缓存根",
+        ));
+    }
+    Ok(canonical_directory)
+}
+
+fn acquire_resolution_generation_lock(
+    cache: &Path,
+    checksum: &str,
+) -> Result<crate::storage::ProjectLock, ManifestError> {
+    let locks = cache.join(".locks");
+    match fs::create_dir(&locks) {
+        Ok(()) => sync_registry_directory_parent(&locks)?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(manifest_error(
+                &locks,
+                None,
+                format!("不能创建依赖 generation 缓存锁目录：{error}"),
+            ));
+        }
+    }
+    let locks_metadata = fs::symlink_metadata(&locks).map_err(|error| {
+        manifest_error(
+            &locks,
+            None,
+            format!("不能检查依赖 generation 缓存锁目录：{error}"),
+        )
+    })?;
+    if locks_metadata.file_type().is_symlink()
+        || !locks_metadata.is_dir()
+        || standard_metadata_is_reparse(&locks_metadata)
+    {
+        return Err(manifest_error(
+            &locks,
+            None,
+            "依赖 generation 缓存锁目录不得为链接、重解析点或特殊文件",
+        ));
+    }
+    let lock_root = locks.join(checksum);
+    match fs::symlink_metadata(&lock_root) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || standard_metadata_is_reparse(&metadata) =>
+        {
+            return Err(manifest_error(
+                &lock_root,
+                None,
+                "依赖 generation 缓存锁组件不得为链接、重解析点或特殊文件",
+            ));
+        }
+        Ok(_) => {
+            let lock_state = lock_root.join(".yanxu");
+            match fs::symlink_metadata(&lock_state) {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        || !metadata.is_dir()
+                        || standard_metadata_is_reparse(&metadata) =>
+                {
+                    return Err(manifest_error(
+                        &lock_state,
+                        None,
+                        "依赖 generation 缓存锁组件不得为链接、重解析点或特殊文件",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(manifest_error(
+                        &lock_state,
+                        None,
+                        format!("不能预先检查依赖 generation 缓存锁状态：{error}"),
+                    ));
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(manifest_error(
+                &lock_root,
+                None,
+                format!("不能预先检查依赖 generation 缓存锁：{error}"),
+            ));
+        }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    let lock = {
+        let mut cache_roots = TrustedPackageRoots::new();
+        cache_roots
+            .insert(cache)
+            .map_err(|error| package_path_manifest_error(cache, error))?;
+        let cache_directory = cache_roots
+            .clone_exact_root_directory(cache)
+            .map_err(|error| {
+                manifest_error(
+                    cache,
+                    None,
+                    format!("不能复制依赖 generation 缓存根句柄：{error}"),
+                )
+            })?
+            .ok_or_else(|| manifest_error(cache, None, "依赖 generation 缓存根句柄不存在"))?;
+        let locks_directory = cache_directory.open_dir_nofollow(".locks").map_err(|error| {
+            manifest_error(
+                &locks,
+                None,
+                format!("不能按目录能力打开依赖 generation 缓存锁目录：{error}"),
+            )
+        })?;
+        match locks_directory.create_dir(checksum) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(manifest_error(
+                    &lock_root,
+                    None,
+                    format!("不能按目录能力创建依赖 generation 缓存锁组件：{error}"),
+                ));
+            }
+        }
+        let lock_directory = locks_directory
+            .open_dir_nofollow(checksum)
+            .map_err(|error| {
+                manifest_error(
+                    &lock_root,
+                    None,
+                    format!("不能按目录能力打开依赖 generation 缓存锁组件：{error}"),
+                )
+            })?;
+        match lock_directory.create_dir(".yanxu") {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(manifest_error(
+                    lock_root.join(".yanxu"),
+                    None,
+                    format!("不能按目录能力创建依赖 generation 缓存锁状态：{error}"),
+                ));
+            }
+        }
+        let state_directory = lock_directory
+            .open_dir_nofollow(".yanxu")
+            .map_err(|error| {
+                manifest_error(
+                    lock_root.join(".yanxu"),
+                    None,
+                    format!("不能按目录能力打开依赖 generation 缓存锁状态：{error}"),
+                )
+            })?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .follow(FollowSymlinks::No)
+            .nonblock(true);
+        let file = state_directory
+            .open_with("package.lock", &options)
+            .map_err(|error| {
+                manifest_error(
+                    lock_root.join(".yanxu/package.lock"),
+                    None,
+                    format!("不能按目录能力打开依赖 generation 缓存锁文件：{error}"),
+                )
+            })?
+            .into_std();
+        let metadata = file.metadata().map_err(|error| {
+            manifest_error(
+                lock_root.join(".yanxu/package.lock"),
+                None,
+                format!("不能检查已打开的依赖 generation 缓存锁文件：{error}"),
+            )
+        })?;
+        if !is_regular_file_metadata(&metadata) {
+            return Err(manifest_error(
+                lock_root.join(".yanxu/package.lock"),
+                None,
+                "依赖 generation 缓存锁文件不得为链接、重解析点或特殊文件",
+            ));
+        }
+        crate::storage::ProjectLock::acquire_opened(file).map_err(|error| {
+            manifest_error(
+                &lock_root,
+                None,
+                format!("不能取得依赖 generation 缓存锁：{error}"),
+            )
+        })?
+    };
+    #[cfg(target_os = "wasi")]
+    let lock = crate::storage::ProjectLock::acquire(&lock_root).map_err(|error| {
+        manifest_error(
+            &lock_root,
+            None,
+            format!("不能取得依赖 generation 缓存锁：{error}"),
+        )
+    })?;
+    let canonical_lock = fs::canonicalize(&lock_root).map_err(|error| {
+        manifest_error(
+            &lock_root,
+            None,
+            format!("不能定位依赖 generation 缓存锁：{error}"),
+        )
+    })?;
+    if !canonical_lock.starts_with(cache) {
+        return Err(manifest_error(
+            &lock_root,
+            None,
+            "依赖 generation 缓存锁越出缓存根",
+        ));
+    }
+    let lock_state = lock_root.join(".yanxu");
+    for directory in [&lock_root, &lock_state] {
+        let metadata = fs::symlink_metadata(directory).map_err(|error| {
+            manifest_error(
+                directory,
+                None,
+                format!("不能检查依赖 generation 缓存锁组件：{error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || standard_metadata_is_reparse(&metadata)
+        {
+            return Err(manifest_error(
+                directory,
+                None,
+                "依赖 generation 缓存锁组件不得为链接、重解析点或特殊文件",
+            ));
+        }
+    }
+    let lock_file = lock_root.join(".yanxu/package.lock");
+    let metadata = fs::symlink_metadata(&lock_file).map_err(|error| {
+        manifest_error(
+            &lock_file,
+            None,
+            format!("不能检查依赖 generation 缓存锁文件：{error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || standard_metadata_is_reparse(&metadata)
+    {
+        return Err(manifest_error(
+            &lock_file,
+            None,
+            "依赖 generation 缓存锁文件不得为链接、重解析点或特殊文件",
+        ));
+    }
+    Ok(lock)
+}
+
+fn create_resolution_checksum_root(cache: &Path, checksum: &str) -> Result<PathBuf, ManifestError> {
+    let root = cache.join(checksum);
+    match fs::create_dir(&root) {
+        Ok(()) => sync_registry_directory_parent(&root)?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(manifest_error(
+                &root,
+                None,
+                format!("不能创建依赖 generation 摘要目录：{error}"),
+            ));
+        }
+    }
+    let metadata = fs::symlink_metadata(&root).map_err(|error| {
+        manifest_error(
+            &root,
+            None,
+            format!("不能检查依赖 generation 摘要目录：{error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || standard_metadata_is_reparse(&metadata)
+    {
+        return Err(manifest_error(
+            &root,
+            None,
+            "依赖 generation 摘要目录不得为链接、重解析点或特殊文件",
+        ));
+    }
+    let canonical = fs::canonicalize(&root).map_err(|error| {
+        manifest_error(
+            &root,
+            None,
+            format!("不能定位依赖 generation 摘要目录：{error}"),
+        )
+    })?;
+    if !canonical.starts_with(cache) {
+        return Err(manifest_error(
+            &root,
+            None,
+            "依赖 generation 摘要目录越出缓存根",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn existing_resolution_generation(
+    checksum_root: &Path,
+    checksum: &str,
+) -> Result<Option<PathBuf>, ManifestError> {
+    let mut candidates = fs::read_dir(checksum_root)
+        .map_err(|error| {
+            manifest_error(
+                checksum_root,
+                None,
+                format!("不能枚举依赖 generation：{error}"),
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            manifest_error(
+                checksum_root,
+                None,
+                format!("不能读取依赖 generation 目录项：{error}"),
+            )
+        })?;
+    candidates.sort_by_key(fs::DirEntry::file_name);
+    for candidate in candidates {
+        if candidate.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let file_type = candidate.file_type().map_err(|error| {
+            manifest_error(
+                candidate.path(),
+                None,
+                format!("不能检查依赖 generation 目录项：{error}"),
+            )
+        })?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let root = candidate.path().join("package");
+        if matches!(resolution_generation_checksum(&root), Ok(actual) if actual == checksum) {
+            set_resolution_generation_read_only(&candidate.path())?;
+            return fs::canonicalize(&root).map(Some).map_err(|error| {
+                manifest_error(&root, None, format!("不能定位依赖 generation：{error}"))
+            });
+        }
+    }
+    Ok(None)
+}
+
+fn resolution_generation_checksum(root: &Path) -> Result<String, ManifestError> {
+    let snapshot = capture_package_tree(
+        root,
+        PackagePathPurpose::TreeChecksum,
+        PackageTreeCaptureLimits::dependency(),
+        None,
+    )?;
+    portable_tree_snapshot_checksum(&snapshot)
+}
+
+fn write_resolution_snapshot(
+    snapshot: &PackageTreeSnapshot,
+    root: &Path,
+) -> Result<(), ManifestError> {
+    fs::create_dir(root).map_err(|error| {
+        manifest_error(root, None, format!("不能创建依赖 generation 包根：{error}"))
+    })?;
+    for entry in &snapshot.files {
+        let path = root.join(&entry.relative);
+        let parent = path
+            .parent()
+            .ok_or_else(|| manifest_error(&path, None, "依赖 generation 文件缺少父目录"))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            manifest_error(
+                parent,
+                None,
+                format!("不能创建依赖 generation 子目录：{error}"),
+            )
+        })?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|error| {
+            manifest_error(
+                &path,
+                None,
+                format!("不能创建依赖 generation 文件：{error}"),
+            )
+        })?;
+        file.write_all(&entry.bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| {
+                manifest_error(
+                    &path,
+                    None,
+                    format!("不能写入依赖 generation 文件：{error}"),
+                )
+            })?;
+    }
+    sync_resolution_directories(root)
+}
+
+#[cfg(unix)]
+fn sync_resolution_directories(root: &Path) -> Result<(), ManifestError> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut index = 0;
+    while index < directories.len() {
+        let directory = directories[index].clone();
+        for entry in fs::read_dir(&directory).map_err(|error| {
+            manifest_error(
+                &directory,
+                None,
+                format!("不能枚举依赖 generation 目录以同步：{error}"),
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                manifest_error(
+                    &directory,
+                    None,
+                    format!("不能读取依赖 generation 目录项：{error}"),
+                )
+            })?;
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                directories.push(entry.path());
+            }
+        }
+        index += 1;
+    }
+    for directory in directories.into_iter().rev() {
+        fs::File::open(&directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                manifest_error(
+                    &directory,
+                    None,
+                    format!("不能同步依赖 generation 目录：{error}"),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_resolution_directories(_root: &Path) -> Result<(), ManifestError> {
+    Ok(())
+}
+
+fn set_resolution_generation_read_only(path: &Path) -> Result<(), ManifestError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        manifest_error(path, None, format!("不能检查依赖 generation 权限：{error}"))
+    })?;
+    if metadata.file_type().is_symlink() || standard_metadata_is_reparse(&metadata) {
+        return Err(manifest_error(
+            path,
+            None,
+            "依赖 generation 不得包含链接或重解析点",
+        ));
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).map_err(|error| {
+            manifest_error(
+                path,
+                None,
+                format!("不能枚举依赖 generation 以收紧权限：{error}"),
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                manifest_error(
+                    path,
+                    None,
+                    format!("不能读取依赖 generation 目录项：{error}"),
+                )
+            })?;
+            set_resolution_generation_read_only(&entry.path())?;
+        }
+    } else if !metadata.is_file() {
+        return Err(manifest_error(
+            path,
+            None,
+            "依赖 generation 只能包含普通目录和文件",
+        ));
+    }
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(if metadata.is_dir() { 0o500 } else { 0o400 });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).map_err(|error| {
+        manifest_error(path, None, format!("不能锁定依赖 generation 权限：{error}"))
+    })
+}
+
+fn resolution_generation_destination(checksum_root: &Path) -> Result<PathBuf, ManifestError> {
+    let primary = checksum_root.join("complete");
+    match fs::symlink_metadata(&primary) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(primary),
+        Ok(_) => {}
+        Err(error) => {
+            return Err(manifest_error(
+                &primary,
+                None,
+                format!("不能检查依赖 generation 发布位置：{error}"),
+            ));
+        }
+    }
+    for _ in 0..1_024 {
+        let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let repair = checksum_root.join(format!("repair-{}-{sequence}", std::process::id()));
+        match fs::symlink_metadata(&repair) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(repair),
+            Ok(_) => continue,
+            Err(error) => {
+                return Err(manifest_error(
+                    &repair,
+                    None,
+                    format!("不能检查依赖 generation 修复位置：{error}"),
+                ));
+            }
+        }
+    }
+    Err(manifest_error(
+        checksum_root,
+        None,
+        "不能分配唯一依赖 generation 发布位置",
+    ))
+}
+
+fn publish_resolution_generation(
+    snapshot: &PackageTreeSnapshot,
+    checksum: &str,
+) -> Result<PathBuf, ManifestError> {
+    let cache = resolution_generation_cache_root()?;
+    let _lock = acquire_resolution_generation_lock(&cache, checksum)?;
+    let checksum_root = create_resolution_checksum_root(&cache, checksum)?;
+    if let Some(root) = existing_resolution_generation(&checksum_root, checksum)? {
+        return Ok(root);
+    }
+    let temporary =
+        RegistryTemporaryDirectory::create_within(&cache, &checksum_root, "resolution-generation")?;
+    write_resolution_snapshot(snapshot, &temporary.path().join("package"))?;
+    let destination = resolution_generation_destination(&checksum_root)?;
+    temporary.publish(&destination)?;
+    sync_registry_directory_parent(&destination)?;
+    set_resolution_generation_read_only(&destination)?;
+    let root = destination.join("package");
+    let actual = resolution_generation_checksum(&root)?;
+    if actual != checksum {
+        return Err(manifest_error(
+            &root,
+            None,
+            format!("依赖 generation 发布后摘要改变：预期 {checksum}，实际 {actual}"),
+        ));
+    }
+    fs::canonicalize(&root).map_err(|error| {
+        manifest_error(
+            &root,
+            None,
+            format!("不能定位已发布依赖 generation：{error}"),
+        )
+    })
+}
+
+fn validate_resolution_generation(
+    root: &Path,
+    checksum: &str,
+    locked: &LockedPackage,
+    target: &str,
+) -> Result<TrustedPackageRoots, ManifestError> {
+    let mut roots = TrustedPackageRoots::new();
+    roots
+        .insert(root)
+        .map_err(|error| package_path_manifest_error(root, error))?;
+    let snapshot = capture_package_tree_in(
+        &roots,
+        root,
+        PackagePathPurpose::TreeChecksum,
+        PackageTreeCaptureLimits::dependency(),
+        None,
+    )?;
+    if portable_tree_snapshot_checksum(&snapshot)? != checksum {
+        return Err(manifest_error(
+            root,
+            None,
+            "依赖 generation 内容与锁定摘要不一致",
+        ));
+    }
+    let manifest_path = root.join(MANIFEST_NAME);
+    let manifest_bytes = snapshot
+        .get(Path::new(MANIFEST_NAME))
+        .ok_or_else(|| manifest_error(&manifest_path, None, "依赖 generation 缺少规范包清单"))?;
+    let manifest_text = std::str::from_utf8(manifest_bytes).map_err(|error| {
+        manifest_error(
+            &manifest_path,
+            None,
+            format!("依赖 generation 包清单不是 UTF-8：{error}"),
+        )
+    })?;
+    let manifest = parse(manifest_text, manifest_path, root.to_path_buf())?;
+    validate_package_root(&manifest)?;
+    let exports = manifest
+        .exports
+        .iter()
+        .map(|(name, path)| (name.clone(), path.to_string_lossy().into_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let native = selected_native_artifact(&manifest, target)?;
+    if locked.name != manifest.name
+        || locked.version != manifest.version.to_string()
+        || locked.entry != manifest.entry.to_string_lossy()
+        || locked.exports != exports
+        || locked.minimum_yanxu != manifest.minimum_yanxu.as_ref().map(ToString::to_string)
+        || locked.target != target
+        || locked.native != native
+    {
+        return Err(manifest_error(
+            &manifest.path,
+            None,
+            format!(
+                "依赖“{}”的不可变 generation 与锁定身份、导出、目标或原生制品不一致",
+                locked.name
+            ),
+        ));
+    }
+    Ok(roots)
+}
+
 #[cfg(not(target_os = "wasi"))]
 struct CapabilityDirectoryFrame {
     directory: cap_std::fs::Dir,
@@ -6562,6 +7719,19 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    fn read_dependency_entry(
+        dependency: &ResolvedDependency,
+        capabilities: &ResolutionCapabilities,
+    ) -> String {
+        let mut roots = TrustedPackageRoots::new();
+        capabilities.extend(&mut roots).unwrap();
+        let resolved = roots
+            .resolve_existing_module_file(&dependency.entry)
+            .unwrap()
+            .expect("dependency entry belongs to the resolved generation");
+        read_resolved_module_source_snapshot(resolved).unwrap()
+    }
+
     fn lock_with_source(source: impl Into<String>) -> LockFile {
         LockFile {
             lock_version: LOCK_FORMAT_VERSION,
@@ -7057,12 +8227,404 @@ mod tests {
                 .lock()
                 .expect("graph cache poisoned")
                 .get(&canonical)
-                .cloned();
+                .map(|resolved| resolved.graph.clone());
             assert_eq!(cached, Some(graph));
             Ok::<_, ManifestError>(())
         })
         .unwrap();
         fs::remove_dir_all(relative).ok();
+    }
+
+    #[test]
+    fn cached_resolution_rejects_replaced_source_root_and_keeps_verified_generation() {
+        let root = temp("resolution-root-replacement");
+        let application = root.join("application");
+        let dependency = root.join("dependency");
+        let marker = root.file_name().unwrap().to_string_lossy();
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        let verified = format!("# {marker}\n公 定 值：数 为 1；\n");
+        let replaced = format!("# {marker}\n公 定 值：数 为 2；\n");
+        write(&dependency.join("主.yx"), &verified);
+        write(
+            &application.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具='../dependency'\n",
+        );
+        write(&application.join("主.yx"), "言 1；\n");
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        let (resolved, capabilities) =
+            resolve_dependency_scoped_with_capabilities(Some(&application), &application, "工具")
+                .unwrap();
+        assert_eq!(read_dependency_entry(&resolved, &capabilities), verified);
+
+        let original = root.join("dependency-original");
+        fs::rename(&dependency, &original).unwrap();
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&dependency.join("主.yx"), &replaced);
+        let error =
+            resolve_dependency_scoped(Some(&application), &application, "工具").unwrap_err();
+        assert!(error.message.contains("锁") || error.message.contains("变化"));
+        assert_eq!(read_dependency_entry(&resolved, &capabilities), verified);
+
+        fs::remove_dir_all(&dependency).unwrap();
+        fs::rename(original, dependency).unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cached_resolution_hashes_same_length_source_changes_before_reuse() {
+        let root = temp("resolution-same-length-change");
+        let application = root.join("application");
+        let dependency = root.join("dependency");
+        let marker = root.file_name().unwrap().to_string_lossy();
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        let verified = format!("# {marker}\n公 定 值：数 为 1；\n");
+        let changed = format!("# {marker}\n公 定 值：数 为 2；\n");
+        assert_eq!(verified.len(), changed.len());
+        write(&dependency.join("主.yx"), &verified);
+        write(
+            &application.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具='../dependency'\n",
+        );
+        write(&application.join("主.yx"), "言 1；\n");
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        let (resolved, capabilities) =
+            resolve_dependency_scoped_with_capabilities(Some(&application), &application, "工具")
+                .unwrap();
+        write(&dependency.join("主.yx"), &changed);
+        let error =
+            resolve_dependency_scoped(Some(&application), &application, "工具").unwrap_err();
+        assert!(error.message.contains("锁") || error.message.contains("变化"));
+        assert_eq!(read_dependency_entry(&resolved, &capabilities), verified);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn graph_cache_revalidates_manifest_lock_and_target_fingerprints() {
+        let root = temp("resolution-cache-fingerprints");
+        let application = root.join("application");
+        let dependency = root.join("dependency");
+        let marker = root.file_name().unwrap().to_string_lossy();
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(
+            &dependency.join("主.yx"),
+            &format!("# {marker}\n公 定 值：数 为 1；\n"),
+        );
+        let manifest_path = application.join(MANIFEST_NAME);
+        write(
+            &manifest_path,
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具='../dependency'\n",
+        );
+        write(&application.join("主.yx"), "言 1；\n");
+        let manifest = load(&manifest_path).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        let key = graph_cache_key(&manifest.root);
+        let initial_manifest_checksum = graph_cache()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .manifest_checksum
+            .clone();
+
+        graph_cache()
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .graph
+            .target = "不匹配目标".into();
+        let target_error =
+            resolve_dependency_scoped(Some(&application), &application, "工具").unwrap_err();
+        assert!(target_error.message.contains("目标"));
+        ensure_lock(&manifest, false).unwrap();
+        assert_eq!(
+            graph_cache()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .graph
+                .target,
+            current_target()
+        );
+
+        write(
+            &manifest_path,
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n描述='缓存指纹变化'\n入口='主.yx'\n[依赖]\n工具='../dependency'\n",
+        );
+        let manifest_error =
+            resolve_dependency_scoped(Some(&application), &application, "工具").unwrap_err();
+        assert!(manifest_error.message.contains("清单"));
+        let current_manifest = load(&manifest_path).unwrap();
+        ensure_lock(&current_manifest, false).unwrap();
+        assert_ne!(
+            graph_cache()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .manifest_checksum,
+            initial_manifest_checksum
+        );
+
+        let lock_path = application.join(LOCK_NAME);
+        let mut lock = read_lock(&lock_path).unwrap();
+        lock.packages[0].checksum = "f".repeat(64);
+        fs::write(&lock_path, toml::to_string_pretty(&lock).unwrap()).unwrap();
+        let error =
+            resolve_dependency_scoped(Some(&application), &application, "工具").unwrap_err();
+        assert!(error.message.contains("锁") || error.message.contains("校验"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolution_binds_manifest_structure_and_digest_to_one_snapshot() {
+        let root = temp("resolution-manifest-snapshot");
+        let manifest_path = root.join(MANIFEST_NAME);
+        write(
+            &manifest_path,
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言 1；\n");
+        let manifest = load(&manifest_path).unwrap();
+        let (application_root, application_roots, _) =
+            bind_resolution_manifest(&manifest).unwrap();
+
+        write(
+            &manifest_path,
+            "[包]\n格式=2\n名称='替换应用'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        let changed_checksum = bound_file_checksum(
+            &application_roots,
+            &application_root.join(MANIFEST_NAME),
+            PackagePathPurpose::ManifestReference,
+            "包清单",
+        )
+        .unwrap();
+        let error = resolve_graph_mode_locked_with_checksum(
+            &manifest,
+            false,
+            false,
+            true,
+            changed_checksum,
+            application_root,
+            application_roots,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("清单"));
+        assert!(error.message.contains("结构") || error.message.contains("变化"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolution_binds_lock_structure_and_digest_to_one_snapshot() {
+        let root = temp("resolution-lock-snapshot");
+        let manifest_path = root.join(MANIFEST_NAME);
+        write(
+            &manifest_path,
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言 1；\n");
+        let manifest = load(&manifest_path).unwrap();
+        let (application_root, application_roots, manifest_checksum) =
+            bind_resolution_manifest(&manifest).unwrap();
+        let graph = ResolutionGraph {
+            root_dependencies: BTreeMap::new(),
+            root_dev_dependencies: BTreeMap::new(),
+            packages: BTreeMap::new(),
+            target: current_target(),
+        };
+        let expected = LockFile {
+            lock_version: LOCK_FORMAT_VERSION,
+            manifest_checksum: manifest_checksum.clone(),
+            target: graph.target.clone(),
+            generator: package_core_version(),
+            root_dependencies: BTreeMap::new(),
+            root_dev_dependencies: BTreeMap::new(),
+            packages: Vec::new(),
+        };
+        let mut replaced = expected.clone();
+        replaced.generator = "替换生成器".into();
+        write_lock(&root.join(LOCK_NAME), &replaced).unwrap();
+
+        let error = freeze_resolution_graph(
+            &manifest,
+            graph,
+            manifest_checksum,
+            application_root,
+            application_roots,
+            Some(&expected),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("锁文件"));
+        assert!(error.message.contains("结构"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolution_cache_rejects_linked_lock_and_checksum_directories() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("resolution-cache-links");
+        let cache = root.join("cache");
+        let outside = root.join("outside");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, cache.join(".locks")).unwrap();
+        let checksum = "a".repeat(64);
+        let lock_error = match acquire_resolution_generation_lock(&cache, &checksum) {
+            Ok(_) => panic!("linked resolution cache lock was accepted"),
+            Err(error) => error,
+        };
+        assert!(lock_error.message.contains("链接"));
+        fs::remove_file(cache.join(".locks")).unwrap();
+
+        fs::create_dir(cache.join(".locks")).unwrap();
+        symlink(&outside, cache.join(".locks").join(&checksum)).unwrap();
+        let component_error = match acquire_resolution_generation_lock(&cache, &checksum) {
+            Ok(_) => panic!("linked resolution cache lock component was accepted"),
+            Err(error) => error,
+        };
+        assert!(component_error.message.contains("链接"));
+        assert!(!outside.join(".yanxu/package.lock").exists());
+        fs::remove_file(cache.join(".locks").join(&checksum)).unwrap();
+
+        symlink(&outside, cache.join(&checksum)).unwrap();
+        let checksum_error = create_resolution_checksum_root(&cache, &checksum).unwrap_err();
+        assert!(checksum_error.message.contains("链接"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_resolution_generation_restores_read_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp("resolution-generation-permissions");
+        let application = root.join("application");
+        let dependency = root.join("dependency");
+        let marker = root.file_name().unwrap().to_string_lossy();
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(
+            &dependency.join("主.yx"),
+            &format!("# {marker}\n公 定 值：数 为 1；\n"),
+        );
+        write(
+            &application.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具='../dependency'\n",
+        );
+        write(&application.join("主.yx"), "言 1；\n");
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        let first = ensure_lock_with_dev(&manifest, false).unwrap();
+        let first = first.packages.values().next().unwrap();
+        fs::set_permissions(&first.entry, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let reused = ensure_lock_with_dev(&manifest, true).unwrap();
+        let reused = reused.packages.values().next().unwrap();
+        assert_eq!(reused.root, first.root);
+        assert_eq!(
+            fs::metadata(&reused.entry).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_capability_reads_original_generation_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp("resolution-generation-capability");
+        let application = root.join("application");
+        let dependency = root.join("dependency");
+        let marker = root.file_name().unwrap().to_string_lossy();
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        let verified = format!("# {marker}\n公 定 值：数 为 1；\n");
+        write(&dependency.join("主.yx"), &verified);
+        write(
+            &application.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具='../dependency'\n",
+        );
+        write(&application.join("主.yx"), "言 1；\n");
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        let (resolved, capabilities) =
+            resolve_dependency_scoped_with_capabilities(Some(&application), &application, "工具")
+                .unwrap();
+
+        let generation_root = resolved.root.clone();
+        let generation_parent = generation_root.parent().unwrap();
+        fs::set_permissions(generation_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let captured = generation_parent.join("captured-package");
+        fs::rename(&generation_root, &captured).unwrap();
+        write(&generation_root.join("主.yx"), "公 定 值：数 为 9；\n");
+        assert_eq!(read_dependency_entry(&resolved, &capabilities), verified);
+
+        fs::remove_dir_all(&generation_root).unwrap();
+        fs::rename(captured, &generation_root).unwrap();
+        fs::set_permissions(generation_parent, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn damaged_resolution_generation_is_preserved_while_repair_is_published() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp("resolution-generation-repair");
+        let application = root.join("application");
+        let dependency = root.join("dependency");
+        let marker = root.file_name().unwrap().to_string_lossy();
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        let verified = format!("# {marker}\n公 定 值：数 为 1；\n");
+        let damaged = format!("# {marker}\n公 定 值：数 为 2；\n");
+        write(&dependency.join("主.yx"), &verified);
+        write(
+            &application.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具='../dependency'\n",
+        );
+        write(&application.join("主.yx"), "言 1；\n");
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        let first = ensure_lock_with_dev(&manifest, false).unwrap();
+        let first = first.packages.values().next().unwrap();
+        let first_root = first.root.clone();
+        let first_entry = first.entry.clone();
+        fs::set_permissions(&first_entry, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&first_entry, &damaged).unwrap();
+
+        let repaired = ensure_lock_with_dev(&manifest, true).unwrap();
+        let repaired = repaired.packages.values().next().unwrap();
+        assert_ne!(repaired.root, first_root);
+        assert_eq!(fs::read_to_string(&first_entry).unwrap(), damaged);
+        assert_eq!(fs::read_to_string(&repaired.entry).unwrap(), verified);
+
+        fs::write(&first_entry, &verified).unwrap();
+        fs::set_permissions(&first_entry, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -7443,9 +9005,13 @@ mod tests {
         write(&application.join("主.yx"), "言 1；\n");
         let manifest = load(application.join(MANIFEST_NAME)).unwrap();
         let dependencies = ensure_lock(&manifest, false).unwrap();
-        assert_eq!(
+        assert_ne!(
             dependencies["工具"].root,
             fs::canonicalize(dependency).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&dependencies["工具"].entry).unwrap(),
+            "公 定 值 为 1；\n"
         );
         fs::remove_dir_all(root).ok();
     }
@@ -7478,14 +9044,11 @@ mod tests {
         fs::remove_dir_all(&dependency).unwrap();
         let restored = ensure_lock_with_dev(&manifest, true).unwrap();
         assert_eq!(restored.packages.len(), 1);
-        assert!(
-            restored
-                .packages
-                .values()
-                .next()
-                .unwrap()
-                .root
-                .starts_with(fs::canonicalize(&vendor).unwrap())
+        let restored_dependency = restored.packages.values().next().unwrap();
+        assert!(!restored_dependency.root.starts_with(&vendor));
+        assert_eq!(
+            fs::read_to_string(&restored_dependency.entry).unwrap(),
+            "公 定 值 为 1；\n"
         );
 
         let first = app.join("build/first.yxp");
@@ -8776,15 +10339,17 @@ mod tests {
         let exported =
             resolve_dependency_scoped(Some(&application), &application.join("src"), "甲/子模块")
                 .unwrap();
+        assert!(exported.entry.ends_with("src/子.yx"));
         assert_eq!(
-            exported.entry,
-            fs::canonicalize(first.join("src/子.yx")).unwrap()
+            fs::read_to_string(&exported.entry).unwrap(),
+            "公 定 子：数 为 1；\n"
         );
         let transitive =
             resolve_dependency_scoped(Some(&application), &first.join("src"), "乙/工具").unwrap();
+        assert!(transitive.entry.ends_with("src/工具.yx"));
         assert_eq!(
-            transitive.entry,
-            fs::canonicalize(second.join("src/工具.yx")).unwrap()
+            fs::read_to_string(&transitive.entry).unwrap(),
+            "公 定 值：数 为 42；\n"
         );
         assert!(
             resolve_dependency_scoped(Some(&application), &application.join("src"), "乙").is_err()
@@ -8810,9 +10375,10 @@ mod tests {
         let manifest = load(application.join(MANIFEST_NAME)).unwrap();
         ensure_lock(&manifest, false).unwrap();
         let dependency = resolve_dependency_scoped(Some(&application), &application, "父").unwrap();
+        assert!(dependency.entry.ends_with("src/库.yx"));
         assert_eq!(
-            dependency.entry,
-            fs::canonicalize(parent.join("src/库.yx")).unwrap()
+            fs::read_to_string(&dependency.entry).unwrap(),
+            "公 定 值：数 为 42；\n"
         );
         fs::remove_dir_all(parent).ok();
     }

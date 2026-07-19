@@ -4140,14 +4140,15 @@ impl Vm {
             return self.load_application_module(id, directory, span);
         }
         let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            let dependency = crate::package::resolve_dependency_scoped(
-                self.package_root.as_deref(),
-                directory,
-                name,
-            )
-            .map_err(|runtime_error| package_error(span, runtime_error))?;
-            self.package_module_roots
-                .insert(&dependency.root)
+            let (dependency, capabilities) =
+                crate::package::resolve_dependency_scoped_with_capabilities(
+                    self.package_root.as_deref(),
+                    directory,
+                    name,
+                )
+                .map_err(|runtime_error| package_error(span, runtime_error))?;
+            capabilities
+                .extend(&mut self.package_module_roots)
                 .map_err(|runtime_error| package_path_error(span, runtime_error))?;
             (dependency.entry, true)
         } else {

@@ -304,34 +304,39 @@ pub fn compile_application(
     let manifest = package::discover(input).map_err(package_error)?;
     if let Some(manifest) = manifest {
         validate_runtime_version(&manifest)?;
-        return package::with_locked_resolution(&manifest, false, |graph| {
-            let canonical_root = fs::canonicalize(&manifest.root).map_err(io_error)?;
-            let entry = canonical_root.join(&manifest.entry);
-            let resources = collect_resources(&manifest)?;
-            let lock_checksum = checksum_file(&manifest.root.join(package::LOCK_NAME)).ok();
-            let summary =
-                PermissionSummary::from_permissions(&manifest.permissions, &manifest.root);
-            let native_modules = collect_native_modules(&graph)?;
-            let application = manifest.application.as_ref().map(application_metadata);
-            let licenses = collect_licenses(&manifest, &graph)?;
-            compile_resolved_application(
-                entry,
-                canonical_root,
-                Some(manifest.root.clone()),
-                ApplicationPackage {
-                    name: manifest.name.clone(),
-                    version: manifest.version.to_string(),
-                },
-                summary,
-                Some(graph),
-                resources,
-                native_modules,
-                application,
-                licenses,
-                lock_checksum,
-                profile,
-            )
-        });
+        return package::with_locked_resolution_capabilities(
+            &manifest,
+            false,
+            |graph, capabilities| {
+                let canonical_root = fs::canonicalize(&manifest.root).map_err(io_error)?;
+                let entry = canonical_root.join(&manifest.entry);
+                let resources = collect_resources(&manifest)?;
+                let lock_checksum = checksum_file(&manifest.root.join(package::LOCK_NAME)).ok();
+                let summary =
+                    PermissionSummary::from_permissions(&manifest.permissions, &manifest.root);
+                let native_modules = collect_native_modules(&graph, &capabilities)?;
+                let application = manifest.application.as_ref().map(application_metadata);
+                let licenses = collect_licenses(&manifest, &graph, &capabilities)?;
+                compile_resolved_application(
+                    entry,
+                    canonical_root,
+                    Some(manifest.root.clone()),
+                    ApplicationPackage {
+                        name: manifest.name.clone(),
+                        version: manifest.version.to_string(),
+                    },
+                    summary,
+                    Some(graph),
+                    Some(capabilities),
+                    resources,
+                    native_modules,
+                    application,
+                    licenses,
+                    lock_checksum,
+                    profile,
+                )
+            },
+        );
     }
     let entry = fs::canonicalize(input)
         .map_err(|error| application_error(format!("不能定位文卷 {}：{error}", input.display())))?;
@@ -354,6 +359,7 @@ pub fn compile_application(
         package_info,
         PermissionSummary::from_permissions(&PermissionSet::unrestricted(), Path::new(".")),
         None,
+        None,
         BTreeMap::new(),
         BTreeMap::new(),
         None,
@@ -371,6 +377,7 @@ fn compile_resolved_application(
     package_info: ApplicationPackage,
     permissions: PermissionSummary,
     graph: Option<ResolutionGraph>,
+    resolution_capabilities: Option<package::ResolutionCapabilities>,
     resources: BTreeMap<String, ApplicationResource>,
     native_modules: BTreeMap<String, ApplicationNativeModule>,
     application: Option<ApplicationMetadata>,
@@ -379,12 +386,18 @@ fn compile_resolved_application(
     profile: &str,
 ) -> Result<ApplicationArchive, ApplicationError> {
     let mut trusted_package_roots = package::TrustedPackageRoots::default();
-    if package_root.is_some() {
+    if let Some(capabilities) = &resolution_capabilities {
+        capabilities
+            .extend(&mut trusted_package_roots)
+            .map_err(application_path_error)?;
+    } else if package_root.is_some() {
         trusted_package_roots
             .insert(&root)
             .map_err(application_path_error)?;
     }
-    if let Some(graph) = &graph {
+    if resolution_capabilities.is_none()
+        && let Some(graph) = &graph
+    {
         for dependency in graph.packages.values() {
             trusted_package_roots
                 .insert(&dependency.root)
@@ -547,12 +560,15 @@ impl ApplicationCompiler {
     ) -> Result<package::ResolvedImportFile, ApplicationError> {
         package::validate_portable_path_text(requested).map_err(application_path_error)?;
         let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            let dependency = package::resolve_dependency_scoped(
+            let (dependency, capabilities) = package::resolve_dependency_scoped_with_capabilities(
                 self.package_root.as_deref(),
                 current_path.parent().unwrap_or_else(|| Path::new(".")),
                 name,
             )
             .map_err(package_error)?;
+            capabilities
+                .extend(&mut self.trusted_package_roots)
+                .map_err(application_path_error)?;
             (dependency.entry, true)
         } else {
             let path = Path::new(requested);
@@ -715,6 +731,7 @@ fn collect_resources(
 
 fn collect_native_modules(
     graph: &ResolutionGraph,
+    capabilities: &package::ResolutionCapabilities,
 ) -> Result<BTreeMap<String, ApplicationNativeModule>, ApplicationError> {
     if graph.target != package::current_target() {
         return Err(application_error(format!(
@@ -723,6 +740,10 @@ fn collect_native_modules(
             package::current_target()
         )));
     }
+    let mut roots = package::TrustedPackageRoots::new();
+    capabilities
+        .extend(&mut roots)
+        .map_err(application_path_error)?;
     let mut modules = BTreeMap::new();
     let mut total = 0_u64;
     for dependency in graph.packages.values() {
@@ -742,10 +763,12 @@ fn collect_native_modules(
             )));
         }
         let source = dependency.root.join(&artifact.path);
-        let metadata = fs::symlink_metadata(&source).map_err(|error| {
-            application_error(format!("不能检查原生制品 {}：{error}", source.display()))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        let resolved = roots
+            .resolve_existing_file(&source, package::PackagePathPurpose::ManifestReference)
+            .map_err(application_path_error)?
+            .ok_or_else(|| application_error("原生制品不属于解析阶段的 generation"))?;
+        let metadata = resolved.metadata().map_err(io_error)?;
+        if !metadata.is_file() {
             return Err(application_error(format!(
                 "原生制品 {} 必须是普通文件，不能是链接或特殊文件",
                 source.display()
@@ -757,7 +780,12 @@ fn collect_native_modules(
                 source.display()
             )));
         }
-        let bytes = read_limited_file(&source, package::NATIVE_ARTIFACT_MAX_BYTES, "原生制品")?;
+        let bytes = package::read_resolved_regular_file_snapshot(
+            resolved,
+            package::NATIVE_ARTIFACT_MAX_BYTES,
+            "原生制品",
+        )
+        .map_err(package_error)?;
         let checksum = format!("{:x}", Sha256::digest(&bytes));
         if checksum != artifact.checksum.to_ascii_lowercase() {
             return Err(application_error(format!(
@@ -805,6 +833,7 @@ fn collect_native_modules(
 fn collect_licenses(
     manifest: &Manifest,
     graph: &ResolutionGraph,
+    capabilities: &package::ResolutionCapabilities,
 ) -> Result<BTreeMap<String, String>, ApplicationError> {
     let mut licenses = BTreeMap::new();
     if let Some(license) = manifest.license.as_ref() {
@@ -813,10 +842,13 @@ fn collect_licenses(
             license.clone(),
         );
     }
+    let mut roots = package::TrustedPackageRoots::new();
+    capabilities
+        .extend(&mut roots)
+        .map_err(application_path_error)?;
     for dependency in graph.packages.values() {
-        let dependency_manifest = package::discover(&dependency.root)
-            .map_err(package_error)?
-            .ok_or_else(|| application_error("锁定依赖缺少言序清单"))?;
+        let dependency_manifest =
+            package::load_manifest_from_roots(&roots, &dependency.root).map_err(package_error)?;
         if let Some(license) = dependency_manifest.license {
             licenses.insert(
                 format!(

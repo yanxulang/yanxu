@@ -571,10 +571,11 @@ impl DocIndex {
             return Ok(ModuleId::standard(name));
         }
         let (path, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            let dependency = crate::package::resolve_dependency_scoped(None, directory, name)
-                .map_err(|error| error.to_string())?;
-            self.trusted_package_roots
-                .insert(&dependency.root)
+            let (dependency, capabilities) =
+                crate::package::resolve_dependency_scoped_with_capabilities(None, directory, name)
+                    .map_err(|error| error.to_string())?;
+            capabilities
+                .extend(&mut self.trusted_package_roots)
                 .map_err(|error| error.to_string())?;
             (dependency.entry, true)
         } else {
