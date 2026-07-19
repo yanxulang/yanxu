@@ -275,7 +275,7 @@ impl NativeExtensionV2 {
         artifact: &NativeArtifact,
         permissions: &PermissionSet,
         expected_name: &str,
-        authority: NativeLoadAuthority,
+        _authority: NativeLoadAuthority,
     ) -> Result<Self, NativeError> {
         let path = path.as_ref();
         if artifact.abi != NATIVE_ABI_VERSION_V2 {
@@ -284,22 +284,9 @@ impl NativeExtensionV2 {
                 format!("锁定制品 ABI {} 不是 ABI v2", artifact.abi),
             ));
         }
-        match authority {
-            NativeLoadAuthority::NativeExtension => permissions
-                .check_native_extension(path)
-                .map_err(|error| native_error("NATIVE_PERMISSION", error.to_string()))?,
-            NativeLoadAuthority::OfficialGui => {
-                if !matches!(expected_name, "yanxu-gui" | "言窗") {
-                    return Err(native_error(
-                        "NATIVE_PERMISSION",
-                        "图形界面权限只可装载官方 yanxu-gui／言窗后端",
-                    ));
-                }
-                permissions
-                    .check_graphical_interface()
-                    .map_err(|error| native_error("NATIVE_PERMISSION", error.to_string()))?;
-            }
-        }
+        permissions
+            .check_native_extension(path)
+            .map_err(|error| native_error("NATIVE_PERMISSION", error.to_string()))?;
         if artifact.target != crate::package::current_target() {
             return Err(native_error(
                 "NATIVE_TARGET",
@@ -371,7 +358,7 @@ impl NativeExtensionV2 {
         artifact: &NativeArtifact,
         permissions: &PermissionSet,
         expected_name: &str,
-        authority: NativeLoadAuthority,
+        _authority: NativeLoadAuthority,
     ) -> Result<Self, NativeError> {
         if artifact.abi != NATIVE_ABI_VERSION_V2 {
             return Err(native_error(
@@ -379,22 +366,9 @@ impl NativeExtensionV2 {
                 format!("锁定制品 ABI {} 不是 ABI v2", artifact.abi),
             ));
         }
-        match authority {
-            NativeLoadAuthority::NativeExtension => permissions
-                .check_native_extension(&artifact.path)
-                .map_err(|error| native_error("NATIVE_PERMISSION", error.to_string()))?,
-            NativeLoadAuthority::OfficialGui => {
-                if !matches!(expected_name, "yanxu-gui" | "言窗") {
-                    return Err(native_error(
-                        "NATIVE_PERMISSION",
-                        "图形界面权限只可装载官方 yanxu-gui／言窗后端",
-                    ));
-                }
-                permissions
-                    .check_graphical_interface()
-                    .map_err(|error| native_error("NATIVE_PERMISSION", error.to_string()))?;
-            }
-        }
+        permissions
+            .check_native_extension(&artifact.path)
+            .map_err(|error| native_error("NATIVE_PERMISSION", error.to_string()))?;
         if artifact.target != crate::package::current_target() {
             return Err(native_error(
                 "NATIVE_TARGET",

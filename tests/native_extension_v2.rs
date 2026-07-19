@@ -159,19 +159,27 @@ fn loads_v2_typed_values_resources_callbacks_and_isolates_panics() {
 }
 
 #[test]
-fn v2_keeps_native_and_gui_permissions_separate() {
+fn v2_rejects_gui_only_authority_even_for_official_names() {
     let library = library_path();
-    let denied = match NativeExtensionV2::load_verified(
-        &library,
-        &artifact(&library),
-        &PermissionSet::sandboxed().allow_graphical_interface(),
-        "v2-example",
-        NativeLoadAuthority::NativeExtension,
-    ) {
-        Ok(_) => panic!("GUI permission must not grant arbitrary native loading"),
-        Err(error) => error,
-    };
-    assert_eq!(denied.code, "NATIVE_PERMISSION");
+    for expected_name in ["v2-example", "yanxu-gui", "言窗"] {
+        for authority in [
+            NativeLoadAuthority::NativeExtension,
+            NativeLoadAuthority::OfficialGui,
+        ] {
+            let denied = match NativeExtensionV2::load_verified(
+                &library,
+                &artifact(&library),
+                &PermissionSet::sandboxed().allow_graphical_interface(),
+                expected_name,
+                authority,
+            ) {
+                Ok(_) => panic!("图形界面权限不得授予动态库装载权限"),
+                Err(error) => error,
+            };
+            assert_eq!(denied.code, "NATIVE_PERMISSION");
+            assert!(denied.message.contains("原生扩展"));
+        }
+    }
 }
 
 #[test]

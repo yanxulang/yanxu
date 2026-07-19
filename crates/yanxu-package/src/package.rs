@@ -601,7 +601,6 @@ fn resolve_graph_mode_locked_with_checksum(
         visiting: Vec::new(),
         target: current_target(),
         native_allowed: manifest.permissions.native_extensions_allowed(),
-        gui_allowed: manifest.permissions.graphical_interface_allowed(),
     };
     let root_dependencies = builder.resolve_table(
         manifest,
@@ -772,7 +771,7 @@ pub fn gui_manifest_template(name: &str, gui_path: Option<&Path>) -> Result<Stri
         },
     );
     Ok(format!(
-        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.15\"\n入口 = \"src/主.yx\"\n\n[依赖]\n{dependency}\n\n[应用]\n类型 = \"图形\"\n名称 = {name:?}\n标识 = {identifier:?}\n版本 = \"0.1.0\"\n\n[应用.窗口]\n宽 = 800\n高 = 600\n最小宽 = 480\n最小高 = 320\n可缩放 = true\n高分屏 = true\n\n[权限]\n文件 = []\n网络 = []\n本地网络 = false\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = false\n图形界面 = true\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
+        "[包]\n格式 = 2\n名称 = {name:?}\n版本 = \"0.1.0\"\n言序 = \">=1.1.15\"\n入口 = \"src/主.yx\"\n\n[依赖]\n{dependency}\n\n[应用]\n类型 = \"图形\"\n名称 = {name:?}\n标识 = {identifier:?}\n版本 = \"0.1.0\"\n\n[应用.窗口]\n宽 = 800\n高 = 600\n最小宽 = 480\n最小高 = 320\n可缩放 = true\n高分屏 = true\n\n[权限]\n文件 = []\n网络 = []\n本地网络 = false\nTCP监听 = []\nUDP绑定 = []\n环境 = []\n进程 = false\n原生扩展 = true\n图形界面 = true\n剪贴板 = false\n文件对话框 = false\n系统通知 = false\n托盘 = false\n打开外部地址 = false\n全局快捷键 = false\n\n[导出]\n默认 = \"src/主.yx\"\n\n[构建]\n目标 = \"字节码\"\n"
     ))
 }
 
@@ -1814,7 +1813,6 @@ struct GraphBuilder<'a> {
     visiting: Vec<String>,
     target: String,
     native_allowed: bool,
-    gui_allowed: bool,
 }
 
 impl GraphBuilder<'_> {
@@ -1871,17 +1869,12 @@ impl GraphBuilder<'_> {
                 &dependency_manifest.dependency_packages,
             )?;
             let native = selected_native_artifact(&dependency_manifest, &self.target)?;
-            let official_gui_native = native.as_ref().is_some_and(|artifact| {
-                self.gui_allowed
-                    && artifact.abi == 2
-                    && matches!(dependency_manifest.name.as_str(), "yanxu-gui" | "言窗")
-            });
-            if native.is_some() && !self.native_allowed && !official_gui_native {
+            if native.is_some() && !self.native_allowed {
                 return Err(manifest_error(
                     &manifest.path,
                     None,
                     format!(
-                        "依赖“{}”包含原生扩展；顶层【权限】必须显式设置 原生扩展 = true（官方 yanxu-gui ABI v2 后端可改由 图形界面 = true 授权）",
+                        "依赖“{}”包含原生扩展；顶层【权限】必须显式设置 原生扩展 = true，图形界面权限不能代替原生加载授权",
                         dependency_manifest.name
                     ),
                 ));
@@ -5339,6 +5332,45 @@ mod tests {
         }
     }
 
+    fn write_native_package(root: &Path, name: &str) {
+        let bytes = b"native permission fixture";
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("backend.bin"), bytes).unwrap();
+        fs::write(root.join("主.yx"), "公 定 ABI：数 为 2；\n").unwrap();
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let target = current_target();
+        let architecture = std::env::consts::ARCH;
+        let os = if target == format!("{architecture}-pc-windows-msvc") {
+            "windows"
+        } else if target == format!("{architecture}-apple-darwin") {
+            "macos"
+        } else if target == format!("{architecture}-unknown-linux-gnu") {
+            "linux"
+        } else {
+            target
+                .strip_prefix(&format!("{architecture}-"))
+                .expect("current target starts with the architecture")
+        };
+        write(
+            &root.join(MANIFEST_NAME),
+            &format!(
+                "[包]\n格式=2\n名称={name:?}\n版本='1.0.0'\n入口='主.yx'\n[导出]\n默认='主.yx'\n[原生]\nABI=2\n[原生.{os}.{architecture}]\n文件='backend.bin'\n校验和='{checksum}'\n大小={}\n",
+                bytes.len()
+            ),
+        );
+        assert_eq!(
+            load(root.join(MANIFEST_NAME))
+                .unwrap()
+                .native
+                .unwrap()
+                .artifacts
+                .keys()
+                .next()
+                .unwrap(),
+            &target
+        );
+    }
+
     #[test]
     fn format_diagnostics_report_the_running_package_version() {
         let unsupported_build = parse(
@@ -6851,12 +6883,78 @@ mod tests {
         assert_eq!(application.window.width, 800);
         assert_eq!(application.window.minimum_width, 480);
         assert!(manifest.permissions.check_graphical_interface().is_ok());
+        assert!(
+            manifest
+                .permissions
+                .check_native_extension("backend")
+                .is_ok()
+        );
         assert!(manifest.permissions.check_clipboard().is_err());
         assert!(matches!(
             manifest.dependencies.get("言窗"),
             Some(Dependency::Path { requirement: Some(requirement), .. })
                 if requirement.to_string() == "^1.0"
         ));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn gui_permission_cannot_authorize_named_path_native_packages() {
+        let root = temp("gui-native-permission");
+        let path_dependency = root.join("path-dependency");
+        write_native_package(&path_dependency, "yanxu-gui");
+        let path_application = root.join("path-application");
+        let path_manifest = "[包]\n格式=2\n名称='路径应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n言窗={包='yanxu-gui',路径='../path-dependency',版='^1'}\n[权限]\n图形界面=true\n";
+        write(&path_application.join(MANIFEST_NAME), path_manifest);
+        write(&path_application.join("主.yx"), "言 1；\n");
+        let manifest = load(path_application.join(MANIFEST_NAME)).unwrap();
+        let error = plan_update(&manifest, false).unwrap_err();
+        assert!(error.message.contains("原生扩展 = true"), "{error}");
+        assert!(error.message.contains("图形界面权限不能代替"), "{error}");
+        write(
+            &path_application.join(MANIFEST_NAME),
+            &path_manifest.replace("图形界面=true", "图形界面=true\n原生扩展=true"),
+        );
+        let manifest = load(path_application.join(MANIFEST_NAME)).unwrap();
+        assert_eq!(plan_update(&manifest, false).unwrap().packages.len(), 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn gui_permission_cannot_authorize_named_git_native_packages() {
+        let root = temp("gui-git-native-permission");
+        let git_dependency = root.join("git-dependency");
+        write_native_package(&git_dependency, "yanxu-gui");
+        for arguments in [
+            ["init", "--quiet"].as_slice(),
+            ["config", "user.email", "yanxu@example.invalid"].as_slice(),
+            ["config", "user.name", "Yanxu Tests"].as_slice(),
+            ["add", "."].as_slice(),
+            ["commit", "--quiet", "-m", "initial"].as_slice(),
+        ] {
+            let status = Command::new("git")
+                .args(arguments)
+                .current_dir(&git_dependency)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let git_url = git_dependency.to_string_lossy().into_owned();
+        let git_application = root.join("git-application");
+        write(
+            &git_application.join(MANIFEST_NAME),
+            &format!(
+                "[包]\n格式=2\n名称='Git应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n言窗={{包='yanxu-gui',git={git_url:?},修订='HEAD',版='^1'}}\n[权限]\n图形界面=true\n"
+            ),
+        );
+        write(&git_application.join("主.yx"), "言 1；\n");
+        let manifest = load(git_application.join(MANIFEST_NAME)).unwrap();
+        let error = plan_update(&manifest, false).unwrap_err();
+        assert!(error.message.contains("原生扩展 = true"), "{error}");
+        assert!(error.message.contains("图形界面权限不能代替"), "{error}");
+        let cache = cache_root().join("git").join(short_hash(&git_url));
+        fs::remove_dir_all(cache).ok();
         fs::remove_dir_all(root).ok();
     }
 
