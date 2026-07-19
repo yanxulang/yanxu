@@ -6,6 +6,7 @@ use crate::permissions::PermissionSet;
 use crate::vm::Vm;
 use crate::{parse_named, type_checker};
 use std::fmt;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -96,6 +97,18 @@ impl fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+impl EngineError {
+    const fn default_code(kind: EngineErrorKind) -> &'static str {
+        match kind {
+            EngineErrorKind::Io => "ENGINE_IO",
+            EngineErrorKind::Frontend => "ENGINE_FRONTEND",
+            EngineErrorKind::Type => "ENGINE_TYPE",
+            EngineErrorKind::Compile => "ENGINE_COMPILE",
+            EngineErrorKind::Runtime => "ENGINE_RUNTIME",
+        }
+    }
+}
+
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
         let host_limits = crate::budget::HostResourceLimits::default();
@@ -165,18 +178,23 @@ impl Engine {
             .permissions
             .check_file(path)
             .map_err(|error| EngineError::new(EngineErrorKind::Runtime, error.to_string()))?;
-        let canonical = fs::canonicalize(path).map_err(|error| {
-            EngineError::new(
-                EngineErrorKind::Io,
-                format!("不能定位“{}”：{error}", path.display()),
-            )
-        })?;
-        let source = fs::read_to_string(&canonical).map_err(|error| {
-            EngineError::new(
-                EngineErrorKind::Io,
-                format!("不能读取“{}”：{error}", canonical.display()),
-            )
-        })?;
+        let resolved =
+            crate::resolve_module_file_path(path).map_err(EngineError::module_path_or_io)?;
+        let canonical = resolved.path().to_path_buf();
+        self.config
+            .permissions
+            .check_file(&canonical)
+            .map_err(|error| EngineError::new(EngineErrorKind::Runtime, error.to_string()))?;
+        let resolved = resolved
+            .open()
+            .map_err(|error| EngineError::module_path_or_io(crate::module_manifest_error(error)))?;
+        let source =
+            crate::package::read_resolved_module_source_snapshot(resolved).map_err(|error| {
+                EngineError::new(
+                    EngineErrorKind::Io,
+                    format!("不能读取“{}”：{error}", canonical.display()),
+                )
+            })?;
         self.run_named(
             &source,
             canonical.display().to_string(),
@@ -201,14 +219,19 @@ impl Engine {
                 self.config.permissions.clone(),
             )
             .map_err(|errors| {
-                EngineError::new(
-                    EngineErrorKind::Type,
-                    errors
-                        .into_iter()
-                        .map(|error| error.to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
+                let code = errors
+                    .iter()
+                    .find(|error| error.code() != "TYPE000")
+                    .map(|error| error.code());
+                let message = errors
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                match code {
+                    Some(code) => EngineError::coded(EngineErrorKind::Type, code, message),
+                    None => EngineError::new(EngineErrorKind::Type, message),
+                }
             })?;
         }
         let execution = match &mut self.runtime {
@@ -221,7 +244,7 @@ impl Engine {
                     output: interpreter.take_output(),
                     backend: Backend::Tree,
                 })
-                .map_err(|error| EngineError::new(EngineErrorKind::Runtime, error.to_string())),
+                .map_err(EngineError::tree_runtime),
             Runtime::Bytecode(vm) => {
                 let chunk = bytecode::compile(&statements).map_err(|error| {
                     EngineError::new(EngineErrorKind::Compile, error.to_string())
@@ -234,7 +257,7 @@ impl Engine {
                         output: vm.take_output(),
                         backend: Backend::Bytecode,
                     })
-                    .map_err(|error| EngineError::new(EngineErrorKind::Runtime, error.to_string()))
+                    .map_err(EngineError::vm_runtime)
             }
         };
         let execution = match execution {
@@ -258,6 +281,73 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    fn coded(kind: EngineErrorKind, code: &'static str, message: impl Into<String>) -> Self {
+        if code == Self::default_code(kind) || matches!(code, "TYPE000" | "RUN000") {
+            return Self::new(kind, message);
+        }
+        Self {
+            kind,
+            message: format!("[{code}] {}", message.into()),
+        }
+    }
+
+    fn module_path_or_io(message: String) -> Self {
+        if let Some((code, diagnostic)) = package_code_and_message(&message) {
+            Self::coded(EngineErrorKind::Frontend, code, diagnostic)
+        } else {
+            Self::new(EngineErrorKind::Io, message)
+        }
+    }
+
+    fn tree_runtime(error: crate::interpreter::RuntimeError) -> Self {
+        let code = error.code;
+        let message = error.to_string();
+        if code.starts_with("PACKAGE_") {
+            Self::coded(
+                EngineErrorKind::Runtime,
+                code,
+                message.replacen(&format!("[{code}] "), "", 1),
+            )
+        } else {
+            Self::new(EngineErrorKind::Runtime, message)
+        }
+    }
+
+    fn vm_runtime(error: crate::vm::VmError) -> Self {
+        let code = error.code;
+        let message = error.to_string();
+        if code.starts_with("PACKAGE_") {
+            Self::coded(
+                EngineErrorKind::Runtime,
+                code,
+                message.replacen(&format!("[{code}] "), "", 1),
+            )
+        } else {
+            Self::new(EngineErrorKind::Runtime, message)
+        }
+    }
+}
+
+fn package_code_and_message(message: &str) -> Option<(&'static str, &str)> {
+    let (encoded, diagnostic) = message.strip_prefix('[')?.split_once("] ")?;
+    let code = match encoded {
+        crate::package::PACKAGE_MODULE_RESERVED_PATH_CODE => {
+            crate::package::PACKAGE_MODULE_RESERVED_PATH_CODE
+        }
+        crate::package::PACKAGE_PATH_NON_PORTABLE_CODE => {
+            crate::package::PACKAGE_PATH_NON_PORTABLE_CODE
+        }
+        crate::package::PACKAGE_PATH_INVALID_CODE => crate::package::PACKAGE_PATH_INVALID_CODE,
+        crate::package::PACKAGE_ROOT_INVALID_CODE => crate::package::PACKAGE_ROOT_INVALID_CODE,
+        crate::package::PACKAGE_MODULE_OUTSIDE_ROOT_CODE => {
+            crate::package::PACKAGE_MODULE_OUTSIDE_ROOT_CODE
+        }
+        crate::package::PACKAGE_PATH_RESERVED_CODE => crate::package::PACKAGE_PATH_RESERVED_CODE,
+        crate::package::PACKAGE_PATH_COLLISION_CODE => crate::package::PACKAGE_PATH_COLLISION_CODE,
+        _ => return None,
+    };
+    Some((code, diagnostic))
 }
 
 #[cfg(test)]

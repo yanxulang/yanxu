@@ -724,7 +724,7 @@ pub struct Vm {
     application_native_modules:
         Option<Rc<std::collections::BTreeMap<String, crate::application::DecodedNativeModule>>>,
     package_root: Option<PathBuf>,
-    package_module_roots: Vec<PathBuf>,
+    package_module_roots: crate::package::TrustedPackageRoots,
     permissions: crate::permissions::PermissionSet,
     socket_quota: crate::stdlib::SocketQuota,
     arguments: Vec<String>,
@@ -791,7 +791,7 @@ impl Vm {
             application_resources: None,
             application_native_modules: None,
             package_root: None,
-            package_module_roots: Vec::new(),
+            package_module_roots: crate::package::TrustedPackageRoots::default(),
             permissions,
             socket_quota: crate::stdlib::SocketQuota::default(),
             arguments: Vec::new(),
@@ -884,18 +884,43 @@ impl Vm {
                 .map_err(|archive_error| error(&Span::synthetic(), archive_error.to_string()))?;
         }
         self.resources.reset();
-        let package_root = crate::package::discover(directory)
-            .ok()
-            .flatten()
-            .map(|manifest| manifest.root);
+        let absolute_directory = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(directory)
+        };
+        let directory = fs::canonicalize(&absolute_directory).unwrap_or(absolute_directory);
+        let package_root = crate::package::discover(&directory)
+            .map_err(|runtime_error| package_error(&Span::synthetic(), runtime_error))?
+            .map(|manifest| {
+                fs::canonicalize(&manifest.root).map_err(|runtime_error| {
+                    error(
+                        &Span::synthetic(),
+                        format!(
+                            "不能定位包根目录“{}”：{runtime_error}",
+                            manifest.root.display()
+                        ),
+                    )
+                })
+            })
+            .transpose()?;
+        let mut package_module_roots = crate::package::TrustedPackageRoots::default();
+        if let Some(root) = &package_root {
+            package_module_roots
+                .insert(root)
+                .map_err(|runtime_error| package_path_error(&Span::synthetic(), runtime_error))?;
+        }
         let previous_package_root = std::mem::replace(&mut self.package_root, package_root);
-        let previous_package_module_roots = std::mem::take(&mut self.package_module_roots);
+        let previous_package_module_roots =
+            std::mem::replace(&mut self.package_module_roots, package_module_roots);
         let result = self.run_chunk(
             Rc::new(chunk.clone()),
             self.globals.clone(),
             "<顶层>".into(),
             Span::synthetic(),
-            directory.to_path_buf(),
+            directory,
             None,
         );
         self.package_root = previous_package_root;
@@ -4106,42 +4131,45 @@ impl Vm {
         directory: &Path,
         span: &Span,
     ) -> Result<Rc<VmModule>, VmError> {
+        crate::package::validate_portable_path_text(requested)
+            .map_err(|runtime_error| package_path_error(span, runtime_error))?;
         if let Some(name) = requested.strip_prefix("标准:") {
             return self.standard_module(name, span);
         }
         if let Some(id) = requested.strip_prefix("归档:") {
             return self.load_application_module(id, directory, span);
         }
-        let joined = if let Some(name) = requested.strip_prefix("包:") {
+        let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
             let dependency = crate::package::resolve_dependency_scoped(
                 self.package_root.as_deref(),
                 directory,
                 name,
             )
-            .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
-            if !self.package_module_roots.contains(&dependency.root) {
-                self.package_module_roots.push(dependency.root);
-            }
-            dependency.entry
+            .map_err(|runtime_error| package_error(span, runtime_error))?;
+            self.package_module_roots
+                .insert(&dependency.root)
+                .map_err(|runtime_error| package_path_error(span, runtime_error))?;
+            (dependency.entry, true)
         } else {
             let path = Path::new(requested);
             if path.is_absolute() {
-                path.into()
+                (path.into(), false)
             } else {
-                directory.join(path)
+                (directory.join(path), false)
             }
         };
-        let canonical = fs::canonicalize(&joined).map_err(|runtime_error| {
-            error(
-                span,
-                format!("不能载入模块“{}”：{runtime_error}", joined.display()),
-            )
-        })?;
+        if !package_import && self.package_module_roots.matching_root(&joined).is_none() {
+            self.permissions
+                .check_file(&joined)
+                .map_err(|permission| error(span, permission.to_string()))?;
+        }
+        let (resolved, authority) = self
+            .package_module_roots
+            .resolve_import_file(directory, &joined, package_import)
+            .map_err(|runtime_error| package_error(span, runtime_error))?;
+        let canonical = resolved.path().to_path_buf();
         if let Err(permission) = self.permissions.check_file(&canonical)
-            && !self
-                .package_module_roots
-                .iter()
-                .any(|root| canonical.starts_with(root))
+            && !authority.is_verified()
         {
             return Err(error(span, permission.to_string()));
         }
@@ -4162,51 +4190,58 @@ impl Vm {
             return Err(error(span, format!("模块循环相引：{}", chain.join(" → "))));
         }
 
+        let resolved = resolved
+            .open()
+            .map_err(|runtime_error| package_error(span, runtime_error))?;
         self.loading_modules.push(canonical.clone());
         self.cache_stats.module_misses += 1;
-        let metadata = fs::metadata(&canonical)
-            .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
-        let modified = metadata.modified().ok();
-        let length = metadata.len();
-        let cached = self
-            .bytecode_cache
-            .get(&canonical)
-            .filter(|cache| cache.length == length && cache.modified == modified)
-            .map(|cache| cache.chunk.clone());
-        let chunk = if let Some(chunk) = cached {
-            self.cache_stats.module_hits += 1;
-            chunk
-        } else {
-            let source = fs::read_to_string(&canonical)
+        let result = (|| {
+            let metadata = resolved
+                .metadata()
                 .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
-            let statements = crate::parse_named(&source, canonical.display().to_string())
-                .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
-            let chunk = Rc::new(
-                crate::bytecode::compile(&statements)
-                    .map_err(|runtime_error| error(span, runtime_error.to_string()))?,
-            );
-            self.bytecode_cache.insert(
-                canonical.clone(),
-                CachedChunk {
-                    length,
-                    modified,
-                    chunk: chunk.clone(),
-                },
-            );
-            chunk
-        };
-        let environment = self.child_env(self.globals.clone());
-        let module_directory = canonical.parent().unwrap_or_else(|| Path::new("."));
-        let execution = self.run_chunk(
-            chunk.clone(),
-            environment.clone(),
-            format!("模块“{}”", canonical.display()),
-            span.clone(),
-            module_directory.into(),
-            None,
-        );
+            let modified = metadata.modified().ok();
+            let length = metadata.len();
+            let cached = self
+                .bytecode_cache
+                .get(&canonical)
+                .filter(|cache| cache.length == length && cache.modified == modified)
+                .map(|cache| cache.chunk.clone());
+            let chunk = if let Some(chunk) = cached {
+                self.cache_stats.module_hits += 1;
+                chunk
+            } else {
+                let source = crate::package::read_resolved_module_source_snapshot(resolved)
+                    .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+                let statements = crate::parse_named(&source, canonical.display().to_string())
+                    .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+                let chunk = Rc::new(
+                    crate::bytecode::compile(&statements)
+                        .map_err(|runtime_error| error(span, runtime_error.to_string()))?,
+                );
+                self.bytecode_cache.insert(
+                    canonical.clone(),
+                    CachedChunk {
+                        length,
+                        modified,
+                        chunk: chunk.clone(),
+                    },
+                );
+                chunk
+            };
+            let environment = self.child_env(self.globals.clone());
+            let module_directory = canonical.parent().unwrap_or_else(|| Path::new("."));
+            self.run_chunk(
+                chunk.clone(),
+                environment.clone(),
+                format!("模块“{}”", canonical.display()),
+                span.clone(),
+                module_directory.into(),
+                None,
+            )?;
+            Ok((chunk, environment))
+        })();
         self.loading_modules.pop();
-        execution?;
+        let (chunk, environment) = result?;
         let module = Rc::new(VmModule {
             name: canonical
                 .file_stem()
@@ -5554,11 +5589,31 @@ fn thrown(value: VmValue, span: &Span) -> VmError {
 }
 
 fn error(span: &Span, message: impl Into<String>) -> VmError {
+    coded_error(span, "RUN000", message)
+}
+
+fn coded_error(span: &Span, code: &'static str, message: impl Into<String>) -> VmError {
     VmError {
-        code: "RUN000",
+        code,
         message: message.into(),
         span: span.clone(),
         frames: Vec::new(),
+    }
+}
+
+fn package_path_error(span: &Span, source: crate::package::PackagePathError) -> VmError {
+    coded_error(span, source.code, source.diagnostic_message())
+}
+
+fn package_error(span: &Span, source: crate::package::ManifestError) -> VmError {
+    if source.code() == "PACKAGE000" {
+        error(span, source.to_string())
+    } else {
+        coded_error(
+            span,
+            source.code(),
+            format!("{}：{}", source.path.display(), source.diagnostic_message()),
+        )
     }
 }
 

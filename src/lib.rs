@@ -42,7 +42,6 @@ use lexer::LexError;
 use parser::ParseError;
 use resolver::SemanticError;
 use std::fmt;
-use std::fs;
 use std::path::Path;
 
 #[derive(Debug)]
@@ -104,13 +103,49 @@ pub fn run_file_with(
     path: impl AsRef<Path>,
 ) -> Result<Value, YanxuError> {
     let path = path.as_ref();
-    let canonical = fs::canonicalize(path)
-        .map_err(|error| YanxuError::Io(format!("不能定位“{}”：{error}", path.display())))?;
-    let source = fs::read_to_string(&canonical)
+    let resolved = resolve_module_file_path(path).map_err(YanxuError::Io)?;
+    let canonical = resolved.path().to_path_buf();
+    let resolved = resolved
+        .open()
+        .map_err(|error| YanxuError::Io(module_manifest_error(error)))?;
+    let source = package::read_resolved_module_source_snapshot(resolved)
         .map_err(|error| YanxuError::Io(format!("不能读取“{}”：{error}", canonical.display())))?;
     let statements = parse_named(&source, canonical.display().to_string())?;
     let directory = canonical.parent().unwrap_or_else(|| Path::new("."));
     interpreter
         .execute_in_directory(&statements, directory)
         .map_err(YanxuError::Runtime)
+}
+
+pub(crate) fn resolve_module_file_path(
+    requested: &Path,
+) -> Result<package::ResolvedImportFile, String> {
+    let requested_absolute = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("不能定位当前目录：{error}"))?
+            .join(requested)
+    };
+    let current_base = requested_absolute
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let mut roots = package::TrustedPackageRoots::default();
+    roots
+        .resolve_import_file(current_base, &requested_absolute, false)
+        .map(|(resolved, _)| resolved)
+        .map_err(module_manifest_error)
+}
+
+fn module_manifest_error(error: package::ManifestError) -> String {
+    if error.code() == "PACKAGE000" {
+        error.to_string()
+    } else {
+        format!(
+            "[{}] {}：{}",
+            error.code(),
+            error.path.display(),
+            error.diagnostic_message()
+        )
+    }
 }
