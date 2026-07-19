@@ -6,6 +6,8 @@
 
 mod archive;
 
+use crate::subprocess;
+
 use crate::path_policy::{
     ModuleAuthority, PACKAGE_PATH_NON_PORTABLE_CODE, PackagePathDecision, PackagePathError,
     PackagePathPurpose, PackagePathReason, PortablePackagePaths, ResolvedPackageFile,
@@ -32,6 +34,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
 
 #[cfg(not(target_os = "wasi"))]
@@ -73,6 +76,13 @@ const RESOLUTION_GENERATION_LAYOUT: &str = "tree-v1";
 const GIT_CACHE_LAYOUT: &str = "v2";
 const GIT_GENERATION_LAYOUT: &str = "tree-v1";
 const GIT_CONFIG_MAX_BYTES: u64 = 64 * 1024;
+const GIT_COMMAND_STDERR_MAX_BYTES: usize = 64 * 1024;
+const GIT_INSPECT_TIMEOUT: Duration = Duration::from_secs(15);
+const GIT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_FETCH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const GIT_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const GIT_INITIALIZE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const GIT_STORE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const GIT_STORE_MAX_ENTRIES: usize = 1_000_000;
 const GIT_STORE_MAX_DEPTH: usize = 256;
 const MANIFEST_TOML_SYNTAX_ERROR: &str = "TOML 格式无效；请检查对应行的语法";
@@ -3390,7 +3400,7 @@ fn resolve_git(
     let (existing_store, invalid_store) = find_git_object_store(&url_root)?;
     let (store, exact) = match existing_store {
         Some(store) => {
-            let exact = if exact_requested && git_commit_exists(&store, revision) {
+            let exact = if exact_requested && git_commit_exists(&store, revision)? {
                 git_exact_revision(&store, revision)?
             } else if offline {
                 let url = safe_git_source_value_for_display(url);
@@ -3642,22 +3652,30 @@ fn git_command_output(
     action: &str,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ManifestError> {
-    let output = command
-        .output()
-        .map_err(|_| manifest_error(path, None, format!("{action}失败：不能启动 Git")))?;
+    let output = bounded_command_output(
+        command,
+        path,
+        action,
+        "Git",
+        subprocess::CommandBudget {
+            timeout: GIT_INSPECT_TIMEOUT,
+            stdout_bytes: max_bytes,
+            stderr_bytes: GIT_COMMAND_STDERR_MAX_BYTES,
+            disk: Some(subprocess::DiskBudget {
+                root: path,
+                max_bytes: GIT_STORE_MAX_BYTES,
+                max_entries: GIT_STORE_MAX_ENTRIES,
+                max_depth: GIT_STORE_MAX_DEPTH,
+            }),
+            cancellation: None,
+        },
+    )?;
     if !output.status.success() {
         return Err(if let Some(code) = output.status.code() {
             manifest_error(path, None, format!("{action}失败（退出码 {code}）"))
         } else {
             manifest_error(path, None, format!("{action}失败（进程异常终止）"))
         });
-    }
-    if output.stdout.len() > max_bytes {
-        return Err(manifest_error(
-            path,
-            None,
-            format!("{action}输出超过 {max_bytes} 字节上限"),
-        ));
     }
     Ok(output.stdout)
 }
@@ -3686,17 +3704,41 @@ fn git_exact_revision(store: &Path, revision: &str) -> Result<String, ManifestEr
     Ok(exact)
 }
 
-fn git_commit_exists(store: &Path, revision: &str) -> bool {
-    git_store_command(store)
-        .arg("cat-file")
-        .arg("-e")
-        .arg(format!("{revision}^{{commit}}"))
-        .output()
-        .is_ok_and(|output| output.status.success())
+fn git_commit_exists(store: &Path, revision: &str) -> Result<bool, ManifestError> {
+    let output = bounded_command_output(
+        git_store_command(store)
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg("--quiet")
+            .arg(format!("{revision}^{{commit}}")),
+        store,
+        "检查 Git 精确提交",
+        "Git",
+        subprocess::CommandBudget {
+            timeout: GIT_INSPECT_TIMEOUT,
+            stdout_bytes: 128,
+            stderr_bytes: GIT_COMMAND_STDERR_MAX_BYTES,
+            disk: Some(subprocess::DiskBudget {
+                root: store,
+                max_bytes: GIT_STORE_MAX_BYTES,
+                max_entries: GIT_STORE_MAX_ENTRIES,
+                max_depth: GIT_STORE_MAX_DEPTH,
+            }),
+            cancellation: None,
+        },
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            command_status_result(output, store, "检查 Git 精确提交")?;
+            unreachable!("成功和缺失状态已在前面处理")
+        }
+    }
 }
 
 fn fetch_git_revision(store: &Path, url: &str, revision: &str) -> Result<String, ManifestError> {
-    run_command(
+    run_git_command(
         git_store_command(store)
             .arg("fetch")
             .arg("--quiet")
@@ -3707,6 +3749,13 @@ fn fetch_git_revision(store: &Path, url: &str, revision: &str) -> Result<String,
             .arg(revision),
         store,
         "获取 Git 修订",
+        GIT_FETCH_TIMEOUT,
+        Some(subprocess::DiskBudget {
+            root: store,
+            max_bytes: GIT_STORE_MAX_BYTES,
+            max_entries: GIT_STORE_MAX_ENTRIES,
+            max_depth: GIT_STORE_MAX_DEPTH,
+        }),
     )?;
     git_exact_revision(store, "FETCH_HEAD")
 }
@@ -3793,6 +3842,7 @@ fn validate_git_store_tree(store: &Path) -> Result<(), ManifestError> {
     }
     let mut pending = vec![(store.to_path_buf(), 0_usize)];
     let mut entries = 0_usize;
+    let mut bytes = 0_u64;
     while let Some((directory, depth)) = pending.pop() {
         if depth > GIT_STORE_MAX_DEPTH {
             return Err(manifest_error(
@@ -3850,7 +3900,18 @@ fn validate_git_store_tree(store: &Path) -> Result<(), ManifestError> {
             }
             if metadata.is_dir() {
                 pending.push((path, depth.saturating_add(1)));
-            } else if !metadata.is_file() {
+            } else if metadata.is_file() {
+                bytes = bytes
+                    .checked_add(measured_standard_file_bytes(&metadata))
+                    .filter(|bytes| *bytes <= GIT_STORE_MAX_BYTES)
+                    .ok_or_else(|| {
+                        manifest_error(
+                            store,
+                            None,
+                            format!("Git 对象库内容超过 {GIT_STORE_MAX_BYTES} 字节"),
+                        )
+                    })?;
+            } else {
                 return Err(manifest_error(
                     &path,
                     None,
@@ -3860,6 +3921,18 @@ fn validate_git_store_tree(store: &Path) -> Result<(), ManifestError> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn measured_standard_file_bytes(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.len().max(metadata.blocks().saturating_mul(512))
+}
+
+#[cfg(not(unix))]
+fn measured_standard_file_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
 }
 
 fn validate_git_object_store(store: &Path) -> Result<(), ManifestError> {
@@ -4017,7 +4090,7 @@ fn create_git_object_store(
     revision: &str,
 ) -> Result<(PathBuf, String), ManifestError> {
     let temporary = RegistryTemporaryDirectory::create_within(url_root, url_root, "git-objects")?;
-    run_command(
+    run_git_command(
         hardened_git_command()
             .arg("init")
             .arg("--bare")
@@ -4026,6 +4099,13 @@ fn create_git_object_store(
             .arg(temporary.path()),
         temporary.path(),
         "初始化 Git bare 对象库",
+        GIT_INITIALIZE_TIMEOUT,
+        Some(subprocess::DiskBudget {
+            root: temporary.path(),
+            max_bytes: GIT_INITIALIZE_MAX_BYTES,
+            max_entries: 4_096,
+            max_depth: 32,
+        }),
     )?;
     let exact = fetch_git_revision(temporary.path(), url, revision)?;
     validate_git_object_store(temporary.path())?;
@@ -4051,7 +4131,7 @@ fn capture_git_commit_snapshot(
     let temporary =
         RegistryTemporaryDirectory::create_within(url_root, url_root, "git-materialize")?;
     let archive_path = temporary.path().join("tree.tar");
-    run_command(
+    run_git_command(
         git_store_command(store)
             .arg("archive")
             .arg("--format=tar")
@@ -4060,6 +4140,13 @@ fn capture_git_commit_snapshot(
             .arg(exact),
         store,
         "导出精确 Git 提交",
+        GIT_ARCHIVE_TIMEOUT,
+        Some(subprocess::DiskBudget {
+            root: temporary.path(),
+            max_bytes: PACKAGE_TREE_MAX_BYTES,
+            max_entries: 16,
+            max_depth: 1,
+        }),
     )?;
     let archive = open_regular_file_for_snapshot(&archive_path).map_err(|error| {
         manifest_error(
@@ -6879,7 +6966,7 @@ fn is_regular_file_metadata(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn standard_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+pub(crate) fn standard_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -6887,7 +6974,7 @@ fn standard_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(not(windows))]
-fn standard_metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
+pub(crate) fn standard_metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
     false
 }
 
@@ -8285,7 +8372,7 @@ fn capture_package_directory_capability(
 }
 
 #[cfg(windows)]
-fn cap_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+pub(crate) fn cap_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
     use cap_std::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -8293,7 +8380,7 @@ fn cap_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
 }
 
 #[cfg(all(not(windows), not(target_os = "wasi")))]
-fn cap_metadata_is_reparse(_metadata: &cap_std::fs::Metadata) -> bool {
+pub(crate) fn cap_metadata_is_reparse(_metadata: &cap_std::fs::Metadata) -> bool {
     false
 }
 
@@ -9599,6 +9686,126 @@ fn copy_registry_tree_with_checkpoint(
             manifest_error(destination, None, format!("不能同步制品缓存目录：{error}"))
         })?;
     Ok(())
+}
+
+fn bounded_command_output(
+    command: &mut Command,
+    path: &Path,
+    action: &str,
+    program_kind: &str,
+    budget: subprocess::CommandBudget<'_>,
+) -> Result<subprocess::CommandOutput, ManifestError> {
+    subprocess::run(command, budget)
+        .map_err(|failure| bounded_command_error(path, action, program_kind, failure))
+}
+
+fn bounded_command_error(
+    path: &Path,
+    action: &str,
+    program_kind: &str,
+    failure: subprocess::CommandFailure,
+) -> ManifestError {
+    use subprocess::{CommandFailure, OutputStream};
+
+    let stream_name = |stream| match stream {
+        OutputStream::Stdout => "标准输出",
+        OutputStream::Stderr => "标准错误",
+    };
+    let message = match failure {
+        CommandFailure::Spawn => format!("{action}失败：不能启动{program_kind}"),
+        CommandFailure::Containment => format!(
+            "[PACKAGE_SUBPROCESS_CONTAINMENT] {action}失败：不能建立可完整回收的{program_kind}进程树"
+        ),
+        CommandFailure::Wait => format!("{action}失败：不能等候{program_kind}进程"),
+        CommandFailure::ReaderSpawn(stream) => format!(
+            "{action}失败：不能启动{program_kind}{}有界读取线程",
+            stream_name(stream)
+        ),
+        CommandFailure::Read(stream) => format!(
+            "{action}失败：不能有界读取{program_kind}{}",
+            stream_name(stream)
+        ),
+        CommandFailure::ReaderPanicked(stream) => format!(
+            "{action}失败：读取{program_kind}{}的线程异常",
+            stream_name(stream)
+        ),
+        CommandFailure::Timeout(timeout) => format!(
+            "[PACKAGE_SUBPROCESS_TIMEOUT] {action}超过 {} 毫秒，已终止并回收{program_kind}进程树",
+            timeout.as_millis()
+        ),
+        CommandFailure::Cancelled => format!(
+            "[PACKAGE_SUBPROCESS_CANCELLED] {action}已取消，已终止并回收{program_kind}进程树"
+        ),
+        CommandFailure::OutputLimit { stream, max_bytes } => format!(
+            "[PACKAGE_SUBPROCESS_OUTPUT_LIMIT] {action}的{program_kind}{}超过 {max_bytes} 字节上限，已终止并回收进程树",
+            stream_name(stream)
+        ),
+        CommandFailure::DiskBytes(max_bytes) => format!(
+            "[PACKAGE_SUBPROCESS_DISK_LIMIT] {action}的临时磁盘内容超过 {max_bytes} 字节上限，已终止并回收{program_kind}进程树"
+        ),
+        CommandFailure::DiskEntries(max_entries) => format!(
+            "[PACKAGE_SUBPROCESS_DISK_LIMIT] {action}的临时磁盘内容超过 {max_entries} 项上限，已终止并回收{program_kind}进程树"
+        ),
+        CommandFailure::DiskDepth(max_depth) => format!(
+            "[PACKAGE_SUBPROCESS_DISK_LIMIT] {action}的临时磁盘目录超过 {max_depth} 层上限，已终止并回收{program_kind}进程树"
+        ),
+        CommandFailure::DiskSpecial => format!(
+            "[PACKAGE_SUBPROCESS_DISK_LIMIT] {action}的临时磁盘内容出现链接、重解析点或特殊文件，已终止并回收{program_kind}进程树"
+        ),
+        CommandFailure::DiskRead => format!(
+            "[PACKAGE_SUBPROCESS_DISK_LIMIT] {action}的临时磁盘内容无法安全计量，已终止并回收{program_kind}进程树"
+        ),
+        #[cfg(target_os = "wasi")]
+        CommandFailure::Unsupported => {
+            format!("{action}失败：当前目标不支持启动{program_kind}")
+        }
+    };
+    manifest_error(path, None, message)
+}
+
+fn command_status_result(
+    output: subprocess::CommandOutput,
+    path: &Path,
+    action: &str,
+) -> Result<(), ManifestError> {
+    if output.status.success() {
+        Ok(())
+    } else if let Some(code) = output.status.code() {
+        Err(manifest_error(
+            path,
+            None,
+            format!("{action}失败（退出码 {code}）"),
+        ))
+    } else {
+        Err(manifest_error(
+            path,
+            None,
+            format!("{action}失败（进程异常终止）"),
+        ))
+    }
+}
+
+fn run_git_command(
+    command: &mut Command,
+    path: &Path,
+    action: &str,
+    timeout: Duration,
+    disk: Option<subprocess::DiskBudget<'_>>,
+) -> Result<(), ManifestError> {
+    let output = bounded_command_output(
+        command,
+        path,
+        action,
+        "Git",
+        subprocess::CommandBudget {
+            timeout,
+            stdout_bytes: 0,
+            stderr_bytes: GIT_COMMAND_STDERR_MAX_BYTES,
+            disk,
+            cancellation: None,
+        },
+    )?;
+    command_status_result(output, path, action)
 }
 
 fn run_command(command: &mut Command, path: &Path, action: &str) -> Result<(), ManifestError> {
@@ -14171,6 +14378,589 @@ mod tests {
         assert!(!error.contains(marker), "{error}");
         assert!(!error.chars().any(char::is_control), "{error:?}");
         assert!(error.contains("退出码 17"), "{error}");
+    }
+
+    #[cfg(any(unix, windows))]
+    fn test_process_is_running(process_id: u32) -> bool {
+        #[cfg(unix)]
+        {
+            let process_id = libc::pid_t::try_from(process_id).unwrap();
+            let result = unsafe { libc::kill(process_id, 0) };
+            result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+            let process = unsafe { OpenProcess(0x0010_0000, 0, process_id) };
+            if process.is_null() {
+                return false;
+            }
+            let status = unsafe { WaitForSingleObject(process, 0) };
+            unsafe {
+                CloseHandle(process);
+            }
+            status == WAIT_TIMEOUT
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn subprocess_timeout_reaps_descendants() {
+        const ROLE: &str = "YANXU_SUBPROCESS_TIMEOUT_TEST_ROLE";
+        const ROOT: &str = "YANXU_SUBPROCESS_TIMEOUT_TEST_ROOT";
+        const TEST: &str = "package::tests::subprocess_timeout_reaps_descendants";
+        if let Some(role) = std::env::var_os(ROLE) {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            if role == "leaf" {
+                fs::write(root.join("leaf.pid"), std::process::id().to_string()).unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+                return;
+            }
+            let mut leaf = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(ROLE, "leaf")
+                .env(ROOT, &root)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !root.join("leaf.pid").exists() {
+                if std::time::Instant::now() >= deadline {
+                    leaf.kill().ok();
+                    leaf.wait().ok();
+                    panic!("后代测试进程未能启动");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_secs(30));
+            leaf.kill().ok();
+            leaf.wait().ok();
+            return;
+        }
+
+        let root = temp("subprocess-timeout-tree");
+        fs::create_dir_all(&root).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ROLE, "controller")
+            .env(ROOT, &root);
+        let error = bounded_command_output(
+            &mut command,
+            &root,
+            "测试进程树超时",
+            "测试命令",
+            subprocess::CommandBudget {
+                timeout: Duration::from_secs(3),
+                stdout_bytes: 64 * 1024,
+                stderr_bytes: 64 * 1024,
+                disk: None,
+                cancellation: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("PACKAGE_SUBPROCESS_TIMEOUT"),
+            "{error}"
+        );
+        let process_id = fs::read_to_string(root.join("leaf.pid"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while test_process_is_running(process_id) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!test_process_is_running(process_id), "后代测试进程仍在运行");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn subprocess_parent_death_reaps_the_running_tree() {
+        const ROLE: &str = "YANXU_SUBPROCESS_PARENT_DEATH_TEST_ROLE";
+        const ROOT: &str = "YANXU_SUBPROCESS_PARENT_DEATH_TEST_ROOT";
+        const TEST: &str = "package::tests::subprocess_parent_death_reaps_the_running_tree";
+        if let Some(role) = std::env::var_os(ROLE) {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            if role == "leaf" {
+                fs::write(root.join("leaf.pid"), std::process::id().to_string()).unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+                return;
+            }
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--nocapture"])
+                .env(ROLE, "leaf")
+                .env(ROOT, &root);
+            let _ = bounded_command_output(
+                &mut command,
+                &root,
+                "测试父进程取消",
+                "测试命令",
+                subprocess::CommandBudget {
+                    timeout: Duration::from_secs(30),
+                    stdout_bytes: 64 * 1024,
+                    stderr_bytes: 64 * 1024,
+                    disk: None,
+                    cancellation: None,
+                },
+            );
+            return;
+        }
+
+        let root = temp("subprocess-parent-death");
+        fs::create_dir_all(&root).unwrap();
+        let mut controller = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ROLE, "controller")
+            .env(ROOT, &root)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !root.join("leaf.pid").exists() {
+            if let Some(status) = controller.try_wait().unwrap() {
+                panic!("父进程取消测试控制进程提前退出：{status}");
+            }
+            if std::time::Instant::now() >= deadline {
+                controller.kill().ok();
+                controller.wait().ok();
+                panic!("父进程取消测试子进程未能启动");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let process_id = fs::read_to_string(root.join("leaf.pid"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        controller.kill().unwrap();
+        controller.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while test_process_is_running(process_id) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !test_process_is_running(process_id),
+            "父进程退出后测试进程树仍在运行"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn subprocess_output_is_bounded_while_running() {
+        const CHILD: &str = "YANXU_SUBPROCESS_OUTPUT_TEST_CHILD";
+        const TEST: &str = "package::tests::subprocess_output_is_bounded_while_running";
+        if let Some(stream) = std::env::var_os(CHILD) {
+            let bytes = [b'x'; 8 * 1024];
+            if stream == "stdout" {
+                let mut stdout = io::stdout().lock();
+                while stdout.write_all(&bytes).is_ok() {}
+            } else {
+                let mut stderr = io::stderr().lock();
+                while stderr.write_all(&bytes).is_ok() {}
+            }
+            return;
+        }
+
+        #[cfg(unix)]
+        let (mut exact, exact_bytes) = {
+            let bytes = 128 * 1024;
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(
+                    "dd if=/dev/zero bs=\"$1\" count=1 2>/dev/null; \
+                     dd if=/dev/zero bs=\"$2\" count=1 1>&2 2>/dev/null",
+                )
+                .arg("bounded-stream-fixture")
+                .arg(bytes.to_string())
+                .arg(bytes.to_string());
+            (command, bytes)
+        };
+        #[cfg(windows)]
+        let (mut exact, exact_bytes) = {
+            let bytes = 4 * 1024;
+            let mut command = Command::new("cmd");
+            command.args(["/D", "/Q", "/C"]).arg(format!(
+                "for /L %i in (1,1,{bytes}) do @<nul set /p \"=x\" & \
+                 for /L %i in (1,1,{bytes}) do @<nul set /p \"=y\" 1>&2"
+            ));
+            (command, bytes)
+        };
+        let exact = bounded_command_output(
+            &mut exact,
+            Path::new("bounded-output"),
+            "测试输出预算精确边界",
+            "测试命令",
+            subprocess::CommandBudget {
+                timeout: Duration::from_secs(5),
+                stdout_bytes: exact_bytes,
+                stderr_bytes: exact_bytes,
+                disk: None,
+                cancellation: None,
+            },
+        )
+        .unwrap();
+        assert!(exact.status.success());
+        assert_eq!(exact.stdout.len(), exact_bytes);
+
+        for (stream, expected) in [("stdout", "标准输出"), ("stderr", "标准错误")] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, stream);
+            let started = std::time::Instant::now();
+            let error = bounded_command_output(
+                &mut command,
+                Path::new("bounded-output"),
+                "测试输出预算",
+                "测试命令",
+                subprocess::CommandBudget {
+                    timeout: Duration::from_secs(5),
+                    stdout_bytes: 1_024,
+                    stderr_bytes: 1_024,
+                    disk: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.message.contains("PACKAGE_SUBPROCESS_OUTPUT_LIMIT"),
+                "{error}"
+            );
+            assert!(error.message.contains(expected), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn subprocess_cancellation_stops_and_reaps_the_process() {
+        const CHILD: &str = "YANXU_SUBPROCESS_CANCEL_TEST_CHILD";
+        const ROOT: &str = "YANXU_SUBPROCESS_CANCEL_TEST_ROOT";
+        const TEST: &str = "package::tests::subprocess_cancellation_stops_and_reaps_the_process";
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            fs::write(root.join("child.pid"), std::process::id().to_string()).unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+
+        let root = temp("subprocess-cancellation");
+        fs::create_dir_all(&root).unwrap();
+        let already_cancelled = std::sync::atomic::AtomicBool::new(true);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(ROOT, &root);
+        let error = bounded_command_output(
+            &mut command,
+            Path::new("pre-cancelled-command"),
+            "测试调用前取消",
+            "测试命令",
+            subprocess::CommandBudget {
+                timeout: Duration::from_secs(5),
+                stdout_bytes: 1_024,
+                stderr_bytes: 1_024,
+                disk: None,
+                cancellation: Some(&already_cancelled),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("PACKAGE_SUBPROCESS_CANCELLED"),
+            "{error}"
+        );
+        assert!(!root.join("child.pid").exists());
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(ROOT, &root);
+        let error = bounded_command_output(
+            &mut command,
+            Path::new("expired-command"),
+            "测试调用前超时",
+            "测试命令",
+            subprocess::CommandBudget {
+                timeout: Duration::ZERO,
+                stdout_bytes: 1_024,
+                stderr_bytes: 1_024,
+                disk: None,
+                cancellation: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("PACKAGE_SUBPROCESS_TIMEOUT"),
+            "{error}"
+        );
+        assert!(!root.join("child.pid").exists());
+
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = cancellation.clone();
+        let trigger_root = root.clone();
+        let trigger = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !trigger_root.join("child.pid").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            trigger.store(true, Ordering::Release);
+        });
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(ROOT, &root);
+        let started = std::time::Instant::now();
+        let error = bounded_command_output(
+            &mut command,
+            Path::new("cancelled-command"),
+            "测试取消",
+            "测试命令",
+            subprocess::CommandBudget {
+                timeout: Duration::from_secs(5),
+                stdout_bytes: 1_024,
+                stderr_bytes: 1_024,
+                disk: None,
+                cancellation: Some(cancellation.as_ref()),
+            },
+        )
+        .unwrap_err();
+        trigger.join().unwrap();
+        assert!(
+            error.message.contains("PACKAGE_SUBPROCESS_CANCELLED"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let process_id = fs::read_to_string(root.join("child.pid"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            !test_process_is_running(process_id),
+            "取消后的测试进程仍在运行"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn subprocess_disk_budget_aborts_and_temporary_directory_is_removed() {
+        const CHILD: &str = "YANXU_SUBPROCESS_DISK_TEST_CHILD";
+        const ROOT: &str = "YANXU_SUBPROCESS_DISK_TEST_ROOT";
+        const TEST: &str =
+            "package::tests::subprocess_disk_budget_aborts_and_temporary_directory_is_removed";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            if mode == "boundary" {
+                fs::File::create(root.join("boundary"))
+                    .unwrap()
+                    .set_len(32 * 1024)
+                    .unwrap();
+                return;
+            }
+            let bytes = [b'd'; 8 * 1024];
+            for index in 0_u64.. {
+                if fs::write(root.join(format!("block-{index}")), bytes).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            return;
+        }
+
+        let root = temp("subprocess-disk-budget");
+        fs::create_dir_all(&root).unwrap();
+        let temporary = RegistryTemporaryDirectory::create(&root, "disk-budget").unwrap();
+        let temporary_path = temporary.path().to_path_buf();
+        let mut boundary = Command::new(std::env::current_exe().unwrap());
+        boundary
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "boundary")
+            .env(ROOT, &temporary_path);
+        let output = bounded_command_output(
+            &mut boundary,
+            &temporary_path,
+            "测试磁盘预算精确边界",
+            "测试命令",
+            subprocess::CommandBudget {
+                timeout: Duration::from_secs(5),
+                stdout_bytes: 64 * 1024,
+                stderr_bytes: 64 * 1024,
+                disk: Some(subprocess::DiskBudget {
+                    root: &temporary_path,
+                    max_bytes: 32 * 1024,
+                    max_entries: 32,
+                    max_depth: 1,
+                }),
+                cancellation: None,
+            },
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            fs::metadata(temporary_path.join("boundary")).unwrap().len(),
+            32 * 1024
+        );
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "overflow")
+            .env(ROOT, &temporary_path);
+        let error = bounded_command_output(
+            &mut command,
+            &temporary_path,
+            "测试磁盘预算",
+            "测试命令",
+            subprocess::CommandBudget {
+                timeout: Duration::from_secs(5),
+                stdout_bytes: 1_024,
+                stderr_bytes: 1_024,
+                disk: Some(subprocess::DiskBudget {
+                    root: &temporary_path,
+                    max_bytes: 32 * 1024,
+                    max_entries: 32,
+                    max_depth: 1,
+                }),
+                cancellation: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("PACKAGE_SUBPROCESS_DISK_LIMIT"),
+            "{error}"
+        );
+        assert!(error.message.contains("字节上限"), "{error}");
+        drop(temporary);
+        assert!(!temporary_path.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_disk_monitor_rejects_root_replacement() {
+        const CHILD: &str = "YANXU_SUBPROCESS_DISK_REPLACE_CHILD";
+        const ROOT: &str = "YANXU_SUBPROCESS_DISK_REPLACE_ROOT";
+        const MOVED: &str = "YANXU_SUBPROCESS_DISK_REPLACE_MOVED";
+        const TEST: &str = "package::tests::subprocess_disk_monitor_rejects_root_replacement";
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            let moved = PathBuf::from(std::env::var_os(MOVED).unwrap());
+            fs::rename(&root, &moved).unwrap();
+            fs::create_dir(&root).unwrap();
+            fs::File::create(moved.join("content"))
+                .unwrap()
+                .set_len(64 * 1024)
+                .unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+
+        let outer = temp("subprocess-disk-root-replacement");
+        let root = outer.join("monitored");
+        let moved = outer.join("moved");
+        fs::create_dir_all(&root).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(ROOT, &root)
+            .env(MOVED, &moved);
+        let error = bounded_command_output(
+            &mut command,
+            &root,
+            "测试磁盘根身份",
+            "测试命令",
+            subprocess::CommandBudget {
+                timeout: Duration::from_secs(5),
+                stdout_bytes: 64 * 1024,
+                stderr_bytes: 64 * 1024,
+                disk: Some(subprocess::DiskBudget {
+                    root: &root,
+                    max_bytes: 1024 * 1024,
+                    max_entries: 32,
+                    max_depth: 1,
+                }),
+                cancellation: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("PACKAGE_SUBPROCESS_DISK_LIMIT"),
+            "{error}"
+        );
+        assert!(error.message.contains("特殊文件"), "{error}");
+        fs::remove_dir_all(outer).ok();
+    }
+
+    #[test]
+    fn persisted_git_object_store_enforces_total_byte_budget() {
+        let root = temp("git-store-byte-budget");
+        fs::create_dir_all(root.join("objects/pack")).unwrap();
+        let oversized = fs::File::create(root.join("objects/pack/oversized.pack")).unwrap();
+        oversized.set_len(GIT_STORE_MAX_BYTES + 1).unwrap();
+        let error = validate_git_store_tree(&root).unwrap_err();
+        assert!(
+            error.message.contains(&GIT_STORE_MAX_BYTES.to_string()),
+            "{error}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_git_object_store_counts_allocated_blocks() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = temp("git-store-allocated-byte-budget");
+        let pack = root.join("objects/pack");
+        fs::create_dir_all(&pack).unwrap();
+        fs::File::create(pack.join("sparse.pack"))
+            .unwrap()
+            .set_len(GIT_STORE_MAX_BYTES - 1)
+            .unwrap();
+        let allocated_path = pack.join("allocated.pack");
+        let mut allocated = fs::File::create(&allocated_path).unwrap();
+        allocated.write_all(b"x").unwrap();
+        allocated.sync_all().unwrap();
+        let metadata = allocated.metadata().unwrap();
+        assert!(metadata.blocks().saturating_mul(512) > metadata.len());
+
+        let error = validate_git_store_tree(&root).unwrap_err();
+        assert!(
+            error.message.contains(&GIT_STORE_MAX_BYTES.to_string()),
+            "{error}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn git_operations_use_separate_hard_deadlines() {
+        assert!(GIT_INSPECT_TIMEOUT < GIT_INITIALIZE_TIMEOUT);
+        assert!(GIT_INITIALIZE_TIMEOUT < GIT_ARCHIVE_TIMEOUT);
+        assert!(GIT_ARCHIVE_TIMEOUT < GIT_FETCH_TIMEOUT);
+    }
+
+    #[test]
+    fn git_commit_probe_distinguishes_absence_from_repository_failure() {
+        let root = temp("git-commit-probe");
+        fs::create_dir_all(&root).unwrap();
+        run_git_fixture(&root, &["init", "--bare", "--quiet", "valid.git"]);
+        let missing = "0000000000000000000000000000000000000000";
+        assert!(!git_commit_exists(&root.join("valid.git"), missing).unwrap());
+
+        let broken = root.join("broken.git");
+        fs::create_dir(&broken).unwrap();
+        let error = git_commit_exists(&broken, missing).unwrap_err();
+        assert!(error.message.contains("检查 Git 精确提交失败"), "{error}");
+        assert!(error.message.contains("退出码"), "{error}");
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
