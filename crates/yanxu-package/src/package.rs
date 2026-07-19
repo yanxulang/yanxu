@@ -56,6 +56,10 @@ const PACKAGE_TREE_MAX_FILE_BYTES: u64 = NATIVE_ARTIFACT_MAX_BYTES;
 const PACKAGE_TREE_MAX_BYTES: u64 = NATIVE_ARTIFACT_MAX_TOTAL_BYTES + ARCHIVE_MAX_EXPANDED_BYTES;
 const PACKAGE_TREE_MAX_ENTRIES: usize = 100_000;
 const PACKAGE_TREE_MAX_DEPTH: usize = 128;
+const MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const LOCK_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const VENDOR_MANIFEST_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const REGISTRY_INDEX_MAX_BYTES: u64 = ARCHIVE_MAX_COMPRESSED_BYTES;
 const REGISTRY_INDEX_MAX_VERSIONS: usize = 10_000;
 const REGISTRY_RELEASE_URL_MAX_BYTES: usize = 4_096;
 const REGISTRY_VULNERABILITY_MAX_COUNT: usize = 1_024;
@@ -528,7 +532,7 @@ pub fn discover(start: impl AsRef<Path>) -> Result<Option<Manifest>, ManifestErr
             .join(start)
     };
     let absolute_start = absolute_normalized(&absolute_start)?;
-    let host_candidates = discovery_manifest_candidates(&absolute_start);
+    let host_candidates = discovery_manifest_candidates(&absolute_start)?;
     let Some(host_nearest) = host_candidates.first() else {
         return Ok(None);
     };
@@ -542,11 +546,11 @@ pub fn discover(start: impl AsRef<Path>) -> Result<Option<Manifest>, ManifestErr
     else {
         return load(host_nearest).map(Some);
     };
-    let resolved_candidates = discovery_manifest_candidates(&resolved_start);
+    let resolved_candidates = discovery_manifest_candidates(&resolved_start)?;
     load(resolved_candidates.first().unwrap_or(host_nearest)).map(Some)
 }
 
-fn discovery_manifest_candidates(start: &Path) -> Vec<PathBuf> {
+fn discovery_manifest_candidates(start: &Path) -> Result<Vec<PathBuf>, ManifestError> {
     let mut directory = if start.is_dir() {
         start.to_path_buf()
     } else {
@@ -558,14 +562,22 @@ fn discovery_manifest_candidates(start: &Path) -> Vec<PathBuf> {
     let mut manifests = Vec::new();
     loop {
         let candidate = directory.join(MANIFEST_NAME);
-        if candidate.is_file() {
-            manifests.push(candidate);
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => manifests.push(candidate),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(manifest_error(
+                    &candidate,
+                    None,
+                    format!("不能检查包清单候选：{error}"),
+                ));
+            }
         }
         if !directory.pop() {
             break;
         }
     }
-    manifests
+    Ok(manifests)
 }
 
 fn resolve_discovery_start_within_root(
@@ -592,7 +604,7 @@ fn resolve_discovery_start_within_root(
 
 fn resolve_existing_discovered_path(path: &Path) -> Result<Option<PathBuf>, ManifestError> {
     let absolute = absolute_normalized(path)?;
-    let candidates = discovery_manifest_candidates(&absolute);
+    let candidates = discovery_manifest_candidates(&absolute)?;
     let Some(outer_root) = candidates.last().and_then(|manifest| manifest.parent()) else {
         return Ok(None);
     };
@@ -642,7 +654,7 @@ impl TrustedPackageRoots {
                     format!("不能复验发现的包清单：{error}"),
                 )
             })?;
-            if let Some(alias_root) = discovery_manifest_candidates(&absolute_start)
+            if let Some(alias_root) = discovery_manifest_candidates(&absolute_start)?
                 .into_iter()
                 .find(|candidate| {
                     fs::canonicalize(candidate).is_ok_and(|path| path == manifest_identity)
@@ -792,8 +804,9 @@ fn open_external_module_file_with_hook(
 
 pub fn load(path: impl AsRef<Path>) -> Result<Manifest, ManifestError> {
     let path = path.as_ref().to_path_buf();
-    let text = fs::read_to_string(&path)
-        .map_err(|error| manifest_error(&path, None, format!("不能读取：{error}")))?;
+    let bytes = read_stable_regular_file_snapshot(&path, MANIFEST_MAX_BYTES, "包清单")?;
+    let text = String::from_utf8(bytes)
+        .map_err(|error| manifest_error(&path, None, format!("包清单不是 UTF-8：{error}")))?;
     let root = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -816,8 +829,7 @@ pub fn load_manifest_from_roots(
         .resolve_existing_file(&path, PackagePathPurpose::ManifestReference)
         .map_err(|error| package_path_manifest_error(&path, error))?
         .ok_or_else(|| manifest_error(&path, None, "规范包清单不属于已打开的包根"))?;
-    let bytes =
-        read_resolved_regular_file_snapshot(resolved, PACKAGE_TREE_MAX_FILE_BYTES, "规范包清单")?;
+    let bytes = read_resolved_regular_file_snapshot(resolved, MANIFEST_MAX_BYTES, "规范包清单")?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|error| manifest_error(&path, None, format!("规范包清单不是 UTF-8：{error}")))?;
     parse(text, path, canonical_root)
@@ -1163,17 +1175,9 @@ pub fn update_lock(
 
 pub fn read_lock(path: impl AsRef<Path>) -> Result<LockFile, ManifestError> {
     let path = path.as_ref();
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| manifest_error(path, None, format!("不能检查锁文件：{error}")))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(manifest_error(
-            path,
-            None,
-            "锁文件必须是普通文件，不得为符号链接或特殊文件",
-        ));
-    }
-    let text = fs::read_to_string(path)
-        .map_err(|error| manifest_error(path, None, format!("不能读取锁文件：{error}")))?;
+    let bytes = read_stable_regular_file_snapshot(path, LOCK_MAX_BYTES, "锁文件")?;
+    let text = String::from_utf8(bytes)
+        .map_err(|error| manifest_error(path, None, format!("锁文件不是 UTF-8：{error}")))?;
     parse_lock_text(path, &text)
 }
 
@@ -1231,7 +1235,9 @@ pub fn validate_lock(manifest: &Manifest) -> Result<LockFile, ManifestError> {
             ),
         ));
     }
-    let checksum = file_checksum(&manifest.path)?;
+    let manifest_bytes =
+        read_stable_regular_file_snapshot(&manifest.path, MANIFEST_MAX_BYTES, "包清单")?;
+    let checksum = format!("{:x}", Sha256::digest(&manifest_bytes));
     if lock.manifest_checksum != checksum {
         return Err(manifest_error(
             &path,
@@ -1287,9 +1293,13 @@ pub fn edit_dependency(
     let manifest_path = manifest_path.as_ref();
     let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let _project_lock = acquire_project_lock(root)?;
-    let original = fs::read_to_string(manifest_path)
-        .map_err(|error| manifest_error(manifest_path, None, format!("不能读取以修改：{error}")))?;
-    load(manifest_path)?;
+    let original = String::from_utf8(read_stable_regular_file_snapshot(
+        manifest_path,
+        MANIFEST_MAX_BYTES,
+        "包清单",
+    )?)
+    .map_err(|error| manifest_error(manifest_path, None, format!("包清单不是 UTF-8：{error}")))?;
+    parse(&original, manifest_path.to_path_buf(), root.to_path_buf())?;
     let normalized = normalize_manifest_toml(&original);
     let mut document: toml::Value = toml::from_str(&normalized)
         .map_err(|error| sanitized_manifest_toml_error(manifest_path, &normalized, &error))?;
@@ -1359,9 +1369,13 @@ pub fn edit_application(
     let manifest_path = manifest_path.as_ref();
     let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let _project_lock = acquire_project_lock(root)?;
-    let original = fs::read_to_string(manifest_path)
-        .map_err(|error| manifest_error(manifest_path, None, format!("不能读取以修改：{error}")))?;
-    load(manifest_path)?;
+    let original = String::from_utf8(read_stable_regular_file_snapshot(
+        manifest_path,
+        MANIFEST_MAX_BYTES,
+        "包清单",
+    )?)
+    .map_err(|error| manifest_error(manifest_path, None, format!("包清单不是 UTF-8：{error}")))?;
+    parse(&original, manifest_path.to_path_buf(), root.to_path_buf())?;
     let normalized = normalize_manifest_toml(&original);
     let mut document: toml::Value = toml::from_str(&normalized)
         .map_err(|error| sanitized_manifest_toml_error(manifest_path, &normalized, &error))?;
@@ -1546,22 +1560,24 @@ fn bound_file_snapshot(
     roots: &TrustedPackageRoots,
     path: &Path,
     purpose: PackagePathPurpose,
+    max_bytes: u64,
     kind: &str,
 ) -> Result<Vec<u8>, ManifestError> {
     let resolved = roots
         .resolve_existing_file(path, purpose)
         .map_err(|error| package_path_manifest_error(path, error))?
         .ok_or_else(|| manifest_error(path, None, format!("{kind}不属于已打开的包根")))?;
-    read_resolved_regular_file_snapshot(resolved, PACKAGE_TREE_MAX_FILE_BYTES, kind)
+    read_resolved_regular_file_snapshot(resolved, max_bytes, kind)
 }
 
 fn bound_file_checksum(
     roots: &TrustedPackageRoots,
     path: &Path,
     purpose: PackagePathPurpose,
+    max_bytes: u64,
     kind: &str,
 ) -> Result<String, ManifestError> {
-    let bytes = bound_file_snapshot(roots, path, purpose, kind)?;
+    let bytes = bound_file_snapshot(roots, path, purpose, max_bytes, kind)?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
@@ -1602,6 +1618,7 @@ fn bind_resolution_manifest(
         &application_roots,
         &bound_manifest_path,
         PackagePathPurpose::ManifestReference,
+        MANIFEST_MAX_BYTES,
         "包清单",
     )?;
     let text = std::str::from_utf8(&bytes).map_err(|error| {
@@ -1639,6 +1656,7 @@ fn freeze_resolution_graph(
         &application_roots,
         &bound_manifest_path,
         PackagePathPurpose::ManifestReference,
+        MANIFEST_MAX_BYTES,
         "包清单",
     )?;
     let bound_manifest_checksum = format!("{:x}", Sha256::digest(&bound_manifest_bytes));
@@ -1676,6 +1694,7 @@ fn freeze_resolution_graph(
                 &application_roots,
                 &lock_path,
                 PackagePathPurpose::YxpEntry,
+                LOCK_MAX_BYTES,
                 "锁文件",
             )?;
             let text = std::str::from_utf8(&bytes).map_err(|error| {
@@ -1784,6 +1803,7 @@ fn validate_cached_resolution(resolved: &ResolvedGraphBundle) -> Result<bool, Ma
         &resolved.application_roots,
         &manifest_path,
         PackagePathPurpose::ManifestReference,
+        MANIFEST_MAX_BYTES,
         "包清单",
     )
     .ok()
@@ -1797,6 +1817,7 @@ fn validate_cached_resolution(resolved: &ResolvedGraphBundle) -> Result<bool, Ma
         &resolved.application_roots,
         &lock_path,
         PackagePathPurpose::YxpEntry,
+        LOCK_MAX_BYTES,
         "锁文件",
     )
     .ok();
@@ -4693,10 +4714,7 @@ fn download_registry_index(
         &format!("{}/{name}/index.json", registry.trim_end_matches('/')),
         &downloaded,
     )?;
-    let index = read_registry_index(&downloaded)?;
-    let bytes = fs::read(&downloaded).map_err(|error| {
-        manifest_error(&downloaded, None, format!("不能读取索引下载结果：{error}"))
-    })?;
+    let (index, bytes) = read_registry_index_snapshot(&downloaded)?;
     let cached = registry_cache.join(format!("{}-index.json", short_hash(name)));
     crate::storage::atomic_write(&cached, &bytes).map_err(|error| {
         manifest_error(&cached, None, format!("不能原子保存索引下载结果：{error}"))
@@ -5458,8 +5476,16 @@ pub fn registry_release_metadata(
         }
         index_path
     };
-    if !index_path.is_file() {
-        return Ok(None);
+    match fs::symlink_metadata(&index_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(manifest_error(
+                &index_path,
+                None,
+                format!("不能检查索引元数据：{error}"),
+            ));
+        }
     }
     let index = read_registry_index(&index_path)?;
     Ok(index
@@ -5485,13 +5511,16 @@ fn local_registry_path(registry: &str) -> Option<PathBuf> {
 }
 
 fn read_registry_index(path: &Path) -> Result<RegistryIndex, ManifestError> {
-    let index_text = fs::read_to_string(path)
-        .map_err(|error| manifest_error(path, None, format!("不能读取索引元数据：{error}")))?;
-    reject_duplicate_registry_json_keys(path, index_text.as_bytes())?;
-    let index: RegistryIndex = serde_json::from_str(&index_text)
+    read_registry_index_snapshot(path).map(|(index, _)| index)
+}
+
+fn read_registry_index_snapshot(path: &Path) -> Result<(RegistryIndex, Vec<u8>), ManifestError> {
+    let bytes = read_stable_regular_file_snapshot(path, REGISTRY_INDEX_MAX_BYTES, "索引元数据")?;
+    reject_duplicate_registry_json_keys(path, &bytes)?;
+    let index: RegistryIndex = serde_json::from_slice(&bytes)
         .map_err(|error| manifest_error(path, None, format!("索引元数据无效：{error}")))?;
     validate_registry_index(path, &index)?;
-    Ok(index)
+    Ok((index, bytes))
 }
 
 fn reject_duplicate_registry_json_keys(path: &Path, payload: &[u8]) -> Result<(), ManifestError> {
@@ -5695,25 +5724,35 @@ fn select_registry_version(
     locked: Option<&Version>,
 ) -> Result<Version, ManifestError> {
     let index_path = package_root.join("index.json");
-    if index_path.is_file() {
-        let index = read_registry_index(&index_path)?;
-        return select_remote_registry_release(
-            index
-                .versions
-                .into_iter()
-                .filter(|release| package_root.join(&release.version).is_dir())
-                .collect(),
-            requirement,
-            locked,
-        )
-        .map(|(version, _)| version)
-        .ok_or_else(|| {
-            manifest_error(
-                package_root,
-                None,
-                format!("索引中没有满足 {requirement} 的未撤回版本"),
+    match fs::symlink_metadata(&index_path) {
+        Ok(_) => {
+            let index = read_registry_index(&index_path)?;
+            return select_remote_registry_release(
+                index
+                    .versions
+                    .into_iter()
+                    .filter(|release| package_root.join(&release.version).is_dir())
+                    .collect(),
+                requirement,
+                locked,
             )
-        });
+            .map(|(version, _)| version)
+            .ok_or_else(|| {
+                manifest_error(
+                    package_root,
+                    None,
+                    format!("索引中没有满足 {requirement} 的未撤回版本"),
+                )
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(manifest_error(
+                &index_path,
+                None,
+                format!("不能检查索引元数据：{error}"),
+            ));
+        }
     }
     if let Some(locked) = locked {
         if requirement.matches(locked) && package_root.join(locked.to_string()).is_dir() {
@@ -5865,8 +5904,11 @@ fn pack_package_with_limits_and_hook(
         .resolve_existing_file(&declared_manifest, PackagePathPurpose::ManifestReference)
         .map_err(|error| package_path_manifest_error(&declared_manifest, error))?
         .ok_or_else(|| manifest_error(&declared_manifest, None, "规范包清单不属于可信包根"))?;
-    let manifest_bytes =
-        read_resolved_regular_file_snapshot(manifest_file, limits.file_bytes, "规范包清单")?;
+    let manifest_bytes = read_resolved_regular_file_snapshot(
+        manifest_file,
+        limits.file_bytes.min(MANIFEST_MAX_BYTES),
+        "规范包清单",
+    )?;
     let manifest_text = std::str::from_utf8(&manifest_bytes).map_err(|error| {
         manifest_error(
             &declared_manifest,
@@ -6224,6 +6266,65 @@ fn hash_regular_file_limited(
         digest.update(&buffer[..read]);
     }
     Ok((size, format!("{:x}", digest.finalize())))
+}
+
+fn read_stable_regular_file_snapshot(
+    path: &Path,
+    max_bytes: u64,
+    kind: &str,
+) -> Result<Vec<u8>, ManifestError> {
+    read_stable_regular_file_snapshot_with_hook(path, max_bytes, kind, || Ok(()))
+}
+
+fn read_stable_regular_file_snapshot_with_hook(
+    path: &Path,
+    max_bytes: u64,
+    kind: &str,
+    after_open: impl FnOnce() -> Result<(), ManifestError>,
+) -> Result<Vec<u8>, ManifestError> {
+    let file = match open_regular_file_for_snapshot(path) {
+        Ok(file) => file,
+        Err(_)
+            if fs::symlink_metadata(path)
+                .is_ok_and(|metadata| !is_regular_file_metadata(&metadata)) =>
+        {
+            return Err(manifest_error(
+                path,
+                None,
+                format!("{kind}必须是普通文件，不得为符号链接、重解析点或特殊文件"),
+            ));
+        }
+        Err(error) => {
+            return Err(manifest_error(
+                path,
+                None,
+                format!("不能打开{kind}：{error}"),
+            ));
+        }
+    };
+    let identity = file.try_clone().map_err(|error| {
+        manifest_error(path, None, format!("不能保留已打开的{kind}身份：{error}"))
+    })?;
+    after_open()?;
+    let bytes = read_opened_regular_file_snapshot(file, path, max_bytes, kind)?;
+    let verification = open_regular_file_for_snapshot(path).map_err(|error| {
+        manifest_error(
+            path,
+            None,
+            format!("不能重新打开{kind}以复验读取后身份：{error}"),
+        )
+    })?;
+    let unchanged = same_opened_file_identity(&identity, &verification).map_err(|error| {
+        manifest_error(path, None, format!("不能复验读取后的{kind}身份：{error}"))
+    })?;
+    if !unchanged {
+        return Err(manifest_error(
+            path,
+            None,
+            format!("{kind}在读取期间被替换"),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// 从解析阶段持有的普通文件句柄读取有界快照。
@@ -8377,7 +8478,8 @@ fn validate_owned_vendor_directory(destination: &Path) -> Result<VendorManifest,
         .ok_or_else(|| {
             manifest_error(destination, None, "既有目录没有可验证的辖制清单，拒绝覆盖")
         })?;
-    let bytes = read_resolved_regular_file_snapshot(manifest, 8 * 1024 * 1024, "辖制清单")?;
+    let bytes =
+        read_resolved_regular_file_snapshot(manifest, VENDOR_MANIFEST_MAX_BYTES, "辖制清单")?;
     let vendor: VendorManifest = serde_json::from_slice(&bytes).map_err(|error| {
         manifest_error(
             &manifest_path,
@@ -8830,12 +8932,22 @@ fn find_vendored_package(
     for ancestor in start.ancestors() {
         for vendor_root in [ancestor.join("vendor"), ancestor.to_path_buf()] {
             let manifest_path = vendor_root.join("言序-vendor.json");
-            if !manifest_path.is_file() {
-                continue;
+            match fs::symlink_metadata(&manifest_path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(manifest_error(
+                        &manifest_path,
+                        None,
+                        format!("不能检查辖制清单：{error}"),
+                    ));
+                }
             }
-            let bytes = fs::read(&manifest_path).map_err(|error| {
-                manifest_error(&manifest_path, None, format!("不能读取辖制清单：{error}"))
-            })?;
+            let bytes = read_stable_regular_file_snapshot(
+                &manifest_path,
+                VENDOR_MANIFEST_MAX_BYTES,
+                "辖制清单",
+            )?;
             let vendor: VendorManifest = serde_json::from_slice(&bytes).map_err(|error| {
                 manifest_error(&manifest_path, None, format!("辖制清单无效：{error}"))
             })?;
@@ -9193,9 +9305,11 @@ fn download(url: &str, destination: &Path) -> Result<(), ManifestError> {
             destination,
             "下载索引资源",
         )?;
-        let bytes = fs::read(&temporary).map_err(|error| {
-            manifest_error(destination, None, format!("不能读取下载结果：{error}"))
-        })?;
+        let bytes = read_stable_regular_file_snapshot(
+            &temporary,
+            ARCHIVE_MAX_COMPRESSED_BYTES,
+            "下载结果",
+        )?;
         crate::storage::atomic_write(destination, &bytes).map_err(|error| {
             manifest_error(destination, None, format!("不能原子保存下载结果：{error}"))
         })
@@ -10195,6 +10309,7 @@ mod tests {
             &application_roots,
             &application_root.join(MANIFEST_NAME),
             PackagePathPurpose::ManifestReference,
+            MANIFEST_MAX_BYTES,
             "包清单",
         )
         .unwrap();
@@ -12626,6 +12741,134 @@ mod tests {
             manifest.dependencies["工具"],
             Dependency::Path { .. }
         ));
+    }
+
+    #[test]
+    fn metadata_snapshots_enforce_explicit_size_limits() {
+        fn sparse(path: &Path, bytes: u64) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let file = fs::File::create(path).unwrap();
+            file.set_len(bytes).unwrap();
+        }
+
+        let root = temp("metadata-size-limits");
+        let manifest_path = root.join("manifest").join(MANIFEST_NAME);
+        sparse(&manifest_path, MANIFEST_MAX_BYTES + 1);
+        let manifest_error = load(&manifest_path).unwrap_err();
+        assert!(manifest_error.message.contains("包清单不得超过"));
+
+        let lock_path = root.join("lock").join(LOCK_NAME);
+        sparse(&lock_path, LOCK_MAX_BYTES + 1);
+        let lock_error = read_lock(&lock_path).unwrap_err();
+        assert!(lock_error.message.contains("锁文件不得超过"));
+
+        let index_path = root.join("registry/index.json");
+        sparse(&index_path, REGISTRY_INDEX_MAX_BYTES + 1);
+        let index_error = read_registry_index(&index_path).unwrap_err();
+        assert!(index_error.message.contains("索引元数据不得超过"));
+
+        let graph = vendor_fixture_graph(&root, "metadata-limit");
+        let locked = graph.packages.values().next().unwrap().locked.clone();
+        let vendor_manifest = root.join("vendor/言序-vendor.json");
+        sparse(&vendor_manifest, VENDOR_MANIFEST_MAX_BYTES + 1);
+        let vendor_error = find_vendored_package(&root.join("application"), &locked).unwrap_err();
+        assert!(vendor_error.message.contains("辖制清单不得超过"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stable_metadata_snapshot_rejects_same_length_path_replacement() {
+        let root = temp("metadata-replacement");
+        let path = root.join("metadata.json");
+        let backup = root.join("metadata-original.json");
+        write(&path, "trusted\n");
+
+        let error =
+            read_stable_regular_file_snapshot_with_hook(&path, 1024, "测试元数据", || {
+                fs::rename(&path, &backup).map_err(|error| {
+                    manifest_error(&path, None, format!("不能模拟元数据替换：{error}"))
+                })?;
+                fs::write(&path, "changed\n").map_err(|error| {
+                    manifest_error(&path, None, format!("不能模拟元数据写入：{error}"))
+                })?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.message.contains("读取期间被替换"), "{error}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(all(unix, not(target_os = "wasi")))]
+    #[test]
+    fn metadata_fifo_entries_are_rejected_without_blocking() {
+        const CHILD_ENV: &str = "YANXU_METADATA_FIFO_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "package::tests::metadata_fifo_entries_are_rejected_without_blocking",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "FIFO 元数据负向测试子进程失败");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().ok();
+                    child.wait().ok();
+                    panic!("FIFO 元数据读取超时，普通文件打开可能发生阻塞");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        fn fifo(path: &Path) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        }
+
+        let root = temp("metadata-fifo");
+        let manifest_path = root.join("manifest").join(MANIFEST_NAME);
+        fifo(&manifest_path);
+        assert!(load(&manifest_path).is_err());
+        assert!(discover(manifest_path.parent().unwrap()).is_err());
+
+        let lock_path = root.join("lock").join(LOCK_NAME);
+        fifo(&lock_path);
+        assert!(read_lock(&lock_path).is_err());
+
+        let index_path = root.join("registry/index.json");
+        fifo(&index_path);
+        assert!(read_registry_index(&index_path).is_err());
+
+        let registry = root.join("registry-source");
+        let release_index = registry.join("fixture/index.json");
+        fifo(&release_index);
+        assert!(
+            registry_release_metadata(
+                registry.to_str().unwrap(),
+                "fixture",
+                &Version::new(1, 0, 0),
+                true,
+            )
+            .is_err()
+        );
+
+        let graph = vendor_fixture_graph(&root, "metadata-fifo");
+        let locked = graph.packages.values().next().unwrap().locked.clone();
+        let vendor_manifest = root.join("vendor/言序-vendor.json");
+        fifo(&vendor_manifest);
+        assert!(find_vendored_package(&root.join("application"), &locked).is_err());
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
