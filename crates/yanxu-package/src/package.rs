@@ -9768,6 +9768,7 @@ mod tests {
             permissions.set_mode(if metadata.is_dir() { 0o700 } else { 0o600 });
         }
         #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         fs::set_permissions(path, permissions).ok();
         if metadata.is_dir() {
@@ -10953,7 +10954,9 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
+            #[allow(clippy::permissions_set_readonly_false)]
             root_permissions.set_readonly(false);
+            #[allow(clippy::permissions_set_readonly_false)]
             entry_permissions.set_readonly(false);
         }
         fs::set_permissions(&resolved.root, root_permissions).unwrap();
@@ -11415,6 +11418,7 @@ mod tests {
             permissions.set_mode(0o600);
         }
         #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         fs::set_permissions(&entry, permissions).unwrap();
         write(&entry, "损坏内容\n");
@@ -11452,6 +11456,7 @@ mod tests {
             permissions.set_mode(0o600);
         }
         #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         fs::set_permissions(&initial_entry, permissions).unwrap();
         write(&initial_entry, "已损坏的旧快照\n");
