@@ -379,6 +379,75 @@ fn vm_rejects_transitive_native_package_without_a_direct_dependency_edge() {
 }
 
 #[test]
+fn vm_allows_a_locked_native_package_to_load_its_own_artifact() {
+    let source_library = library_path();
+    let root = temporary_native_root("self-artifact");
+    let native = root.join("native");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(native.join("src")).unwrap();
+    let staged_name = format!("backend{}", std::env::consts::DLL_SUFFIX);
+    let staged_library = native.join(&staged_name);
+    std::fs::copy(&source_library, &staged_library).unwrap();
+    let bytes = std::fs::read(&staged_library).unwrap();
+    let checksum = format!("{:x}", Sha256::digest(&bytes));
+    let (os, architecture) = if cfg!(target_os = "windows") {
+        (
+            "windows",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            },
+        )
+    } else if cfg!(target_os = "macos") {
+        (
+            "macos",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            },
+        )
+    } else {
+        (
+            "linux",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            },
+        )
+    };
+    std::fs::write(
+        native.join("言序.toml"),
+        format!(
+            "[包]\n格式=2\n名称='v2-example'\n版本='0.1.0'\n言序='>=1.1.7'\n入口='src/主.yx'\n[导出]\n默认='src/主.yx'\n[\"原生\"]\nABI=2\n[\"原生\".{os}.{architecture}]\n文件='{staged_name}'\n校验和='{checksum}'\n大小={}\n",
+            bytes.len()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        native.join("src/主.yx"),
+        "引「标准:原生」为 原生；定 后端 为 原生.加载（「v2-example」）；公 定 已加载：理 为 真；\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("言序.toml"),
+        "[包]\n格式=2\n名称='native-self-test'\n版本='0.1.0'\n言序='>=1.1.7'\n入口='src/主.yx'\n[依赖]\n后端={包='v2-example',路径='native',版='^0.1'}\n[权限]\n原生扩展=true\n[导出]\n默认='src/主.yx'\n",
+    )
+    .unwrap();
+    let source = "引「包:后端」为 后端；定 已加载 为 后端.已加载；";
+    let entry = root.join("src/主.yx");
+    std::fs::write(&entry, source).unwrap();
+    let statements = yanxu::parse_named(source, entry.display().to_string()).unwrap();
+    let chunk = yanxu::bytecode::compile(&statements).unwrap();
+    let mut vm = yanxu::vm::Vm::silent();
+    vm.execute_in_directory(&chunk, entry.parent().unwrap())
+        .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn vm_executes_posted_v2_callbacks_only_through_the_owner_thread_event_pump() {
     let library = library_path();
     let unique = SystemTime::now()

@@ -197,7 +197,7 @@ pub fn build_bundle(
             executable: layout.executable.clone(),
             log_directory: platform_log_directory(platform, &metadata.identifier),
             dll_search_policy: if platform == BundlePlatform::Windows {
-                "absolute-content-addressed-native-paths; LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS".into()
+                "absolute-content-addressed-native-paths; LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32".into()
             } else {
                 "absolute-content-addressed-native-paths".into()
             },

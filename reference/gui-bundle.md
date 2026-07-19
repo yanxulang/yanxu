@@ -29,8 +29,8 @@ Intel 与 Apple Silicon。
 
 Windows 生成应用目录和真实 GUI 子系统 PE，不弹控制台窗口。构建器嵌入 ICO、公司/
 文件/产品版本以及 PerMonitorV2 高 DPI manifest。ABI 库按绝对内容寻址路径装载，并
-使用`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`，不搜索
-进程当前目录；支持 x86-64 与 ARM64。
+使用`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`，不搜索
+应用目录、进程当前目录或用户追加 DLL 目录；支持 x86-64 与 ARM64。
 
 Linux 生成 AppDir、`AppRun`、Desktop Entry 和 hicolor 16–512 像素图标。winit 在
 运行时按系统环境选择 Wayland，必要时回退 X11；发行机器仍需常规图形栈、字体配置与

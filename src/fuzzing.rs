@@ -81,6 +81,9 @@ pub fn engineering_protocol(data: &[u8]) {
 #[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
 pub fn native_library(data: &[u8]) {
+    if data.len() > STRUCTURED_INPUT_LIMIT {
+        return;
+    }
     let _ = crate::native_abi_v2::validate_native_library_metadata(data);
 }
 
