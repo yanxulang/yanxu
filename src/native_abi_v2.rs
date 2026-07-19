@@ -6,16 +6,21 @@
 use crate::host_events::{HostValue, HostValueLimits};
 use crate::native_abi::{NativeError, native_error};
 #[cfg(not(target_family = "wasm"))]
-use crate::native_abi::{StagedLibrary, load_dynamic_library_safely, stage_verified_library};
-use crate::package::{NATIVE_ARTIFACT_MAX_BYTES, NativeArtifact};
+use crate::native_abi::{
+    StagedLibrary, absolute_native_artifact_path, load_dynamic_library_safely,
+    open_native_artifact, stage_verified_library,
+};
+use crate::package::{NATIVE_ARTIFACT_MAX_BYTES, NativeArtifact, ResolvedPackageFile};
 use crate::permissions::PermissionSet;
+#[cfg(not(target_family = "wasm"))]
+use goblin::Object;
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "macos")))]
+use goblin::mach::{Mach, MachO, SingleArch};
 #[cfg(not(target_family = "wasm"))]
 use sha2::{Digest, Sha256};
 #[cfg(not(target_family = "wasm"))]
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-#[cfg(not(target_family = "wasm"))]
-use std::io::Read;
 use std::path::Path;
 use std::ptr;
 #[cfg(not(target_family = "wasm"))]
@@ -44,6 +49,12 @@ const NATIVE_V2_MAX_NAME_BYTES: usize = 1_024;
 const NATIVE_V2_MAX_ERROR_CODE_BYTES: usize = 256;
 #[cfg(not(target_family = "wasm"))]
 const NATIVE_V2_MAX_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
+#[cfg(not(target_family = "wasm"))]
+const NATIVE_V2_MAX_DYNAMIC_DEPENDENCIES: usize = 256;
+#[cfg(not(target_family = "wasm"))]
+const NATIVE_V2_MAX_DYNAMIC_DEPENDENCY_BYTES: usize = 1_024;
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "macos")))]
+const NATIVE_V2_MAX_MACH_ARCHITECTURES: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -268,6 +279,333 @@ impl Drop for OutputGuardV2 {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn native_format_error(message: impl Into<String>) -> NativeError {
+    native_error("NATIVE_FORMAT", message)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn native_dependency_error(message: impl Into<String>) -> NativeError {
+    native_error("NATIVE_DEPENDENCY", message)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn validate_dependency_count(count: usize) -> Result<(), NativeError> {
+    if count > NATIVE_V2_MAX_DYNAMIC_DEPENDENCIES {
+        return Err(native_dependency_error(format!(
+            "原生制品声明 {count} 个动态依赖，超过上限 {NATIVE_V2_MAX_DYNAMIC_DEPENDENCIES}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(test, target_os = "linux", target_os = "windows")
+))]
+fn validate_bare_dependency_name(name: &str, format: &str) -> Result<(), NativeError> {
+    if name.is_empty()
+        || name.len() > NATIVE_V2_MAX_DYNAMIC_DEPENDENCY_BYTES
+        || !name.is_ascii()
+        || name.starts_with('.')
+        || name.contains(['/', '\\', ':'])
+        || name
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err(native_dependency_error(format!(
+            "{format} 动态依赖“{name}”不是受约束的系统库基名"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "linux")))]
+fn validate_elf_dependencies(
+    libraries: &[&str],
+    rpaths: &[&str],
+    runpaths: &[&str],
+) -> Result<(), NativeError> {
+    validate_dependency_count(libraries.len())?;
+    if !rpaths.is_empty() || !runpaths.is_empty() {
+        return Err(native_dependency_error(
+            "ELF 原生制品不得声明 DT_RPATH 或 DT_RUNPATH",
+        ));
+    }
+    for library in libraries {
+        validate_bare_dependency_name(library, "ELF DT_NEEDED")?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "macos")))]
+fn validate_mach_dependencies(libraries: &[&str], rpaths: &[&str]) -> Result<(), NativeError> {
+    validate_dependency_count(libraries.len())?;
+    if !rpaths.is_empty() {
+        return Err(native_dependency_error("Mach-O 原生制品不得声明 LC_RPATH"));
+    }
+    for library in libraries {
+        let trusted = library.starts_with("/usr/lib/")
+            || library.starts_with("/System/Library/Frameworks/")
+            || library.starts_with("/System/Library/PrivateFrameworks/");
+        if !trusted
+            || !library.is_ascii()
+            || library.len() > NATIVE_V2_MAX_DYNAMIC_DEPENDENCY_BYTES
+            || library.contains("//")
+            || library.contains("/./")
+            || library.contains("/../")
+            || library.ends_with("/.")
+            || library.ends_with("/..")
+        {
+            return Err(native_dependency_error(format!(
+                "Mach-O 动态依赖“{library}”不属于固定系统库路径"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "windows")))]
+fn validate_pe_dependencies(
+    libraries: &[&str],
+    has_delay_imports: bool,
+) -> Result<(), NativeError> {
+    validate_dependency_count(libraries.len())?;
+    if has_delay_imports {
+        return Err(native_dependency_error(
+            "PE 原生制品不得声明未纳入静态闭包验证的延迟导入表",
+        ));
+    }
+    for library in libraries {
+        validate_bare_dependency_name(library, "PE 导入")?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "linux")))]
+fn expected_elf_machine() -> Result<u16, NativeError> {
+    if cfg!(target_arch = "x86_64") {
+        Ok(goblin::elf::header::EM_X86_64)
+    } else if cfg!(target_arch = "aarch64") {
+        Ok(goblin::elf::header::EM_AARCH64)
+    } else {
+        Err(native_format_error(format!(
+            "当前架构 {} 尚无 ABI v2 ELF 装载策略",
+            std::env::consts::ARCH
+        )))
+    }
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "macos")))]
+fn expected_mach_cpu() -> Result<u32, NativeError> {
+    if cfg!(target_arch = "x86_64") {
+        Ok(goblin::mach::cputype::CPU_TYPE_X86_64)
+    } else if cfg!(target_arch = "aarch64") {
+        Ok(goblin::mach::cputype::CPU_TYPE_ARM64)
+    } else {
+        Err(native_format_error(format!(
+            "当前架构 {} 尚无 ABI v2 Mach-O 装载策略",
+            std::env::consts::ARCH
+        )))
+    }
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "windows")))]
+fn expected_pe_machine() -> Result<u16, NativeError> {
+    if cfg!(target_arch = "x86_64") {
+        Ok(goblin::pe::header::COFF_MACHINE_X86_64)
+    } else if cfg!(target_arch = "aarch64") {
+        Ok(goblin::pe::header::COFF_MACHINE_ARM64)
+    } else {
+        Err(native_format_error(format!(
+            "当前架构 {} 尚无 ABI v2 PE 装载策略",
+            std::env::consts::ARCH
+        )))
+    }
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "linux")))]
+fn validate_elf_library(elf: &goblin::elf::Elf<'_>) -> Result<(), NativeError> {
+    if !elf.is_lib || elf.interpreter.is_some() {
+        return Err(native_format_error("ABI v2 ELF 制品必须是无解释器的共享库"));
+    }
+    let expected = expected_elf_machine()?;
+    if elf.header.e_machine != expected {
+        return Err(native_format_error(format!(
+            "ELF 机器类型 {} 与当前架构要求 {expected} 不符",
+            elf.header.e_machine
+        )));
+    }
+    if let Some(dynamic) = &elf.dynamic {
+        const DT_AUXILIARY: u64 = 0x7fff_fffd;
+        const DT_FILTER: u64 = 0x7fff_ffff;
+        let forbidden = dynamic.dyns.iter().find(|entry| {
+            matches!(
+                entry.d_tag,
+                goblin::elf::dynamic::DT_RPATH
+                    | goblin::elf::dynamic::DT_RUNPATH
+                    | goblin::elf::dynamic::DT_AUDIT
+                    | goblin::elf::dynamic::DT_DEPAUDIT
+                    | DT_AUXILIARY
+                    | DT_FILTER
+            )
+        });
+        if let Some(entry) = forbidden {
+            return Err(native_dependency_error(format!(
+                "ELF 原生制品含禁止的动态装载标签 0x{:x}",
+                entry.d_tag
+            )));
+        }
+        let needed_count = dynamic
+            .dyns
+            .iter()
+            .filter(|entry| entry.d_tag == goblin::elf::dynamic::DT_NEEDED)
+            .count();
+        if needed_count != elf.libraries.len() {
+            return Err(native_format_error(
+                "ELF DT_NEEDED 表含不能完整解析的依赖名称",
+            ));
+        }
+    }
+    validate_elf_dependencies(&elf.libraries, &elf.rpaths, &elf.runpaths)
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "macos")))]
+fn validate_mach_library(mach: &MachO<'_>) -> Result<(), NativeError> {
+    if !matches!(
+        mach.header.filetype,
+        goblin::mach::header::MH_DYLIB | goblin::mach::header::MH_BUNDLE
+    ) {
+        return Err(native_format_error(
+            "ABI v2 Mach-O 制品必须是动态库或 bundle",
+        ));
+    }
+    let expected = expected_mach_cpu()?;
+    if mach.header.cputype != expected {
+        return Err(native_format_error(format!(
+            "Mach-O CPU 类型 {} 与当前架构要求 {expected} 不符",
+            mach.header.cputype
+        )));
+    }
+    if mach.load_commands.iter().any(|command| {
+        matches!(
+            command.command,
+            goblin::mach::load_command::CommandVariant::DyldEnvironment(_)
+        )
+    }) {
+        return Err(native_dependency_error(
+            "Mach-O 原生制品不得通过 LC_DYLD_ENVIRONMENT 改写装载环境",
+        ));
+    }
+    // goblin reserves index zero for the image's own LC_ID_DYLIB (or the synthetic
+    // "self" entry). Only subsequent entries are dependencies consulted by dyld.
+    let libraries = mach.libs.get(1..).unwrap_or_default();
+    validate_mach_dependencies(libraries, &mach.rpaths)
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "macos")))]
+fn validate_mach_container(mach: Mach<'_>) -> Result<(), NativeError> {
+    match mach {
+        Mach::Binary(binary) => validate_mach_library(&binary),
+        Mach::Fat(container) => {
+            let architecture_count = container
+                .arches()
+                .map_err(|error| native_format_error(format!("不能解析 Mach-O 架构表：{error}")))?
+                .len();
+            if architecture_count == 0 || architecture_count > NATIVE_V2_MAX_MACH_ARCHITECTURES {
+                return Err(native_format_error(format!(
+                    "Mach-O 通用制品架构数 {architecture_count} 不在 1–{NATIVE_V2_MAX_MACH_ARCHITECTURES} 范围内"
+                )));
+            }
+            let expected = expected_mach_cpu()?;
+            let mut selected = None;
+            for entry in &container {
+                let entry = entry.map_err(|error| {
+                    native_format_error(format!("不能解析 Mach-O 通用制品：{error}"))
+                })?;
+                if let SingleArch::MachO(binary) = entry
+                    && binary.header.cputype == expected
+                {
+                    if selected.is_some() {
+                        return Err(native_format_error("Mach-O 通用制品含重复的当前架构切片"));
+                    }
+                    selected = Some(binary);
+                }
+            }
+            let selected =
+                selected.ok_or_else(|| native_format_error("Mach-O 通用制品不含当前架构切片"))?;
+            validate_mach_library(&selected)
+        }
+    }
+}
+
+#[cfg(all(not(target_family = "wasm"), any(test, target_os = "windows")))]
+fn validate_pe_library(pe: &goblin::pe::PE<'_>) -> Result<(), NativeError> {
+    if !pe.is_lib {
+        return Err(native_format_error("ABI v2 PE 制品必须标记为 DLL"));
+    }
+    let expected = expected_pe_machine()?;
+    if pe.header.coff_header.machine != expected {
+        return Err(native_format_error(format!(
+            "PE 机器类型 {} 与当前架构要求 {expected} 不符",
+            pe.header.coff_header.machine
+        )));
+    }
+    let optional = pe
+        .header
+        .optional_header
+        .as_ref()
+        .ok_or_else(|| native_format_error("ABI v2 PE 制品缺少可选头"))?;
+    validate_pe_dependencies(
+        &pe.libraries,
+        optional
+            .data_directories
+            .get_delay_import_descriptor()
+            .is_some(),
+    )
+}
+
+/// 只解析并验证 ABI v2 动态库的宿主格式与依赖闭包，不执行任何初始化代码。
+/// 供加载器、定向回归和结构化输入模糊测试复用。
+#[cfg(not(target_family = "wasm"))]
+#[doc(hidden)]
+pub fn validate_native_library_metadata(bytes: &[u8]) -> Result<(), NativeError> {
+    if bytes.len() as u64 > NATIVE_ARTIFACT_MAX_BYTES {
+        return Err(native_error("NATIVE_LIMIT", "原生制品不得超过 256 MiB"));
+    }
+    let object = Object::parse(bytes)
+        .map_err(|error| native_format_error(format!("不能解析原生制品头：{error}")))?;
+    #[cfg(target_os = "linux")]
+    {
+        match object {
+            Object::Elf(elf) => validate_elf_library(&elf),
+            _ => Err(native_format_error("Linux ABI v2 制品必须是 ELF 共享库")),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match object {
+            Object::Mach(mach) => validate_mach_container(mach),
+            _ => Err(native_format_error("macOS ABI v2 制品必须是 Mach-O 动态库")),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match object {
+            Object::PE(pe) => validate_pe_library(&pe),
+            _ => Err(native_format_error("Windows ABI v2 制品必须是 PE DLL")),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = object;
+        Err(native_format_error(format!(
+            "当前系统 {} 尚无 ABI v2 动态库元数据策略",
+            std::env::consts::OS
+        )))
+    }
+}
+
 impl NativeExtensionV2 {
     #[cfg(not(target_family = "wasm"))]
     pub fn load_verified(
@@ -275,9 +613,35 @@ impl NativeExtensionV2 {
         artifact: &NativeArtifact,
         permissions: &PermissionSet,
         expected_name: &str,
-        _authority: NativeLoadAuthority,
+        authority: NativeLoadAuthority,
     ) -> Result<Self, NativeError> {
-        let path = path.as_ref();
+        let path = absolute_native_artifact_path(path.as_ref())?;
+        Self::validate_artifact_declaration(&path, artifact, permissions)?;
+        let source = open_native_artifact(&path)?;
+        Self::load_verified_file_after_policy(source, artifact, expected_name, authority)
+    }
+
+    /// 装载解析阶段已经打开的 ABI v2 制品。路径只用于权限与诊断，全部字节必须
+    /// 从令牌中的句柄读取，调用方不得在依赖解析后按环境路径重新打开文件。
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn load_verified_file(
+        source: ResolvedPackageFile,
+        artifact: &NativeArtifact,
+        permissions: &PermissionSet,
+        expected_name: &str,
+        authority: NativeLoadAuthority,
+    ) -> Result<Self, NativeError> {
+        Self::validate_artifact_declaration(source.path(), artifact, permissions)?;
+        Self::load_verified_file_after_policy(source, artifact, expected_name, authority)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn validate_artifact_declaration(
+        path: &Path,
+        artifact: &NativeArtifact,
+        permissions: &PermissionSet,
+    ) -> Result<(), NativeError> {
         if artifact.abi != NATIVE_ABI_VERSION_V2 {
             return Err(native_error(
                 "NATIVE_ABI",
@@ -308,14 +672,24 @@ impl NativeExtensionV2 {
                 "原生制品须声明 64 位十六进制 SHA-256",
             ));
         }
-        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            native_error("NATIVE_IO", format!("不能检查 {}：{error}", path.display()))
+        if artifact.size > NATIVE_ARTIFACT_MAX_BYTES {
+            return Err(native_error("NATIVE_LIMIT", "原生制品不得超过 256 MiB"));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn load_verified_file_after_policy(
+        source: ResolvedPackageFile,
+        artifact: &NativeArtifact,
+        expected_name: &str,
+        _authority: NativeLoadAuthority,
+    ) -> Result<Self, NativeError> {
+        let metadata = source.metadata().map_err(|error| {
+            native_error("NATIVE_IO", format!("不能检查已打开的原生制品：{error}"))
         })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(native_error(
-                "NATIVE_IO",
-                "原生制品须为普通文件而非符号链接或特殊文件",
-            ));
+        if !metadata.is_file() {
+            return Err(native_error("NATIVE_IO", "已打开的原生制品不是普通文件"));
         }
         if metadata.len() != artifact.size || metadata.len() > NATIVE_ARTIFACT_MAX_BYTES {
             return Err(native_error(
@@ -327,27 +701,13 @@ impl NativeExtensionV2 {
                 ),
             ));
         }
-        let mut source = std::fs::File::open(path).map_err(|error| {
-            native_error("NATIVE_IO", format!("不能读取 {}：{error}", path.display()))
-        })?;
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        Read::by_ref(&mut source)
-            .take(NATIVE_ARTIFACT_MAX_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| native_error("NATIVE_IO", format!("不能读取原生制品：{error}")))?;
-        if bytes.len() as u64 > NATIVE_ARTIFACT_MAX_BYTES {
-            return Err(native_error("NATIVE_LIMIT", "原生制品读取过程中超过上限"));
-        }
-        let checksum = format!("{:x}", Sha256::digest(&bytes));
-        if checksum != artifact.checksum.to_ascii_lowercase() {
-            return Err(native_error(
-                "NATIVE_CHECKSUM",
-                format!("制品校验不符：声明 {}，实际 {checksum}", artifact.checksum),
-            ));
-        }
-        let staged = stage_verified_library(&bytes, &checksum)?;
-        // SAFETY: Bytes were verified and staged privately; descriptors are validated below.
-        unsafe { Self::load(staged, expected_name) }
+        let bytes = crate::package::read_resolved_regular_file_snapshot(
+            source,
+            NATIVE_ARTIFACT_MAX_BYTES,
+            "ABI v2 原生制品",
+        )
+        .map_err(|error| native_error("NATIVE_IO", error.to_string()))?;
+        Self::load_verified_bytes_after_policy(&bytes, artifact, expected_name)
     }
 
     /// 装载已随应用归档携带的锁定制品字节。调用方无须提供源码或包缓存；
@@ -360,25 +720,16 @@ impl NativeExtensionV2 {
         expected_name: &str,
         _authority: NativeLoadAuthority,
     ) -> Result<Self, NativeError> {
-        if artifact.abi != NATIVE_ABI_VERSION_V2 {
-            return Err(native_error(
-                "NATIVE_ABI",
-                format!("锁定制品 ABI {} 不是 ABI v2", artifact.abi),
-            ));
-        }
-        permissions
-            .check_native_extension(&artifact.path)
-            .map_err(|error| native_error("NATIVE_PERMISSION", error.to_string()))?;
-        if artifact.target != crate::package::current_target() {
-            return Err(native_error(
-                "NATIVE_TARGET",
-                format!(
-                    "制品目标 {} 与当前目标 {} 不符",
-                    artifact.target,
-                    crate::package::current_target()
-                ),
-            ));
-        }
+        Self::validate_artifact_declaration(Path::new(&artifact.path), artifact, permissions)?;
+        Self::load_verified_bytes_after_policy(bytes, artifact, expected_name)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn load_verified_bytes_after_policy(
+        bytes: &[u8],
+        artifact: &NativeArtifact,
+        expected_name: &str,
+    ) -> Result<Self, NativeError> {
         if bytes.len() as u64 != artifact.size || bytes.len() as u64 > NATIVE_ARTIFACT_MAX_BYTES {
             return Err(native_error(
                 "NATIVE_LIMIT",
@@ -389,17 +740,6 @@ impl NativeExtensionV2 {
                 ),
             ));
         }
-        if artifact.checksum.len() != 64
-            || !artifact
-                .checksum
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(native_error(
-                "NATIVE_CHECKSUM",
-                "原生制品须声明 64 位十六进制 SHA-256",
-            ));
-        }
         let checksum = format!("{:x}", Sha256::digest(bytes));
         if checksum != artifact.checksum.to_ascii_lowercase() {
             return Err(native_error(
@@ -407,6 +747,7 @@ impl NativeExtensionV2 {
                 format!("制品校验不符：声明 {}，实际 {checksum}", artifact.checksum),
             ));
         }
+        validate_native_library_metadata(bytes)?;
         let staged = stage_verified_library(bytes, &checksum)?;
         // SAFETY: Bytes were verified and staged privately; descriptors are validated below.
         unsafe { Self::load(staged, expected_name) }
@@ -415,6 +756,21 @@ impl NativeExtensionV2 {
     #[cfg(target_family = "wasm")]
     pub fn load_verified(
         _path: impl AsRef<Path>,
+        _artifact: &NativeArtifact,
+        _permissions: &PermissionSet,
+        _expected_name: &str,
+        _authority: NativeLoadAuthority,
+    ) -> Result<Self, NativeError> {
+        Err(native_error(
+            "NATIVE_UNSUPPORTED",
+            "WASI 禁止装载宿主动态库",
+        ))
+    }
+
+    #[cfg(target_family = "wasm")]
+    #[doc(hidden)]
+    pub fn load_verified_file(
+        _source: ResolvedPackageFile,
         _artifact: &NativeArtifact,
         _permissions: &PermissionSet,
         _expected_name: &str,
@@ -1233,5 +1589,64 @@ mod tests {
         assert_eq!(capabilities()["abi_version"], 2);
         assert_eq!(capabilities()["persistent_callbacks"], true);
         assert!(capabilities()["max_depth"].as_u64().unwrap() > 0);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn dynamic_dependency_policies_reject_search_path_and_path_injection() {
+        // Keep every host-format validator type-checked even when this test runs on one OS.
+        let _elf_validator = validate_elf_library;
+        let _mach_validator = validate_mach_container;
+        let _pe_validator = validate_pe_library;
+
+        validate_elf_dependencies(&["libc.so.6", "libgcc_s.so.1"], &[], &[]).unwrap();
+        assert_eq!(
+            validate_elf_dependencies(&["../libescape.so"], &[], &[])
+                .unwrap_err()
+                .code,
+            "NATIVE_DEPENDENCY"
+        );
+        assert_eq!(
+            validate_elf_dependencies(&["libc.so.6"], &["$ORIGIN"], &[])
+                .unwrap_err()
+                .code,
+            "NATIVE_DEPENDENCY"
+        );
+
+        validate_mach_dependencies(
+            &[
+                "/usr/lib/libSystem.B.dylib",
+                "/System/Library/Frameworks/WebKit.framework/Versions/A/WebKit",
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            validate_mach_dependencies(&["@rpath/libescape.dylib"], &[])
+                .unwrap_err()
+                .code,
+            "NATIVE_DEPENDENCY"
+        );
+        assert_eq!(
+            validate_mach_dependencies(&["/usr/lib/libSystem.B.dylib"], &["@loader_path"])
+                .unwrap_err()
+                .code,
+            "NATIVE_DEPENDENCY"
+        );
+
+        validate_pe_dependencies(&["KERNEL32.dll", "api-ms-win-core-file-l1-1-0.dll"], false)
+            .unwrap();
+        assert_eq!(
+            validate_pe_dependencies(&["..\\escape.dll"], false)
+                .unwrap_err()
+                .code,
+            "NATIVE_DEPENDENCY"
+        );
+        assert_eq!(
+            validate_pe_dependencies(&["KERNEL32.dll"], true)
+                .unwrap_err()
+                .code,
+            "NATIVE_DEPENDENCY"
+        );
     }
 }

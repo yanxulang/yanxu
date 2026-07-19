@@ -78,6 +78,12 @@ pub fn engineering_protocol(data: &[u8]) {
     let _ = crate::engineering::response(&request);
 }
 
+#[cfg(not(target_family = "wasm"))]
+#[doc(hidden)]
+pub fn native_library(data: &[u8]) {
+    let _ = crate::native_abi_v2::validate_native_library_metadata(data);
+}
+
 fn structured_input_path(kind: &str, name: &str, data: &[u8]) -> Option<PathBuf> {
     if data.len() > STRUCTURED_INPUT_LIMIT {
         return None;
@@ -115,6 +121,8 @@ mod tests {
             manifest(seed);
             lockfile(seed);
             engineering_protocol(seed);
+            #[cfg(not(target_family = "wasm"))]
+            native_library(seed);
         }
     }
 }

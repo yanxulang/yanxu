@@ -76,6 +76,7 @@ url = "2"
 yanxu-package = { path = "crates/yanxu-package", version = "1.1.17" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+goblin = "0.10.7"
 libloading = "0.8"
 rustyline = "18.0.1"
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }

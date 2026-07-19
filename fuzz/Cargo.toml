@@ -62,4 +62,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "native_library"
+path = "fuzz_targets/native_library.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
