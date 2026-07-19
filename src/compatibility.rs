@@ -4,8 +4,7 @@ use crate::bytecode;
 use crate::interpreter::Interpreter;
 use crate::vm::Vm;
 use serde::Serialize;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const COMPATIBILITY_SCHEMA_VERSION: u32 = 1;
 
@@ -72,16 +71,14 @@ impl CompatibilityReport {
 }
 
 pub fn run(root: impl AsRef<Path>) -> Result<CompatibilityReport, String> {
-    let root = root.as_ref();
-    let mut paths = Vec::new();
-    collect_sources(root, &mut paths)?;
-    paths.sort();
+    let requested = root.as_ref();
+    let (root, paths) = crate::testing::discover_with_root(requested)?;
     if paths.is_empty() {
         return Err(format!("未在“{}”找到兼容语料", root.display()));
     }
     let cases = paths
         .iter()
-        .map(|path| run_case(root, path))
+        .map(|path| run_case(&root, path))
         .collect::<Vec<_>>();
     Ok(CompatibilityReport {
         schema: "https://yanxu.dev/schemas/compatibility-report-v1.json",
@@ -104,15 +101,15 @@ fn run_case(root: &Path, path: &Path) -> CompatibilityCase {
         tree: frontend_failure(&detail),
         bytecode: frontend_failure(&detail),
     };
-    let source = match fs::read_to_string(path) {
+    let (canonical, source) = match crate::read_module_source_file(path) {
         Ok(source) => source,
-        Err(error) => return failed(format!("不能读取：{error}")),
+        Err(error) => return failed(error),
     };
-    let statements = match crate::parse_named(&source, path.display().to_string()) {
+    let statements = match crate::parse_named(&source, canonical.display().to_string()) {
         Ok(statements) => statements,
         Err(error) => return failed(error.to_string()),
     };
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = canonical.parent().unwrap_or_else(|| Path::new("."));
     let mut interpreter = Interpreter::silent();
     let tree_result = interpreter.execute_in_directory(&statements, directory);
     let tree = RuntimeOutcome {
@@ -156,22 +153,6 @@ fn frontend_failure(message: &str) -> RuntimeOutcome {
         output: Vec::new(),
         error: Some(message.into()),
     }
-}
-
-fn collect_sources(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
-    if path.is_file() {
-        if path.extension().is_some_and(|extension| extension == "yx") {
-            output.push(path.to_path_buf());
-        }
-        return Ok(());
-    }
-    let entries = fs::read_dir(path)
-        .map_err(|error| format!("不能读取兼容目录“{}”：{error}", path.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("不能读取兼容目录项：{error}"))?;
-        collect_sources(&entry.path(), output)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

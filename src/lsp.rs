@@ -88,14 +88,17 @@ fn serve_io<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> io::Result<()
             }
             "textDocument/formatting" => {
                 let uri = document_uri(&message);
-                let edits = documents.get(uri).and_then(|source| {
-                    crate::parse_named(source, uri).ok().map(|statements| {
-                        json!([{
-                            "range": full_document_range(source),
-                            "newText": crate::formatter::format(&statements)
-                        }])
-                    })
-                });
+                let edits = validate_lsp_document_path(uri)
+                    .ok()
+                    .and_then(|()| documents.get(uri))
+                    .and_then(|source| {
+                        crate::parse_named(source, uri).ok().map(|statements| {
+                            json!([{
+                                "range": full_document_range(source),
+                                "newText": crate::formatter::format(&statements)
+                            }])
+                        })
+                    });
                 respond(&mut writer, id, edits.unwrap_or_else(|| json!([])))?;
             }
             "textDocument/completion"
@@ -136,6 +139,16 @@ fn initialize_result() -> Value {
 }
 
 fn semantic_response(method: &str, uri: &str, source: &str, request: &Value) -> Value {
+    if validate_lsp_document_path(uri).is_err() {
+        return if matches!(
+            method,
+            "textDocument/completion" | "textDocument/references" | "textDocument/documentSymbol"
+        ) {
+            json!([])
+        } else {
+            Value::Null
+        };
+    }
     let (line, utf16_column) = request_position(request);
     let column = character_column(source, line, utf16_column);
     let Ok(index) = SemanticIndex::build(source, uri) else {
@@ -262,17 +275,37 @@ fn package_member_completion_items(
         return Vec::new();
     };
     let module_path = dependency.root.join(export);
-    let Ok(metadata) = std::fs::symlink_metadata(&module_path) else {
-        return Vec::new();
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 8 * 1024 * 1024
+    let mut trusted_package_roots = crate::package::TrustedPackageRoots::default();
+    if trusted_package_roots.insert(&dependency.root).is_err()
+        || trusted_package_roots
+            .validate_requested_import(&dependency.root, &module_path, true)
+            .is_err()
     {
         return Vec::new();
     }
-    let Ok(module_source) = std::fs::read_to_string(&module_path) else {
+    let Ok(Some(resolved_module)) =
+        trusted_package_roots.resolve_existing_module_file(&module_path)
+    else {
         return Vec::new();
     };
-    let module_name = module_path.display().to_string();
+    let canonical_module = resolved_module.path().to_path_buf();
+    if trusted_package_roots
+        .authorize_module(&module_path, &canonical_module)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Ok(metadata) = resolved_module.metadata() else {
+        return Vec::new();
+    };
+    if !metadata.is_file() || metadata.len() > 8 * 1024 * 1024 {
+        return Vec::new();
+    }
+    let Ok(module_source) = crate::package::read_resolved_module_source_snapshot(resolved_module)
+    else {
+        return Vec::new();
+    };
+    let module_name = canonical_module.display().to_string();
     let Ok(tokens) = crate::lexer::scan_named(&module_source, &module_name) else {
         return Vec::new();
     };
@@ -421,9 +454,75 @@ fn uri_file_path(uri: &str) -> Option<std::path::PathBuf> {
     url::Url::parse(uri).ok()?.to_file_path().ok()
 }
 
+fn validate_lsp_document_path(uri: &str) -> Result<(), String> {
+    if uri.contains('\\') || uri.to_ascii_lowercase().contains("%5c") {
+        return crate::package::validate_portable_path_text("\\")
+            .map_err(|error| format!("[{}] {}", error.code, error.message));
+    }
+    let Some(path) = uri_file_path(uri) else {
+        return Ok(());
+    };
+    validate_lsp_file_path(&path)
+        .map(|_| ())
+        .map_err(|error| format!("[{}] {}", error.code, error.message))
+}
+
+struct LspPathError {
+    code: &'static str,
+    message: String,
+}
+
+fn validate_lsp_file_path(path: &Path) -> Result<Option<PathBuf>, LspPathError> {
+    let mut roots = crate::package::TrustedPackageRoots::default();
+    roots
+        .insert_discovered(path)
+        .map_err(|error| LspPathError {
+            code: error.code(),
+            message: format!("{}：{}", error.path.display(), error.diagnostic_message()),
+        })?;
+    roots
+        .authorize_module(path, path)
+        .map_err(|error| LspPathError {
+            code: error.code,
+            message: error.diagnostic_message(),
+        })?;
+    let canonical = match roots.resolve_existing_module_file(path) {
+        Ok(Some(resolved)) => Some(resolved.path().to_path_buf()),
+        Ok(None) => fs::canonicalize(path).ok(),
+        Err(error)
+            if error.code == crate::package::PACKAGE_PATH_INVALID_CODE
+                && error.message.contains("不存在") =>
+        {
+            None
+        }
+        Err(error) => {
+            return Err(LspPathError {
+                code: error.code,
+                message: error.diagnostic_message(),
+            });
+        }
+    };
+    if let Some(canonical) = canonical.as_ref() {
+        roots
+            .insert_discovered(canonical)
+            .map_err(|error| LspPathError {
+                code: error.code(),
+                message: format!("{}：{}", error.path.display(), error.diagnostic_message()),
+            })?;
+        roots
+            .authorize_module(path, canonical)
+            .map_err(|error| LspPathError {
+                code: error.code,
+                message: error.diagnostic_message(),
+            })?;
+    }
+    Ok(canonical)
+}
+
 struct LspModuleGraph {
     root: ModuleId,
     modules: BTreeMap<ModuleId, LspModule>,
+    trusted_package_roots: crate::package::TrustedPackageRoots,
 }
 
 struct LspModule {
@@ -451,11 +550,18 @@ struct QualifiedSelection {
 impl LspModuleGraph {
     fn build(uri: &str, source: &str) -> Result<Self, String> {
         let path = uri_file_path(uri).ok_or_else(|| "文档 URI 不是文件".to_owned())?;
-        let canonical = fs::canonicalize(&path).unwrap_or(path);
+        let canonical = validate_lsp_file_path(&path)
+            .map_err(|error| format!("[{}] {}", error.code, error.message))?
+            .unwrap_or_else(|| path.clone());
         let root = ModuleId::for_path(&canonical);
+        let mut trusted_package_roots = crate::package::TrustedPackageRoots::default();
+        trusted_package_roots
+            .insert_discovered(&canonical)
+            .map_err(|error| error.to_string())?;
         let mut graph = Self {
             root: root.clone(),
             modules: BTreeMap::new(),
+            trusted_package_roots,
         };
         let directory = canonical
             .parent()
@@ -575,28 +681,37 @@ impl LspModuleGraph {
     }
 
     fn load_import(&mut self, requested: &str, directory: &Path) -> Result<ModuleId, String> {
+        crate::package::validate_portable_path_text(requested)
+            .map_err(|error| error.to_string())?;
         if let Some(name) = requested.strip_prefix("标准:") {
             return Ok(ModuleId::standard(name));
         }
-        let path = if let Some(name) = requested.strip_prefix("包:") {
-            crate::package::resolve_dependency_scoped(None, directory, name)
-                .map_err(|error| error.to_string())?
-                .entry
+        let (path, package_import) = if let Some(name) = requested.strip_prefix("包:") {
+            let dependency = crate::package::resolve_dependency_scoped(None, directory, name)
+                .map_err(|error| error.to_string())?;
+            self.trusted_package_roots
+                .insert(&dependency.root)
+                .map_err(|error| error.to_string())?;
+            (dependency.entry, true)
         } else {
             let requested = Path::new(requested);
             if requested.is_absolute() {
-                requested.to_path_buf()
+                (requested.to_path_buf(), false)
             } else {
-                directory.join(requested)
+                (directory.join(requested), false)
             }
         };
-        let canonical = fs::canonicalize(&path)
-            .map_err(|error| format!("不能读取 LSP 模块“{}”：{error}", path.display()))?;
+        let (resolved, _) = self
+            .trusted_package_roots
+            .resolve_import_file(directory, &path, package_import)
+            .map_err(|error| error.to_string())?;
+        let canonical = resolved.path().to_path_buf();
         let module_id = ModuleId::for_path(&canonical);
         if self.modules.contains_key(&module_id) {
             return Ok(module_id);
         }
-        let source = fs::read_to_string(&canonical)
+        let resolved = resolved.open().map_err(|error| error.to_string())?;
+        let source = crate::package::read_resolved_module_source_snapshot(resolved)
             .map_err(|error| format!("不能读取 LSP 模块“{}”：{error}", canonical.display()))?;
         let child_directory = canonical.parent().unwrap_or(directory).to_path_buf();
         self.load_module(module_id.clone(), canonical, source, &child_directory)?;
@@ -1135,28 +1250,72 @@ fn document_symbol(symbol: &Symbol, source: &str, children: Option<Vec<Value>>) 
 }
 
 pub fn diagnostics(source: &str, name: &str) -> Vec<Value> {
+    if let Some(path) = uri_file_path(name)
+        && let Err(error) = validate_lsp_file_path(&path)
+    {
+        let span = Span::new(SourceFile::new(name, source), 1, 1, 1, 1);
+        return vec![diagnostic_with_code(
+            &span,
+            source,
+            error.code,
+            &error.message,
+            1,
+        )];
+    }
+    let mut diagnostics = Vec::new();
     let statements = match crate::lexer::scan_named(source, name) {
-        Err(error) => return vec![diagnostic(&error.span, source, &error.message, 1)],
+        Err(error) => {
+            diagnostics.push(diagnostic(&error.span, source, &error.message, 1));
+            return diagnostics;
+        }
         Ok(tokens) => match crate::parser::parse(tokens) {
-            Err(error) => return vec![diagnostic(&error.span, source, &error.message, 1)],
+            Err(error) => {
+                diagnostics.push(diagnostic(&error.span, source, &error.message, 1));
+                return diagnostics;
+            }
             Ok(statements) => statements,
         },
     };
     if let Err(error) = crate::resolver::resolve(&statements) {
-        return vec![diagnostic(&error.span, source, &error.message, 1)];
+        diagnostics.push(diagnostic(&error.span, source, &error.message, 1));
+        return diagnostics;
     }
-    let mut diagnostics = crate::type_checker::check(&statements)
-        .err()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|error| diagnostic(&error.span, source, &error.message, 1))
-        .collect::<Vec<_>>();
+    let type_check = uri_file_path(name).map_or_else(
+        || crate::type_checker::check(&statements),
+        |path| {
+            crate::type_checker::check_in_directory(
+                &statements,
+                path.parent().unwrap_or_else(|| Path::new(".")),
+            )
+        },
+    );
+    diagnostics.extend(
+        type_check
+            .err()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|error| {
+                diagnostic_with_code(
+                    &error.span,
+                    source,
+                    error.code(),
+                    error.diagnostic_message(),
+                    1,
+                )
+            }),
+    );
     if let Some(path) = uri_file_path(name)
         && let Ok(Some(manifest)) = crate::package::discover(&path)
     {
         if let Err(error) = crate::package::validate_lock(&manifest) {
             let span = Span::new(SourceFile::new(name, source), 1, 1, 1, 1);
-            diagnostics.push(diagnostic(&span, source, &error.to_string(), 2));
+            diagnostics.push(diagnostic_with_code(
+                &span,
+                source,
+                error.code(),
+                &format!("{}：{}", error.path.display(), error.diagnostic_message()),
+                2,
+            ));
         }
         if let Ok(tokens) = crate::lexer::scan_named(source, name) {
             for pair in tokens.windows(2) {
@@ -1183,10 +1342,21 @@ pub fn diagnostics(source: &str, name: &str) -> Vec<Value> {
 }
 
 fn diagnostic(span: &Span, source: &str, message: &str, severity: u8) -> Value {
+    diagnostic_with_code(span, source, "LSP000", message, severity)
+}
+
+fn diagnostic_with_code(
+    span: &Span,
+    source: &str,
+    code: &'static str,
+    message: &str,
+    severity: u8,
+) -> Value {
     json!({
         "range": range(span, source),
         "severity": severity,
         "source": "言序",
+        "code": code,
         "message": message
     })
 }
@@ -1540,11 +1710,12 @@ mod tests {
         std::fs::create_dir_all(dependency.join("src")).unwrap();
         std::fs::write(
             dependency.join(crate::package::MANIFEST_NAME),
-            "[包]\n格式=2\n名称='工具包'\n版本='1.2.0'\n入口='src/主.yx'\n[导出]\n默认='src/主.yx'\n配置='src/配置.yx'\n",
+            "[包]\n格式=2\n名称='工具包'\n版本='1.2.0'\n入口='src/主.yx'\n[导出]\n默认='src/主.yx'\n配置='src/配置.yx'\n重音='src/e\u{301}.yx'\n",
         )
         .unwrap();
         std::fs::write(dependency.join("src/主.yx"), "公 定 值 为 1；").unwrap();
         std::fs::write(dependency.join("src/配置.yx"), "公 定 名 为「配置」；").unwrap();
+        std::fs::write(dependency.join("src/é.yx"), "公 定 重音值 为 2；").unwrap();
         std::fs::write(
             app.join(crate::package::MANIFEST_NAME),
             "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='src/主.yx'\n[依赖]\n工具别名={包='工具包',路径='../dependency'}\n",
@@ -1576,6 +1747,18 @@ mod tests {
                     .as_str()
                     .is_some_and(|documentation| documentation.contains("包:工具别名"))
         }));
+
+        let unicode_member_source = "引「包:工具别名/重音」为 重音；\n重音.";
+        let unicode_members = package_member_completion_items(
+            &uri,
+            unicode_member_source,
+            2,
+            "重音.".chars().count() + 1,
+        );
+        assert!(
+            unicode_members.iter().any(|item| item["label"] == "重音值"),
+            "{unicode_members:#?}"
+        );
 
         let source = "引「包:未声明」为 未知；";
         std::fs::write(
@@ -1642,6 +1825,38 @@ mod tests {
 
         let diagnostic_text = serde_json::to_string(&diagnostics("言 1；", &uri)).unwrap();
         assert!(!diagnostic_text.contains(marker), "{diagnostic_text}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn module_graph_reuses_unicode_equivalent_document_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "yanxu-lsp-unicode-path-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let actual_directory = root.join("src/é");
+        std::fs::create_dir_all(&actual_directory).unwrap();
+        std::fs::write(
+            root.join(crate::package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='路径应用'\n版本='1.0.0'\n入口='src/e\u{301}/主.yx'\n",
+        )
+        .unwrap();
+        let source = "引「子.yx」为 子；\n言 子.值；";
+        std::fs::write(actual_directory.join("主.yx"), source).unwrap();
+        std::fs::write(actual_directory.join("子.yx"), "公 定 值 为 1；").unwrap();
+
+        let requested = root.join("src/e\u{301}/主.yx");
+        let uri = url::Url::from_file_path(&requested).unwrap().to_string();
+        let graph = LspModuleGraph::build(&uri, source).unwrap();
+        assert_eq!(graph.modules.len(), 2);
+        assert_eq!(
+            graph.root,
+            ModuleId::for_path(&std::fs::canonicalize(actual_directory.join("主.yx")).unwrap())
+        );
+
         std::fs::remove_dir_all(root).ok();
     }
 

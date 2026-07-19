@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use yanxu::bytecode;
@@ -311,5 +312,144 @@ fn failed_module_reads_do_not_poison_later_loader_state() {
     assert_eq!(interpreter.take_output(), ["7"]);
     vm.execute_in_directory(&chunk, &root).unwrap();
     assert_eq!(vm.take_output(), ["7"]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn top_level_tooling_rejects_reserved_package_sources() {
+    let root = temporary_root("tooling-reserved");
+    write(
+        root.join(package::MANIFEST_NAME),
+        "[包]\n格式=2\n名称='工具边界'\n版本='1.0.0'\n入口='主.yx'\n",
+    );
+    write(root.join("主.yx"), "言 1；\n");
+    let reserved = root.join("build/测试.yx");
+    let source = "言 1；\n";
+    write(&reserved, source);
+
+    let runtime = env!("CARGO_BIN_EXE_yanxu");
+    for arguments in [
+        vec![reserved.display().to_string()],
+        vec!["check".into(), reserved.display().to_string()],
+        vec!["vm".into(), reserved.display().to_string()],
+        vec!["fmt".into(), reserved.display().to_string()],
+        vec!["debug".into(), reserved.display().to_string()],
+        vec!["migrate".into(), reserved.display().to_string()],
+        vec!["doc".into(), reserved.display().to_string()],
+        vec![
+            "doc".into(),
+            "--json".into(),
+            reserved.display().to_string(),
+        ],
+    ] {
+        let output = Command::new(runtime).args(&arguments).output().unwrap();
+        assert!(!output.status.success(), "{arguments:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(PACKAGE_MODULE_RESERVED_PATH_CODE),
+            "{arguments:?}: {stderr}"
+        );
+    }
+
+    let test_error = yanxu::testing::run(&reserved).unwrap_err();
+    assert!(
+        test_error.contains(PACKAGE_MODULE_RESERVED_PATH_CODE),
+        "{test_error}"
+    );
+    let compatibility_error = yanxu::compatibility::run(&reserved).unwrap_err();
+    assert!(
+        compatibility_error.contains(PACKAGE_MODULE_RESERVED_PATH_CODE),
+        "{compatibility_error}"
+    );
+
+    let statements = yanxu::parse_named(source, reserved.display().to_string()).unwrap();
+    let document_error =
+        yanxu::docgen::markdown_in_directory("测试", &statements, reserved.parent().unwrap())
+            .unwrap_err();
+    assert!(
+        document_error.contains(PACKAGE_MODULE_RESERVED_PATH_CODE),
+        "{document_error}"
+    );
+
+    let uri = url::Url::from_file_path(&reserved).unwrap().to_string();
+    let diagnostics = yanxu::lsp::diagnostics(source, &uri);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0]["code"], PACKAGE_MODULE_RESERVED_PATH_CODE);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn top_level_tooling_resolves_unicode_equivalent_package_paths() {
+    let root = temporary_root("tooling-unicode");
+    let actual = root.join("src/é/主.yx");
+    let requested = root.join("src/e\u{301}/主.yx");
+    write(
+        root.join(package::MANIFEST_NAME),
+        "[包]\n格式=2\n名称='工具路径'\n版本='1.0.0'\n入口='src/e\u{301}/主.yx'\n",
+    );
+    let source = "引「子.yx」为 子；公 定 结果：数 为 子.值；言 结果；\n";
+    write(&actual, source);
+    write(root.join("src/é/子.yx"), "公 定 值：数 为 1；\n");
+
+    let runtime = env!("CARGO_BIN_EXE_yanxu");
+    for command in ["check", "vm", "doc"] {
+        let output = Command::new(runtime)
+            .arg(command)
+            .arg(&requested)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let tests = yanxu::testing::run(&requested).unwrap();
+    assert_eq!(tests.len(), 1);
+    assert!(tests[0].passed, "{tests:#?}");
+    let compatibility = yanxu::compatibility::run(&requested).unwrap();
+    assert!(compatibility.is_success(), "{}", compatibility.human());
+    let statements = yanxu::parse_named(source, requested.display().to_string()).unwrap();
+    let documentation =
+        yanxu::docgen::markdown_in_directory("主", &statements, requested.parent().unwrap())
+            .unwrap();
+    assert!(documentation.contains("结果"), "{documentation}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_tooling_rejects_symlink_entries() {
+    use std::os::unix::fs::symlink;
+
+    let root = temporary_root("tooling-directory-link");
+    write(
+        root.join(package::MANIFEST_NAME),
+        "[包]\n格式=2\n名称='目录边界'\n版本='1.0.0'\n入口='主.yx'\n",
+    );
+    write(root.join("主.yx"), "言 1；\n");
+    let link = root.join("链接.yx");
+    symlink("主.yx", &link).unwrap();
+
+    for error in [
+        yanxu::testing::discover(&root).unwrap_err(),
+        yanxu::compatibility::run(&root).unwrap_err(),
+        yanxu::docgen::markdown_directory(&root).unwrap_err(),
+    ] {
+        assert!(error.contains("符号链接"), "{error}");
+    }
+
+    let uri = url::Url::from_file_path(&link).unwrap().to_string();
+    let diagnostics = yanxu::lsp::diagnostics("言 1；\n", &uri);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0]["code"], package::PACKAGE_PATH_INVALID_CODE);
+    assert!(
+        diagnostics[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("符号链接")),
+        "{diagnostics:#?}"
+    );
+
     fs::remove_dir_all(root).unwrap();
 }

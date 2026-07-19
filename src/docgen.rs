@@ -403,6 +403,7 @@ struct DocIndex {
     root_module: ModuleId,
     modules: BTreeMap<ModuleId, DocModule>,
     documented_modules: BTreeSet<ModuleId>,
+    trusted_package_roots: crate::package::TrustedPackageRoots,
 }
 
 impl DocIndex {
@@ -413,21 +414,84 @@ impl DocIndex {
             root_module: module_id.clone(),
             modules: BTreeMap::from([(module_id, module)]),
             documented_modules: BTreeSet::new(),
+            trusted_package_roots: crate::package::TrustedPackageRoots::default(),
         }
     }
 
     fn from_root(module_name: &str, statements: &[Stmt], directory: &Path) -> Result<Self, String> {
+        if fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(format!(
+                "文档模块目录不得为符号链接“{}”",
+                directory.display()
+            ));
+        }
+        let requested_directory = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| format!("不能定位当前目录：{error}"))?
+                .join(directory)
+        };
+        let mut trusted_package_roots = trusted_package_roots(&requested_directory)?;
+        if let Some(root) = trusted_package_roots.matching_root(&requested_directory)
+            && root != requested_directory
+        {
+            trusted_package_roots
+                .authorize_module(&requested_directory, &requested_directory)
+                .map_err(|error| error.to_string())?;
+        }
+        let directory = if trusted_package_roots
+            .matching_root(&requested_directory)
+            .is_some_and(|root| root == requested_directory)
+        {
+            fs::canonicalize(&requested_directory).map_err(|error| {
+                format!(
+                    "不能定位文档模块目录“{}”：{error}",
+                    requested_directory.display()
+                )
+            })?
+        } else {
+            match trusted_package_roots
+                .resolve_existing_module_path(&requested_directory)
+                .map_err(|error| error.to_string())?
+            {
+                Some(path) => path,
+                None => fs::canonicalize(&requested_directory).map_err(|error| {
+                    format!(
+                        "不能定位文档模块目录“{}”：{error}",
+                        requested_directory.display()
+                    )
+                })?,
+            }
+        };
+        trusted_package_roots
+            .insert_discovered(&directory)
+            .map_err(|error| error.to_string())?;
+        if trusted_package_roots.roots().all(|root| root != directory) {
+            trusted_package_roots
+                .authorize_module(&requested_directory, &directory)
+                .map_err(|error| error.to_string())?;
+        }
         let root_module = module_id_for_statements(statements, module_name);
+        if let Some(source) = statements.first().and_then(|statement| {
+            let path = Path::new(&statement.span.source.name);
+            path.exists().then(|| fs::canonicalize(path).ok()).flatten()
+        }) {
+            trusted_package_roots
+                .authorize_module(&source, &source)
+                .map_err(|error| error.to_string())?;
+        }
         let mut index = Self {
             root_module: root_module.clone(),
             modules: BTreeMap::new(),
             documented_modules: BTreeSet::from([root_module.clone()]),
+            trusted_package_roots,
         };
         index.load_module(
             root_module,
             module_name.to_owned(),
             statements.to_vec(),
-            directory,
+            &directory,
         )?;
         Ok(index)
     }
@@ -441,6 +505,7 @@ impl DocIndex {
             root_module,
             modules: BTreeMap::new(),
             documented_modules: BTreeSet::new(),
+            trusted_package_roots: trusted_package_roots(root)?,
         };
         for (name, statements) in modules {
             let module_id = module_id_for_statements(statements, name);
@@ -500,28 +565,37 @@ impl DocIndex {
     }
 
     fn load_import(&mut self, requested: &str, directory: &Path) -> Result<ModuleId, String> {
+        crate::package::validate_portable_path_text(requested)
+            .map_err(|error| error.to_string())?;
         if let Some(name) = requested.strip_prefix("标准:") {
             return Ok(ModuleId::standard(name));
         }
-        let path = if let Some(name) = requested.strip_prefix("包:") {
-            crate::package::resolve_dependency_scoped(None, directory, name)
-                .map_err(|error| error.to_string())?
-                .entry
+        let (path, package_import) = if let Some(name) = requested.strip_prefix("包:") {
+            let dependency = crate::package::resolve_dependency_scoped(None, directory, name)
+                .map_err(|error| error.to_string())?;
+            self.trusted_package_roots
+                .insert(&dependency.root)
+                .map_err(|error| error.to_string())?;
+            (dependency.entry, true)
         } else {
             let requested = Path::new(requested);
             if requested.is_absolute() {
-                requested.to_path_buf()
+                (requested.to_path_buf(), false)
             } else {
-                directory.join(requested)
+                (directory.join(requested), false)
             }
         };
-        let canonical = fs::canonicalize(&path)
-            .map_err(|error| format!("不能读取文档模块“{}”：{error}", path.display()))?;
+        let (resolved, _) = self
+            .trusted_package_roots
+            .resolve_import_file(directory, &path, package_import)
+            .map_err(|error| error.to_string())?;
+        let canonical = resolved.path().to_path_buf();
         let module_id = ModuleId::for_path(&canonical);
         if self.modules.contains_key(&module_id) {
             return Ok(module_id);
         }
-        let source = fs::read_to_string(&canonical)
+        let resolved = resolved.open().map_err(|error| error.to_string())?;
+        let source = crate::package::read_resolved_module_source_snapshot(resolved)
             .map_err(|error| format!("不能读取文档模块“{}”：{error}", canonical.display()))?;
         let statements = crate::parse_named(&source, canonical.display().to_string())
             .map_err(|error| error.to_string())?;
@@ -694,23 +768,87 @@ fn module_id_for_statements(statements: &[Stmt], fallback: &str) -> ModuleId {
 }
 
 pub fn markdown_directory(path: impl AsRef<Path>) -> Result<String, String> {
-    let root = fs::canonicalize(path.as_ref())
-        .map_err(|error| format!("不能定位文档目录“{}”：{error}", path.as_ref().display()))?;
+    let requested = path.as_ref();
+    if fs::symlink_metadata(requested).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!("文档入口不得为符号链接“{}”", requested.display()));
+    }
+    let requested_absolute = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("不能定位当前目录：{error}"))?
+            .join(requested)
+    };
+    let mut trusted_package_roots = trusted_package_roots(&requested_absolute)?;
+    if let Some(package_root) = trusted_package_roots.matching_root(&requested_absolute)
+        && package_root != requested_absolute
+    {
+        trusted_package_roots
+            .authorize_module(&requested_absolute, &requested_absolute)
+            .map_err(|error| error.to_string())?;
+    }
+    let root = if trusted_package_roots
+        .matching_root(&requested_absolute)
+        .is_some_and(|root| root == requested_absolute)
+    {
+        fs::canonicalize(&requested_absolute).map_err(|error| {
+            format!(
+                "不能定位文档目录“{}”：{error}",
+                requested_absolute.display()
+            )
+        })?
+    } else {
+        match trusted_package_roots
+            .resolve_existing_module_path(&requested_absolute)
+            .map_err(|error| error.to_string())?
+        {
+            Some(path) => path,
+            None => fs::canonicalize(&requested_absolute).map_err(|error| {
+                format!(
+                    "不能定位文档目录“{}”：{error}",
+                    requested_absolute.display()
+                )
+            })?,
+        }
+    };
+    trusted_package_roots
+        .insert_discovered(&root)
+        .map_err(|error| error.to_string())?;
+    if trusted_package_roots
+        .roots()
+        .all(|package_root| package_root != root)
+    {
+        trusted_package_roots
+            .authorize_module(&requested_absolute, &root)
+            .map_err(|error| error.to_string())?;
+    }
     let mut files = Vec::new();
-    visit(&root, &mut files)?;
-    files.sort();
+    let mut portable_paths = BTreeMap::new();
+    visit(
+        &root,
+        &trusted_package_roots,
+        &mut portable_paths,
+        &mut files,
+    )?;
+    files.sort_by_key(|file| documentation_path_key(&trusted_package_roots, file));
     let mut modules = Vec::new();
     for file in files {
-        let source = fs::read_to_string(&file)
-            .map_err(|error| format!("不能读取“{}”：{error}", file.display()))?;
-        let statements = crate::parse_named(&source, file.display().to_string())
+        let current_base = file.parent().unwrap_or(&root);
+        let (resolved, _) = trusted_package_roots
+            .resolve_import_file(current_base, &file, false)
             .map_err(|error| error.to_string())?;
-        let name = file
+        let canonical = resolved.path().to_path_buf();
+        let resolved = resolved.open().map_err(|error| error.to_string())?;
+        let source = crate::package::read_resolved_module_source_snapshot(resolved)
+            .map_err(|error| format!("不能读取“{}”：{error}", canonical.display()))?;
+        let statements = crate::parse_named(&source, canonical.display().to_string())
+            .map_err(|error| error.to_string())?;
+        let relative = canonical
             .strip_prefix(&root)
-            .unwrap_or(&file)
-            .with_extension("")
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
+            .unwrap_or(&canonical)
+            .with_extension("");
+        let name =
+            crate::package::portable_package_path(&relative).map_err(|error| error.to_string())?;
         modules.push((name, statements));
     }
 
@@ -733,6 +871,14 @@ pub fn markdown_directory(path: impl AsRef<Path>) -> Result<String, String> {
         output.push_str(&markdown_with_context(name, statements, &context));
     }
     Ok(output)
+}
+
+fn documentation_path_key(roots: &crate::package::TrustedPackageRoots, path: &Path) -> String {
+    roots
+        .matching_root(path)
+        .and_then(|root| path.strip_prefix(root).ok())
+        .and_then(|relative| crate::package::portable_package_path(relative).ok())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 pub fn stable_anchor(kind: &str, name: &str) -> String {
@@ -1258,15 +1404,61 @@ fn anchor_text(text: &str) -> String {
     anchor.trim_matches('-').to_owned()
 }
 
-fn visit(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+fn trusted_package_roots(directory: &Path) -> Result<crate::package::TrustedPackageRoots, String> {
+    let mut roots = crate::package::TrustedPackageRoots::default();
+    roots
+        .insert_discovered(directory)
+        .map_err(|error| error.to_string())?;
+    Ok(roots)
+}
+
+fn visit(
+    path: &Path,
+    trusted_package_roots: &crate::package::TrustedPackageRoots,
+    portable_paths: &mut BTreeMap<PathBuf, crate::package::PortablePackagePaths>,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
     for entry in
         fs::read_dir(path).map_err(|error| format!("不能读取目录“{}”：{error}", path.display()))?
     {
         let path = entry.map_err(|error| error.to_string())?.path();
-        if path.is_dir() {
-            visit(&path, files)?;
-        } else if path.extension().is_some_and(|extension| extension == "yx") {
-            files.push(path);
+        if let Some(root) = trusted_package_roots.matching_root(&path) {
+            let relative = path.strip_prefix(root).expect("matching package root");
+            match crate::package::package_path_decision(
+                relative,
+                crate::package::PackagePathPurpose::YxpEntry,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                crate::package::PackagePathDecision::Include => {}
+                crate::package::PackagePathDecision::Exclude(_) => continue,
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            let paths = portable_paths.entry(root.to_path_buf()).or_default();
+            if metadata.is_dir() {
+                paths
+                    .insert_directory(relative)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                paths.insert(relative).map_err(|error| error.to_string())?;
+            }
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("文档目录不得包含符号链接“{}”", path.display()));
+        }
+        let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
+        if metadata.is_dir() {
+            trusted_package_roots
+                .authorize_module(&path, &canonical)
+                .map_err(|error| error.to_string())?;
+            visit(&canonical, trusted_package_roots, portable_paths, files)?;
+        } else if metadata.is_file() && path.extension().is_some_and(|extension| extension == "yx")
+        {
+            trusted_package_roots
+                .authorize_module(&path, &canonical)
+                .map_err(|error| error.to_string())?;
+            files.push(canonical);
         }
     }
     Ok(())

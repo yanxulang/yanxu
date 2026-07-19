@@ -42,7 +42,7 @@ use lexer::LexError;
 use parser::ParseError;
 use resolver::SemanticError;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub enum YanxuError {
@@ -103,13 +103,7 @@ pub fn run_file_with(
     path: impl AsRef<Path>,
 ) -> Result<Value, YanxuError> {
     let path = path.as_ref();
-    let resolved = resolve_module_file_path(path).map_err(YanxuError::Io)?;
-    let canonical = resolved.path().to_path_buf();
-    let resolved = resolved
-        .open()
-        .map_err(|error| YanxuError::Io(module_manifest_error(error)))?;
-    let source = package::read_resolved_module_source_snapshot(resolved)
-        .map_err(|error| YanxuError::Io(format!("不能读取“{}”：{error}", canonical.display())))?;
+    let (canonical, source) = read_module_source_file(path).map_err(YanxuError::Io)?;
     let statements = parse_named(&source, canonical.display().to_string())?;
     let directory = canonical.parent().unwrap_or_else(|| Path::new("."));
     interpreter
@@ -135,6 +129,15 @@ pub(crate) fn resolve_module_file_path(
         .resolve_import_file(current_base, &requested_absolute, false)
         .map(|(resolved, _)| resolved)
         .map_err(module_manifest_error)
+}
+
+pub(crate) fn read_module_source_file(requested: &Path) -> Result<(PathBuf, String), String> {
+    let resolved = resolve_module_file_path(requested)?;
+    let canonical = resolved.path().to_path_buf();
+    let resolved = resolved.open().map_err(module_manifest_error)?;
+    let source = package::read_resolved_module_source_snapshot(resolved)
+        .map_err(|error| format!("不能读取“{}”：{error}", canonical.display()))?;
+    Ok((canonical, source))
 }
 
 fn module_manifest_error(error: package::ManifestError) -> String {
