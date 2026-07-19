@@ -1168,6 +1168,34 @@ mod tests {
     }
 
     #[test]
+    fn workspace_member_manifest_uses_the_bounded_metadata_reader() {
+        let root = temporary_root("workspace-member-metadata-limit");
+        write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工作区'\n版本='1.0.0'\n入口='主.yx'\n[工作区]\n成员=['member']\n",
+        );
+        write(root.join("主.yx"), "言 1；\n");
+        let member_manifest = root.join("member").join(package::MANIFEST_NAME);
+        fs::create_dir_all(member_manifest.parent().unwrap()).unwrap();
+        let file = fs::File::create(&member_manifest).unwrap();
+        file.set_len(4 * 1024 * 1024 + 1).unwrap();
+
+        let result = response(&json!({
+            "protocol_version": ENGINEERING_PROTOCOL_VERSION,
+            "operation": "workspace",
+            "path": root,
+        }));
+        assert_eq!(result["ok"], false);
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("包清单不得超过")
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn audit_declares_and_echoes_the_stable_capability() {
         let expected = json!({
             "schema_version": 1,
