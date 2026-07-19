@@ -9,6 +9,7 @@ pub(super) struct ArchiveLimits {
     pub(super) expanded_bytes: u64,
     pub(super) entries: usize,
     pub(super) path_bytes: usize,
+    pub(super) metadata_headers: bool,
 }
 
 pub(super) const ARCHIVE_LIMITS: ArchiveLimits = ArchiveLimits {
@@ -17,6 +18,7 @@ pub(super) const ARCHIVE_LIMITS: ArchiveLimits = ArchiveLimits {
     expanded_bytes: ARCHIVE_MAX_EXPANDED_BYTES,
     entries: ARCHIVE_MAX_ENTRIES,
     path_bytes: ARCHIVE_MAX_PATH_BYTES,
+    metadata_headers: false,
 };
 
 #[cfg(test)]
@@ -36,14 +38,47 @@ pub(super) fn extract_archive_bytes_safely(
     archive: &Path,
     destination: &Path,
 ) -> Result<(), ManifestError> {
+    extract_archive_bytes_with_limits(bytes, archive, destination, ARCHIVE_LIMITS)
+}
+
+pub(super) fn extract_archive_bytes_with_limits(
+    bytes: &[u8],
+    archive: &Path,
+    destination: &Path,
+    limits: ArchiveLimits,
+) -> Result<(), ManifestError> {
     let compressed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     extract_archive_reader_with_limits(
         io::Cursor::new(bytes),
         compressed_bytes,
         archive,
         destination,
-        ARCHIVE_LIMITS,
+        limits,
     )
+}
+
+/// 展开由本地 Git 进程直接生成的未压缩 tar 快照。
+///
+/// Git 依赖不使用可由用户配置替换的 `tar.gz` 压缩命令；原始 tar 字节仍受
+/// 输入、单文件、总展开量、条目数和路径长度的同一组硬上限约束。
+pub(super) fn extract_tar_bytes_with_limits(
+    bytes: &[u8],
+    archive: &Path,
+    destination: &Path,
+    limits: ArchiveLimits,
+) -> Result<(), ManifestError> {
+    let archive_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if archive_bytes > limits.compressed_bytes {
+        return Err(manifest_error(
+            archive,
+            None,
+            format!(
+                "归档为 {archive_bytes} 字节，超过 {} 字节输入上限",
+                limits.compressed_bytes
+            ),
+        ));
+    }
+    extract_tar_reader_with_limits(io::Cursor::new(bytes), archive, destination, limits)
 }
 
 /// 只读验证既有文件是否为本生产器可安全覆盖的 YXP 制品。
@@ -215,10 +250,20 @@ fn extract_archive_reader_with_limits<R: Read>(
         ));
     }
     let decoder = flate2::read::GzDecoder::new(reader);
-    let mut tar = tar::Archive::new(decoder);
+    extract_tar_reader_with_limits(decoder, archive, destination, limits)
+}
+
+fn extract_tar_reader_with_limits<R: Read>(
+    reader: R,
+    archive: &Path,
+    destination: &Path,
+    limits: ArchiveLimits,
+) -> Result<(), ManifestError> {
+    let mut tar = tar::Archive::new(reader);
     let entries = tar.entries().map_err(|error| {
         manifest_error(archive, None, format!("索引制品不是有效 tar.gz：{error}"))
     })?;
+    let entries = entries.raw(!limits.metadata_headers);
     let mut entry_count = 0_usize;
     let mut expanded_bytes = 0_u64;
     for entry in entries {
@@ -249,6 +294,46 @@ fn extract_archive_reader_with_limits<R: Read>(
                     format!("不能创建制品目录：{error}"),
                 )
             })?;
+            continue;
+        }
+        if limits.metadata_headers
+            && (entry_type.is_pax_global_extensions()
+                || entry_type.is_pax_local_extensions()
+                || entry_type.is_gnu_longname()
+                || entry_type.is_gnu_longlink())
+        {
+            let metadata_bytes = entry.size();
+            if metadata_bytes > limits.file_bytes {
+                return Err(manifest_error(
+                    archive,
+                    None,
+                    format!(
+                        "归档元数据“{}”为 {metadata_bytes} 字节，超过 {} 字节上限",
+                        relative.display(),
+                        limits.file_bytes
+                    ),
+                ));
+            }
+            expanded_bytes = expanded_bytes
+                .checked_add(metadata_bytes)
+                .filter(|total| *total <= limits.expanded_bytes)
+                .ok_or_else(|| {
+                    manifest_error(
+                        archive,
+                        None,
+                        format!("归档展开后超过 {} 字节上限", limits.expanded_bytes),
+                    )
+                })?;
+            let copied = io::copy(&mut entry, &mut io::sink()).map_err(|error| {
+                manifest_error(archive, None, format!("不能读取归档扩展元数据：{error}"))
+            })?;
+            if copied != metadata_bytes {
+                return Err(manifest_error(
+                    archive,
+                    None,
+                    "归档扩展元数据声明大小与实际内容不符",
+                ));
+            }
             continue;
         }
         if !entry_type.is_file() {
