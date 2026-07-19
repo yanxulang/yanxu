@@ -76,6 +76,7 @@ typedef struct YanxuNativeConstantV1 {
 
 typedef struct YanxuNativeModuleV1 {
     uint32_t abi_version;
+    /* 必须精确等于 sizeof(YanxuNativeModuleV1)。 */
     size_t struct_size;
     const uint8_t *name;
     size_t name_length;

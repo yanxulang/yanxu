@@ -80,6 +80,9 @@ libloading = "0.8"
 rustyline = "18.0.1"
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 proc-macro2 = "1"
 quote = "1"

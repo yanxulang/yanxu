@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt;
 #[cfg(not(target_family = "wasm"))]
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
@@ -169,6 +169,13 @@ pub struct YanxuNativeModuleV1 {
     pub capabilities: u64,
 }
 
+#[repr(C)]
+#[cfg(not(target_family = "wasm"))]
+struct YanxuNativeModuleHeaderV1 {
+    abi_version: u32,
+    struct_size: usize,
+}
+
 #[cfg(not(target_family = "wasm"))]
 type NativeModuleEntry = unsafe extern "C" fn() -> *const YanxuNativeModuleV1;
 
@@ -210,11 +217,13 @@ impl Drop for NativeInner {
 pub(crate) struct StagedLibrary {
     pub(crate) root: PathBuf,
     pub(crate) path: PathBuf,
+    file: Option<std::fs::File>,
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl Drop for StagedLibrary {
     fn drop(&mut self) {
+        drop(self.file.take());
         make_staged_tree_writable(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
@@ -233,25 +242,36 @@ pub(crate) fn stage_verified_library(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let root = std::env::temp_dir().join(format!("yanxu-native-v1-{}-{nonce}", std::process::id()));
-    std::fs::create_dir(&root)
+    create_private_staging_directory(&root)
         .map_err(|error| native_error("NATIVE_IO", format!("不能创建原生暂存目录：{error}")))?;
     let content_directory = root.join(checksum);
     let path = content_directory.join(format!("extension{}", std::env::consts::DLL_SUFFIX));
-    let staged = StagedLibrary { root, path };
+    let mut staged = StagedLibrary {
+        root,
+        path,
+        file: None,
+    };
     let result = (|| {
-        std::fs::create_dir(&content_directory)
+        create_private_staging_directory(&content_directory)
             .map_err(|error| native_error("NATIVE_IO", format!("不能创建内容寻址目录：{error}")))?;
-        let mut output = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged.path)
+        let mut output = create_private_staging_file(&staged.path)
             .map_err(|error| native_error("NATIVE_IO", format!("不能暂存原生制品：{error}")))?;
         output
             .write_all(bytes)
             .and_then(|_| output.sync_all())
             .map_err(|error| native_error("NATIVE_IO", format!("不能写入原生暂存制品：{error}")))?;
-        set_staged_read_only(&staged.path, false)?;
-        let staged_bytes = std::fs::read(&staged.path)
+        let mut held = hold_staged_file(output)?;
+        let metadata = held
+            .metadata()
+            .map_err(|error| native_error("NATIVE_IO", format!("不能检查原生暂存制品：{error}")))?;
+        if !metadata.is_file() || metadata.len() != bytes.len() as u64 {
+            return Err(native_error(
+                "NATIVE_IO",
+                "原生暂存制品不是预期大小的普通文件",
+            ));
+        }
+        let mut staged_bytes = Vec::with_capacity(bytes.len());
+        held.read_to_end(&mut staged_bytes)
             .map_err(|error| native_error("NATIVE_IO", format!("不能复核原生暂存制品：{error}")))?;
         let staged_checksum = format!("{:x}", Sha256::digest(staged_bytes));
         if staged_checksum != checksum {
@@ -260,6 +280,9 @@ pub(crate) fn stage_verified_library(
                 format!("原生暂存制品摘要改变：预期 {checksum}，实际 {staged_checksum}"),
             ));
         }
+        held.seek(SeekFrom::Start(0))
+            .map_err(|error| native_error("NATIVE_IO", format!("不能复位原生暂存制品：{error}")))?;
+        staged.file = Some(held);
         set_staged_read_only(&content_directory, true)?;
         set_staged_read_only(&staged.root, true)?;
         Ok(())
@@ -271,6 +294,126 @@ pub(crate) fn stage_verified_library(
             Err(error)
         }
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn create_private_staging_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    std::fs::DirBuilder::new().create(path)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn create_private_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn set_open_staged_file_read_only(file: &std::fs::File) -> Result<(), NativeError> {
+    let mut permissions = file
+        .metadata()
+        .map_err(|error| native_error("NATIVE_IO", error.to_string()))?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o400);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    file.set_permissions(permissions)
+        .map_err(|error| native_error("NATIVE_IO", format!("不能锁定原生暂存制品：{error}")))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn hold_staged_file(file: std::fs::File) -> Result<std::fs::File, NativeError> {
+    set_open_staged_file_read_only(&file)?;
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let intermediate = reopen_staged_file(&file, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+        drop(file);
+        let mut held = reopen_staged_file(&intermediate, FILE_SHARE_READ)?;
+        drop(intermediate);
+        held.seek(SeekFrom::Start(0))
+            .map_err(|error| native_error("NATIVE_IO", format!("不能复位原生暂存制品：{error}")))?;
+        Ok(held)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut file = file;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| native_error("NATIVE_IO", format!("不能复位原生暂存制品：{error}")))?;
+        Ok(file)
+    }
+}
+
+#[cfg(windows)]
+fn reopen_staged_file(file: &std::fs::File, share_mode: u32) -> Result<std::fs::File, NativeError> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, ReOpenFile};
+
+    // SAFETY: `file` owns a live Windows file handle. A successful result is a new owned handle.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle() as HANDLE,
+            FILE_GENERIC_READ,
+            share_mode,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(native_error(
+            "NATIVE_IO",
+            format!(
+                "不能重新打开原生暂存制品：{}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    // SAFETY: ReOpenFile returned a distinct live handle whose ownership transfers to File.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn absolute_native_artifact_path(path: &Path) -> Result<PathBuf, NativeError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|current| current.join(path))
+        .map_err(|error| native_error("NATIVE_IO", format!("不能定位当前目录：{error}")))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn open_native_artifact(path: &Path) -> Result<crate::package::ResolvedPackageFile, NativeError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut roots = crate::package::TrustedPackageRoots::new();
+    roots
+        .insert(parent)
+        .map_err(|error| native_error("NATIVE_IO", format!("不能建立原生制品目录句柄：{error}")))?;
+    roots
+        .resolve_existing_file(path, crate::package::PackagePathPurpose::ManifestReference)
+        .map_err(|error| native_error("NATIVE_IO", format!("不能安全打开原生制品：{error}")))?
+        .ok_or_else(|| native_error("NATIVE_IO", "原生制品不属于已打开的父目录"))
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -421,9 +564,16 @@ impl NativeExtension {
         permissions: &PermissionSet,
         expected_name: &str,
     ) -> Result<Self, NativeError> {
-        let path = path.as_ref();
+        let requested_path = path.as_ref();
+        if artifact.abi != NATIVE_ABI_VERSION {
+            return Err(native_error(
+                "NATIVE_ABI",
+                format!("锁定制品 ABI {} 不是 ABI v1", artifact.abi),
+            ));
+        }
+        let path = absolute_native_artifact_path(requested_path)?;
         permissions
-            .check_native_extension(path)
+            .check_native_extension(&path)
             .map_err(|error| native_error("NATIVE_PERMISSION", error.to_string()))?;
         if artifact.target != crate::package::current_target() {
             return Err(native_error(
@@ -446,30 +596,48 @@ impl NativeExtension {
                 "原生制品须声明 64 位十六进制 SHA-256",
             ));
         }
-        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-            native_error("NATIVE_IO", format!("不能检查 {}：{error}", path.display()))
-        })?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(native_error(
-                "NATIVE_IO",
-                "原生制品须为普通文件而非符号链接",
-            ));
-        }
-        if metadata.len() > NATIVE_MAX_LIBRARY_BYTES {
+        if artifact.size > NATIVE_MAX_LIBRARY_BYTES {
             return Err(native_error("NATIVE_LIMIT", "原生制品不得超过 256 MiB"));
         }
-        let mut source = std::fs::File::open(path).map_err(|error| {
-            native_error("NATIVE_IO", format!("不能读取 {}：{error}", path.display()))
+        let source = open_native_artifact(&path)?;
+        let opened_metadata = source.metadata().map_err(|error| {
+            native_error("NATIVE_IO", format!("不能检查已打开的原生制品：{error}"))
         })?;
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        Read::by_ref(&mut source)
-            .take(NATIVE_MAX_LIBRARY_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| native_error("NATIVE_IO", format!("不能读取原生制品：{error}")))?;
+        if !opened_metadata.is_file() {
+            return Err(native_error("NATIVE_IO", "已打开的原生制品不是普通文件"));
+        }
+        if opened_metadata.len() != artifact.size
+            || opened_metadata.len() > NATIVE_MAX_LIBRARY_BYTES
+        {
+            return Err(native_error(
+                "NATIVE_LIMIT",
+                format!(
+                    "原生制品大小不符或超限：锁定 {}，实际 {}",
+                    artifact.size,
+                    opened_metadata.len()
+                ),
+            ));
+        }
+        let bytes = crate::package::read_resolved_regular_file_snapshot(
+            source,
+            NATIVE_MAX_LIBRARY_BYTES,
+            "原生制品",
+        )
+        .map_err(|error| native_error("NATIVE_IO", error.to_string()))?;
         if bytes.len() as u64 > NATIVE_MAX_LIBRARY_BYTES {
             return Err(native_error(
                 "NATIVE_LIMIT",
                 "原生制品读取过程中超过 256 MiB",
+            ));
+        }
+        if bytes.len() as u64 != artifact.size {
+            return Err(native_error(
+                "NATIVE_LIMIT",
+                format!(
+                    "原生制品大小不符或超限：锁定 {}，实际 {}",
+                    artifact.size,
+                    bytes.len()
+                ),
             ));
         }
         let checksum = format!("{:x}", Sha256::digest(&bytes));
@@ -681,20 +849,29 @@ unsafe fn validate_descriptor(
     descriptor: *const YanxuNativeModuleV1,
     expected_name: &str,
 ) -> Result<ValidatedDescriptor, NativeError> {
-    let descriptor = unsafe { descriptor.as_ref() }
+    let header = unsafe { descriptor.cast::<YanxuNativeModuleHeaderV1>().as_ref() }
         .ok_or_else(|| native_error("NATIVE_DESCRIPTOR", "模块描述符为空"))?;
-    if descriptor.abi_version != NATIVE_ABI_VERSION {
+    if header.abi_version != NATIVE_ABI_VERSION {
         return Err(native_error(
             "NATIVE_ABI",
             format!(
                 "扩展 ABI {} 与运行时 ABI {NATIVE_ABI_VERSION} 不兼容",
-                descriptor.abi_version
+                header.abi_version
             ),
         ));
     }
-    if descriptor.struct_size < std::mem::size_of::<YanxuNativeModuleV1>() {
-        return Err(native_error("NATIVE_ABI", "模块描述符尺寸过小"));
+    let expected_struct_size = std::mem::size_of::<YanxuNativeModuleV1>();
+    if header.struct_size != expected_struct_size {
+        return Err(native_error(
+            "NATIVE_ABI",
+            format!(
+                "模块描述符尺寸 {} 与 ABI v1 要求的 {expected_struct_size} 不符",
+                header.struct_size
+            ),
+        ));
     }
+    let descriptor = unsafe { descriptor.as_ref() }
+        .ok_or_else(|| native_error("NATIVE_DESCRIPTOR", "模块描述符为空"))?;
     let name = unsafe { copy_utf8(descriptor.name, descriptor.name_length, "模块名") }?;
     if name != expected_name {
         return Err(native_error(
@@ -977,6 +1154,19 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, "NATIVE_ABI");
+        descriptor.abi_version = NATIVE_ABI_VERSION;
+        descriptor.struct_size = std::mem::size_of::<YanxuNativeModuleV1>() - 1;
+        let undersized = match unsafe { validate_descriptor(&descriptor, "example") } {
+            Ok(_) => panic!("undersized ABI v1 descriptor should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(undersized.code, "NATIVE_ABI");
+        descriptor.struct_size = std::mem::size_of::<YanxuNativeModuleV1>() + 1;
+        let oversized = match unsafe { validate_descriptor(&descriptor, "example") } {
+            Ok(_) => panic!("oversized ABI v1 descriptor should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(oversized.code, "NATIVE_ABI");
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -1129,8 +1319,77 @@ mod tests {
                 .permissions()
                 .readonly()
         );
+        #[cfg(windows)]
+        assert!(
+            std::fs::remove_file(&staged.path).is_err(),
+            "held staging handle must deny replacement"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                std::fs::metadata(&staged.root)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500
+            );
+            assert_eq!(
+                std::fs::metadata(staged.path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500
+            );
+            assert_eq!(
+                std::fs::metadata(&staged.path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+        }
         drop(staged);
         assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_entries_start_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "yanxu-native-v1-mode-{}-{unique}",
+            std::process::id()
+        ));
+        create_private_staging_directory(&root).unwrap();
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let content = root.join("content");
+        create_private_staging_directory(&content).unwrap();
+        assert_eq!(
+            std::fs::metadata(&content).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let artifact = content.join("extension.bin");
+        drop(create_private_staging_file(&artifact).unwrap());
+        assert_eq!(
+            std::fs::metadata(&artifact).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
