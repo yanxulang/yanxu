@@ -980,6 +980,10 @@ impl Interpreter {
         self.resources.set_budget(budget);
     }
 
+    pub(crate) fn set_time_limit(&mut self, limit: Duration) {
+        self.resources.set_time_limit(Some(limit));
+    }
+
     pub(crate) fn set_host_resource_limits(&mut self, limits: crate::budget::HostResourceLimits) {
         self.resources.set_host_limits(limits);
     }

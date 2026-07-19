@@ -6,9 +6,35 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+static ACTIVE_TEST_EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static PEAK_TEST_EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+struct ActiveTestExecution;
+
+#[cfg(test)]
+impl ActiveTestExecution {
+    fn begin() -> Self {
+        let active = ACTIVE_TEST_EXECUTIONS.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK_TEST_EXECUTIONS.fetch_max(active, Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ActiveTestExecution {
+    fn drop(&mut self) {
+        ACTIVE_TEST_EXECUTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TestOptions {
@@ -155,11 +181,12 @@ pub fn run_with_options(
     let queue = Arc::new(Mutex::new(VecDeque::from(paths)));
     let (sender, receiver) = mpsc::channel();
     let workers = options.jobs.min(count);
+    let mut worker_handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let queue = queue.clone();
         let sender = sender.clone();
         let timeout = options.timeout;
-        thread::spawn(move || {
+        worker_handles.push(thread::spawn(move || {
             loop {
                 let path = queue.lock().expect("test queue poisoned").pop_front();
                 let Some(path) = path else {
@@ -167,17 +194,34 @@ pub fn run_with_options(
                 };
                 let _ = sender.send(run_case_with_timeout(path, timeout));
             }
-        });
+        }));
     }
     drop(sender);
 
     let mut results = Vec::with_capacity(count);
+    let mut failure = None;
     for _ in 0..count {
-        results.push(
-            receiver
-                .recv()
-                .map_err(|_| "测试工作线程意外终止".to_string())??,
-        );
+        match receiver.recv() {
+            Ok(Ok(result)) => results.push(result),
+            Ok(Err(error)) => {
+                failure.get_or_insert(error);
+            }
+            Err(_) => {
+                failure.get_or_insert_with(|| "测试工作线程意外终止".to_string());
+                break;
+            }
+        }
+    }
+    for worker in worker_handles {
+        if worker.join().is_err() {
+            failure.get_or_insert_with(|| "测试工作线程发生内部恐慌".to_string());
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if results.len() != count {
+        return Err("测试工作线程没有返回全部结果".into());
     }
     results.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(results)
@@ -210,49 +254,57 @@ pub fn machine_report(results: &[TestCaseResult]) -> Value {
 }
 
 fn run_case_with_timeout(path: PathBuf, timeout: Duration) -> Result<TestCaseResult, String> {
-    let (sender, receiver) = mpsc::channel();
-    let worker_path = path.clone();
+    #[cfg(test)]
+    let _active = ActiveTestExecution::begin();
     let started = Instant::now();
-    thread::spawn(move || {
-        let result = std::panic::catch_unwind(|| run_case(&worker_path)).unwrap_or_else(|_| {
+    let result =
+        std::panic::catch_unwind(|| run_case(&path, started, timeout)).unwrap_or_else(|_| {
             Ok(TestCaseResult {
-                path: worker_path,
+                path: path.clone(),
                 passed: false,
                 status: TestStatus::Failed,
                 detail: "测试执行时发生内部恐慌".into(),
                 duration_ms: 0,
             })
         });
-        let _ = sender.send(result);
-    });
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => result.map(|mut result| {
-            result.duration_ms = started.elapsed().as_millis();
-            result
-        }),
-        Err(mpsc::RecvTimeoutError::Timeout) => Ok(TestCaseResult {
+    let elapsed = started.elapsed();
+    if elapsed >= timeout {
+        Ok(TestCaseResult {
             path,
             passed: false,
             status: TestStatus::TimedOut,
             detail: format!("超过 {} 毫秒", timeout.as_millis()),
-            duration_ms: started.elapsed().as_millis(),
-        }),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err("测试线程意外终止".into()),
+            duration_ms: elapsed.as_millis(),
+        })
+    } else {
+        result.map(|mut result| {
+            result.duration_ms = elapsed.as_millis();
+            result
+        })
     }
 }
 
-fn run_case(path: &Path) -> Result<TestCaseResult, String> {
+fn run_case(path: &Path, started: Instant, timeout: Duration) -> Result<TestCaseResult, String> {
     let (canonical, source) = crate::read_module_source_file(path)?;
     let expected = expectations(&source);
     let expected_failure = expected_failure(&source);
     let mut interpreter = Interpreter::silent();
     let execution = match crate::parse_named(&source, canonical.display().to_string()) {
-        Ok(statements) => interpreter
-            .execute_in_directory(
-                &statements,
-                canonical.parent().unwrap_or_else(|| Path::new(".")),
-            )
-            .map_err(crate::YanxuError::Runtime),
+        Ok(statements) => {
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .ok_or_else(|| "EXECUTION_TIMEOUT：读取和解析已耗尽测试时间预算".to_string())?;
+            if remaining.is_zero() {
+                return Err("EXECUTION_TIMEOUT：读取和解析已耗尽测试时间预算".into());
+            }
+            interpreter.set_time_limit(remaining);
+            interpreter
+                .execute_in_directory(
+                    &statements,
+                    canonical.parent().unwrap_or_else(|| Path::new(".")),
+                )
+                .map_err(crate::YanxuError::Runtime)
+        }
         Err(error) => Err(error),
     };
     let (raw_passed, detail) = match execution {
@@ -387,6 +439,8 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static RUN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn reads_ordered_output_expectations_and_expected_failure() {
         assert_eq!(
@@ -401,6 +455,7 @@ mod tests {
 
     #[test]
     fn filters_runs_concurrently_and_reports_expected_failures_as_json() {
+        let _run = RUN_TEST_LOCK.lock().unwrap();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -429,6 +484,44 @@ mod tests {
         assert_eq!(report["schema_version"], TEST_REPORT_SCHEMA_VERSION);
         assert_eq!(report["summary"]["expectedFailures"], 1);
         assert_eq!(report["tests"][0]["status"], "expected_failure");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_timeouts_stop_every_execution_and_respect_the_worker_limit() {
+        let _run = RUN_TEST_LOCK.lock().unwrap();
+        assert_eq!(ACTIVE_TEST_EXECUTIONS.load(Ordering::SeqCst), 0);
+        PEAK_TEST_EXECUTIONS.store(0, Ordering::SeqCst);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yanxu-timeout-tests-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..8 {
+            fs::write(root.join(format!("超时-{index}.yx")), "当 真 则\n终\n").unwrap();
+        }
+        let options = TestOptions {
+            filter: None,
+            jobs: 2,
+            timeout: Duration::from_millis(10),
+        };
+
+        let results = run_with_options(&root, &options).unwrap();
+
+        assert_eq!(results.len(), 8);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.status == TestStatus::TimedOut)
+        );
+        assert_eq!(ACTIVE_TEST_EXECUTIONS.load(Ordering::SeqCst), 0);
+        let peak = PEAK_TEST_EXECUTIONS.load(Ordering::SeqCst);
+        assert!(
+            (1..=options.jobs).contains(&peak),
+            "peak executions: {peak}"
+        );
+        assert_eq!(machine_report(&results)["summary"]["timedOut"], 8);
         fs::remove_dir_all(root).unwrap();
     }
 }

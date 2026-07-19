@@ -1,5 +1,7 @@
 //! 两套执行器共享的资源预算配置与计量器。
 
+use std::time::{Duration, Instant};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionBudget {
     pub max_steps: u64,
@@ -109,6 +111,8 @@ pub(crate) struct ResourceMeter {
     host_limits: HostResourceLimits,
     steps: u64,
     call_depth: usize,
+    time_limit: Option<Duration>,
+    time_started: Option<Instant>,
 }
 
 impl ResourceMeter {
@@ -118,6 +122,8 @@ impl ResourceMeter {
             host_limits: HostResourceLimits::default(),
             steps: 0,
             call_depth: 0,
+            time_limit: None,
+            time_started: None,
         }
     }
 
@@ -138,9 +144,15 @@ impl ResourceMeter {
         self.host_limits = host_limits;
     }
 
+    pub(crate) fn set_time_limit(&mut self, limit: Option<Duration>) {
+        self.time_limit = limit;
+        self.time_started = limit.map(|_| Instant::now());
+    }
+
     pub(crate) fn reset(&mut self) {
         self.steps = 0;
         self.call_depth = 0;
+        self.time_started = self.time_limit.map(|_| Instant::now());
     }
 
     /// 进入一个独立计量的步数窗口（如宿主事件回调）：暂存累计步数并清零。
@@ -154,11 +166,25 @@ impl ResourceMeter {
     }
 
     pub(crate) fn charge_step(&mut self) -> Result<(), String> {
+        self.check_time_limit()?;
         self.steps = self.steps.saturating_add(1);
         if self.steps > self.budget.max_steps {
             Err(format!(
                 "执行步数超过预算 {}；可提高 max_steps（命令行 --max-steps 或环境变量 YANXU_MAX_STEPS），或检查无穷循环",
                 self.budget.max_steps
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_time_limit(&self) -> Result<(), String> {
+        if let (Some(limit), Some(started)) = (self.time_limit, self.time_started)
+            && started.elapsed() >= limit
+        {
+            Err(format!(
+                "EXECUTION_TIMEOUT：执行超过时间预算 {} 毫秒",
+                limit.as_millis()
             ))
         } else {
             Ok(())
@@ -224,6 +250,22 @@ mod tests {
         meter.close_step_window(saved);
         // 恢复后外层余额保持耗尽状态，不因窗口而放宽。
         assert!(meter.charge_step().is_err());
+    }
+
+    #[test]
+    fn time_limit_can_stop_and_then_release_an_execution_meter() {
+        let mut meter = ResourceMeter::new(ExecutionBudget::default());
+        meter.set_time_limit(Some(Duration::ZERO));
+        meter.reset();
+        assert!(
+            meter
+                .charge_step()
+                .unwrap_err()
+                .contains("EXECUTION_TIMEOUT")
+        );
+        meter.set_time_limit(None);
+        meter.reset();
+        assert!(meter.charge_step().is_ok());
     }
 
     #[test]
