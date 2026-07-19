@@ -1511,7 +1511,7 @@ impl Checker {
                 }
             }
             ExprKind::Get { object, name } => {
-                if let Some(module) = self.module_summary_for_expr(object, scope) {
+                if let Some(module) = Self::module_summary_for_expr(object, scope) {
                     self.expression(object, scope);
                     if let Some(symbol) = module.exports.get(name) {
                         return exported_symbol_type(symbol);
@@ -1609,11 +1609,11 @@ impl Checker {
         }
     }
 
-    fn module_summary_for_expr(&self, expression: &Expr, scope: &Scope) -> Option<ModuleSummary> {
+    fn module_summary_for_expr(expression: &Expr, scope: &Scope) -> Option<ModuleSummary> {
         match &expression.kind {
             ExprKind::Variable(name) => scope.get(name)?.module.clone(),
             ExprKind::Get { object, name } => {
-                let module = self.module_summary_for_expr(object, scope)?;
+                let module = Self::module_summary_for_expr(object, scope)?;
                 match module.exports.get(name)? {
                     ExportedSymbol::Module { summary, .. } => Some(summary.as_ref().clone()),
                     _ => None,
@@ -1627,7 +1627,7 @@ impl Checker {
         match &expression.kind {
             ExprKind::Variable(name) => scope.get(name)?.class_id.clone(),
             ExprKind::Get { object, name } => {
-                let module = self.module_summary_for_expr(object, scope)?;
+                let module = Self::module_summary_for_expr(object, scope)?;
                 match module.exports.get(name)? {
                     ExportedSymbol::Class { type_id, .. } => Some(type_id.clone()),
                     _ => None,

@@ -1873,9 +1873,13 @@ fn collect_use_export_names(tree: &UseTree, names: &mut BTreeSet<String>) -> boo
             names.insert(rename.rename.to_string());
             false
         }
-        UseTree::Group(group) => group.items.iter().fold(false, |glob, tree| {
-            collect_use_export_names(tree, names) || glob
-        }),
+        UseTree::Group(group) => {
+            let mut contains_glob = false;
+            for tree in &group.items {
+                contains_glob |= collect_use_export_names(tree, names);
+            }
+            contains_glob
+        }
         UseTree::Glob(_) => true,
     }
 }
@@ -2364,9 +2368,11 @@ fn compare_values(
         }
         _ if baseline == current => {}
         _ => changes.push(SurfaceChange {
-            bump: reviewed_patch_change(path, baseline, current)
-                .then_some(RequiredBump::Patch)
-                .unwrap_or(RequiredBump::Major),
+            bump: if reviewed_patch_change(path, baseline, current) {
+                RequiredBump::Patch
+            } else {
+                RequiredBump::Major
+            },
             kind: "changed",
             path: display_path(path),
         }),
