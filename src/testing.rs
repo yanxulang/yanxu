@@ -1,10 +1,9 @@
 //! `.yx` 规格测试发现、并发执行与报告。
 
 use crate::interpreter::Interpreter;
-use crate::run_file_with;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -60,14 +59,74 @@ pub struct TestCaseResult {
 }
 
 pub fn discover(path: impl AsRef<Path>) -> Result<Vec<PathBuf>, String> {
-    let path = path.as_ref();
+    discover_with_root(path).map(|(_, files)| files)
+}
+
+pub(crate) fn discover_with_root(
+    path: impl AsRef<Path>,
+) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    let requested = path.as_ref();
+    if fs::symlink_metadata(requested).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!("测试入口不得为符号链接“{}”", requested.display()));
+    }
+    let requested_absolute = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("不能定位当前目录：{error}"))?
+            .join(requested)
+    };
+    let mut roots = testing_package_roots(&requested_absolute)?;
+    if let Some(root) = roots.matching_root(&requested_absolute)
+        && root != requested_absolute
+    {
+        roots
+            .authorize_module(&requested_absolute, &requested_absolute)
+            .map_err(|error| error.to_string())?;
+    }
+    let path = if roots
+        .matching_root(&requested_absolute)
+        .is_some_and(|root| root == requested_absolute)
+    {
+        fs::canonicalize(&requested_absolute)
+            .map_err(|error| format!("不能定位“{}”：{error}", requested.display()))?
+    } else {
+        match roots
+            .resolve_existing_module_path(&requested_absolute)
+            .map_err(|error| error.to_string())?
+        {
+            Some(path) => path,
+            None => fs::canonicalize(&requested_absolute)
+                .map_err(|error| format!("不能定位“{}”：{error}", requested.display()))?,
+        }
+    };
+    roots
+        .insert_discovered(&path)
+        .map_err(|error| error.to_string())?;
     if path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
+        roots
+            .authorize_module(&requested_absolute, &path)
+            .map_err(|error| error.to_string())?;
+        return Ok((path.clone(), vec![path]));
+    }
+    if roots.roots().all(|root| root != path) {
+        roots
+            .authorize_module(&requested_absolute, &path)
+            .map_err(|error| error.to_string())?;
     }
     let mut files = Vec::new();
-    visit(path, &mut files)?;
-    files.sort();
-    Ok(files)
+    let mut portable_paths = BTreeMap::new();
+    visit(&path, &roots, &mut portable_paths, &mut files)?;
+    files.sort_by_key(|file| testing_path_key(&roots, file));
+    Ok((path, files))
+}
+
+fn testing_path_key(roots: &crate::package::TrustedPackageRoots, path: &Path) -> String {
+    roots
+        .matching_root(path)
+        .and_then(|root| path.strip_prefix(root).ok())
+        .and_then(|relative| crate::package::portable_package_path(relative).ok())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 pub fn run(path: impl AsRef<Path>) -> Result<Vec<TestCaseResult>, String> {
@@ -183,12 +242,19 @@ fn run_case_with_timeout(path: PathBuf, timeout: Duration) -> Result<TestCaseRes
 }
 
 fn run_case(path: &Path) -> Result<TestCaseResult, String> {
-    let source = fs::read_to_string(path)
-        .map_err(|error| format!("不能读取“{}”：{error}", path.display()))?;
+    let (canonical, source) = crate::read_module_source_file(path)?;
     let expected = expectations(&source);
     let expected_failure = expected_failure(&source);
     let mut interpreter = Interpreter::silent();
-    let execution = run_file_with(&mut interpreter, path);
+    let execution = match crate::parse_named(&source, canonical.display().to_string()) {
+        Ok(statements) => interpreter
+            .execute_in_directory(
+                &statements,
+                canonical.parent().unwrap_or_else(|| Path::new(".")),
+            )
+            .map_err(crate::YanxuError::Runtime),
+        Err(error) => Err(error),
+    };
     let (raw_passed, detail) = match execution {
         Ok(_) if expected.is_empty() || expected == interpreter.output() => (
             true,
@@ -233,15 +299,58 @@ fn run_case(path: &Path) -> Result<TestCaseResult, String> {
     })
 }
 
-fn visit(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+fn testing_package_roots(path: &Path) -> Result<crate::package::TrustedPackageRoots, String> {
+    let mut roots = crate::package::TrustedPackageRoots::default();
+    roots
+        .insert_discovered(path)
+        .map_err(|error| error.to_string())?;
+    Ok(roots)
+}
+
+fn visit(
+    path: &Path,
+    roots: &crate::package::TrustedPackageRoots,
+    portable_paths: &mut BTreeMap<PathBuf, crate::package::PortablePackagePaths>,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
     let entries =
         fs::read_dir(path).map_err(|error| format!("不能读取目录“{}”：{error}", path.display()))?;
     for entry in entries {
         let path = entry.map_err(|error| error.to_string())?.path();
-        if path.is_dir() {
-            visit(&path, files)?;
-        } else if path.extension().is_some_and(|extension| extension == "yx") {
-            files.push(path);
+        if let Some(root) = roots.matching_root(&path) {
+            let relative = path.strip_prefix(root).expect("matching package root");
+            match crate::package::package_path_decision(
+                relative,
+                crate::package::PackagePathPurpose::YxpEntry,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                crate::package::PackagePathDecision::Include => {}
+                crate::package::PackagePathDecision::Exclude(_) => continue,
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            let paths = portable_paths.entry(root.to_path_buf()).or_default();
+            if metadata.is_dir() {
+                paths
+                    .insert_directory(relative)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                paths.insert(relative).map_err(|error| error.to_string())?;
+            }
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("测试目录不得包含符号链接“{}”", path.display()));
+        }
+        let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
+        if metadata.is_dir() {
+            visit(&canonical, roots, portable_paths, files)?;
+        } else if metadata.is_file() && path.extension().is_some_and(|extension| extension == "yx")
+        {
+            roots
+                .authorize_module(&path, &canonical)
+                .map_err(|error| error.to_string())?;
+            files.push(canonical);
         }
     }
     Ok(())

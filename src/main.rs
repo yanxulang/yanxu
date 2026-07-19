@@ -255,14 +255,12 @@ fn run_file(path: &str, arguments: &[String]) -> ExitCode {
 }
 
 fn check_file(path: &str) -> ExitCode {
-    let (canonical, statements) = match source_file(path) {
+    let (canonical, source, statements) = match source_file(path) {
         Ok(result) => result,
         Err(error) => return fail(error),
     };
-    if let Ok(source) = fs::read_to_string(&canonical) {
-        for finding in yanxu::migration::analyze(&source) {
-            eprintln!("{}", finding.render(path));
-        }
+    for finding in yanxu::migration::analyze(&source) {
+        eprintln!("{}", finding.render(path));
     }
     match yanxu::type_checker::check_in_directory(
         &statements,
@@ -282,7 +280,7 @@ fn check_file(path: &str) -> ExitCode {
 }
 
 fn run_vm(path: &str, disassemble: bool, arguments: &[String]) -> ExitCode {
-    let (canonical, statements) = match source_file(path) {
+    let (canonical, _, statements) = match source_file(path) {
         Ok(result) => result,
         Err(error) => return fail(error),
     };
@@ -307,7 +305,7 @@ fn run_vm(path: &str, disassemble: bool, arguments: &[String]) -> ExitCode {
 }
 
 fn format_file(path: &str, write: bool) -> ExitCode {
-    let (canonical, statements) = match source_file(path) {
+    let (canonical, _, statements) = match source_file(path) {
         Ok(result) => result,
         Err(error) => return fail(error),
     };
@@ -430,9 +428,9 @@ fn migration_command(arguments: &[String]) -> ExitCode {
     let Some(path) = path else {
         return fail("迁移须给出 .yx 文卷路径");
     };
-    let source = match fs::read_to_string(path) {
+    let (canonical, source) = match module_source_file(Path::new(path)) {
         Ok(source) => source,
-        Err(error) => return fail(format!("不能读取“{path}”：{error}")),
+        Err(error) => return fail(error),
     };
     let (migrated, findings) = yanxu::migration::migrate(&source);
     if findings.is_empty() {
@@ -453,7 +451,7 @@ fn migration_command(arguments: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        MigrationMode::Write => match fs::write(path, migrated) {
+        MigrationMode::Write => match fs::write(&canonical, migrated) {
             Ok(()) => {
                 println!("已迁移：{path}");
                 ExitCode::SUCCESS
@@ -537,13 +535,13 @@ fn benchmark(iterations: usize) -> ExitCode {
 
 fn document_file(path: &str, output: Option<&str>) -> ExitCode {
     let input = Path::new(path);
-    let markdown = if input.is_dir() {
+    let markdown = if fs::symlink_metadata(input).is_ok_and(|metadata| metadata.is_dir()) {
         match yanxu::docgen::markdown_directory(input) {
             Ok(markdown) => markdown,
             Err(error) => return fail(error),
         }
     } else {
-        let (canonical, statements) = match source_file(path) {
+        let (canonical, _, statements) = match source_file(path) {
             Ok(result) => result,
             Err(error) => return fail(error),
         };
@@ -576,10 +574,10 @@ fn document_file(path: &str, output: Option<&str>) -> ExitCode {
 
 fn document_json(path: &str, output: Option<&str>) -> ExitCode {
     let input = Path::new(path);
-    if input.is_dir() {
+    if fs::symlink_metadata(input).is_ok_and(|metadata| metadata.is_dir()) {
         return fail("yanxu 文 --json 当前要求单个模块文卷");
     }
-    let (canonical, statements) = match source_file(path) {
+    let (canonical, _, statements) = match source_file(path) {
         Ok(result) => result,
         Err(error) => return fail(error),
     };
@@ -613,15 +611,46 @@ fn document_json(path: &str, output: Option<&str>) -> ExitCode {
     }
 }
 
-fn source_file(path: &str) -> Result<(PathBuf, Vec<yanxu::ast::Stmt>), String> {
-    let path = Path::new(path);
-    let canonical =
-        fs::canonicalize(path).map_err(|error| format!("不能定位“{}”：{error}", path.display()))?;
-    let source = fs::read_to_string(&canonical)
-        .map_err(|error| format!("不能读取“{}”：{error}", canonical.display()))?;
+fn source_file(path: &str) -> Result<(PathBuf, String, Vec<yanxu::ast::Stmt>), String> {
+    let (canonical, source) = module_source_file(Path::new(path))?;
     let statements =
         parse_named(&source, canonical.display().to_string()).map_err(|error| error.to_string())?;
-    Ok((canonical, statements))
+    Ok((canonical, source, statements))
+}
+
+fn module_source_file(requested: &Path) -> Result<(PathBuf, String), String> {
+    let requested_absolute = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("不能定位当前目录：{error}"))?
+            .join(requested)
+    };
+    let current_base = requested_absolute
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let mut roots = yanxu::package::TrustedPackageRoots::default();
+    let (resolved, _) = roots
+        .resolve_import_file(current_base, &requested_absolute, false)
+        .map_err(module_manifest_error)?;
+    let canonical = resolved.path().to_path_buf();
+    let resolved = resolved.open().map_err(module_manifest_error)?;
+    let source = yanxu::package::read_resolved_module_source_snapshot(resolved)
+        .map_err(|error| format!("不能读取“{}”：{error}", canonical.display()))?;
+    Ok((canonical, source))
+}
+
+fn module_manifest_error(error: yanxu::package::ManifestError) -> String {
+    if error.code() == "PACKAGE000" {
+        error.to_string()
+    } else {
+        format!(
+            "[{}] {}：{}",
+            error.code(),
+            error.path.display(),
+            error.diagnostic_message()
+        )
+    }
 }
 
 fn interactive_repl() -> ExitCode {
