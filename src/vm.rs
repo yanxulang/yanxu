@@ -725,6 +725,7 @@ pub struct Vm {
         Option<Rc<std::collections::BTreeMap<String, crate::application::DecodedNativeModule>>>,
     package_root: Option<PathBuf>,
     package_module_roots: crate::package::TrustedPackageRoots,
+    opened_module_roots_only: bool,
     permissions: crate::permissions::PermissionSet,
     socket_quota: crate::stdlib::SocketQuota,
     arguments: Vec<String>,
@@ -792,6 +793,7 @@ impl Vm {
             application_native_modules: None,
             package_root: None,
             package_module_roots: crate::package::TrustedPackageRoots::default(),
+            opened_module_roots_only: false,
             permissions,
             socket_quota: crate::stdlib::SocketQuota::default(),
             arguments: Vec::new(),
@@ -879,6 +881,24 @@ impl Vm {
         chunk: &Chunk,
         directory: &Path,
     ) -> Result<VmValue, VmError> {
+        self.execute_in_directory_with_optional_roots(chunk, directory, None)
+    }
+
+    pub(crate) fn execute_in_directory_with_opened_roots(
+        &mut self,
+        chunk: &Chunk,
+        directory: &Path,
+        opened_roots: &crate::package::TrustedPackageRoots,
+    ) -> Result<VmValue, VmError> {
+        self.execute_in_directory_with_optional_roots(chunk, directory, Some(opened_roots))
+    }
+
+    fn execute_in_directory_with_optional_roots(
+        &mut self,
+        chunk: &Chunk,
+        directory: &Path,
+        opened_roots: Option<&crate::package::TrustedPackageRoots>,
+    ) -> Result<VmValue, VmError> {
         if chunk.format_version == crate::bytecode::BYTECODE_FORMAT_VERSION {
             crate::bytecode::validate_format(chunk)
                 .map_err(|archive_error| error(&Span::synthetic(), archive_error.to_string()))?;
@@ -891,23 +911,35 @@ impl Vm {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(directory)
         };
-        let directory = fs::canonicalize(&absolute_directory).unwrap_or(absolute_directory);
-        let package_root = crate::package::discover(&directory)
-            .map_err(|runtime_error| package_error(&Span::synthetic(), runtime_error))?
-            .map(|manifest| {
-                fs::canonicalize(&manifest.root).map_err(|runtime_error| {
-                    error(
-                        &Span::synthetic(),
-                        format!(
-                            "不能定位包根目录“{}”：{runtime_error}",
-                            manifest.root.display()
-                        ),
-                    )
+        let directory = if opened_roots.is_some() {
+            absolute_directory
+        } else {
+            fs::canonicalize(&absolute_directory).unwrap_or(absolute_directory)
+        };
+        let package_root = if let Some(opened_roots) = opened_roots {
+            opened_roots
+                .matching_root(&directory)
+                .map(Path::to_path_buf)
+        } else {
+            crate::package::discover(&directory)
+                .map_err(|runtime_error| package_error(&Span::synthetic(), runtime_error))?
+                .map(|manifest| {
+                    fs::canonicalize(&manifest.root).map_err(|runtime_error| {
+                        error(
+                            &Span::synthetic(),
+                            format!(
+                                "不能定位包根目录“{}”：{runtime_error}",
+                                manifest.root.display()
+                            ),
+                        )
+                    })
                 })
-            })
-            .transpose()?;
-        let mut package_module_roots = crate::package::TrustedPackageRoots::default();
-        if let Some(root) = &package_root {
+                .transpose()?
+        };
+        let mut package_module_roots = opened_roots.cloned().unwrap_or_default();
+        if opened_roots.is_none()
+            && let Some(root) = &package_root
+        {
             package_module_roots
                 .insert(root)
                 .map_err(|runtime_error| package_path_error(&Span::synthetic(), runtime_error))?;
@@ -915,6 +947,8 @@ impl Vm {
         let previous_package_root = std::mem::replace(&mut self.package_root, package_root);
         let previous_package_module_roots =
             std::mem::replace(&mut self.package_module_roots, package_module_roots);
+        let previous_opened_module_roots_only =
+            std::mem::replace(&mut self.opened_module_roots_only, opened_roots.is_some());
         let result = self.run_chunk(
             Rc::new(chunk.clone()),
             self.globals.clone(),
@@ -925,6 +959,7 @@ impl Vm {
         );
         self.package_root = previous_package_root;
         self.package_module_roots = previous_package_module_roots;
+        self.opened_module_roots_only = previous_opened_module_roots_only;
         result
     }
 
@@ -4136,13 +4171,21 @@ impl Vm {
             return self.load_application_module(id, directory, span);
         }
         let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            let (dependency, capabilities) =
+            let (dependency, capabilities) = if self.opened_module_roots_only {
+                crate::package::resolve_dependency_scoped_with_opened_capabilities(
+                    &self.package_module_roots,
+                    self.package_root.as_deref(),
+                    directory,
+                    name,
+                )
+            } else {
                 crate::package::resolve_dependency_scoped_with_capabilities(
                     self.package_root.as_deref(),
                     directory,
                     name,
                 )
-                .map_err(|runtime_error| package_error(span, runtime_error))?;
+            }
+            .map_err(|runtime_error| package_error(span, runtime_error))?;
             capabilities
                 .extend(&mut self.package_module_roots)
                 .map_err(|runtime_error| package_path_error(span, runtime_error))?;
@@ -4160,10 +4203,14 @@ impl Vm {
                 .check_file(&joined)
                 .map_err(|permission| error(span, permission.to_string()))?;
         }
-        let (resolved, authority) = self
-            .package_module_roots
-            .resolve_import_file(directory, &joined, package_import)
-            .map_err(|runtime_error| package_error(span, runtime_error))?;
+        let (resolved, authority) = if self.opened_module_roots_only {
+            self.package_module_roots
+                .resolve_import_file_from_opened_roots(directory, &joined, package_import)
+        } else {
+            self.package_module_roots
+                .resolve_import_file(directory, &joined, package_import)
+        }
+        .map_err(|runtime_error| package_error(span, runtime_error))?;
         let canonical = resolved.path().to_path_buf();
         if let Err(permission) = self.permissions.check_file(&canonical)
             && !authority.is_verified()

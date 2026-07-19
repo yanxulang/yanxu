@@ -739,6 +739,38 @@ impl TrustedPackageRoots {
             .map_err(|error| package_path_manifest_error(requested_or_joined, error))?;
         Ok((resolved, authority))
     }
+
+    /// 只从调用方已经打开的根能力解析导入，不再执行环境路径包发现。
+    ///
+    /// 目录工具在完成快照后使用此入口，避免替换目录通过新增更深包清单改变
+    /// 根选择。包外路径一律失败闭合；`包:` 依赖须先把解析所得能力并入本集合。
+    #[doc(hidden)]
+    pub fn resolve_import_file_from_opened_roots(
+        &self,
+        current_base: &Path,
+        requested_or_joined: &Path,
+        allow_cross_package: bool,
+    ) -> Result<(ResolvedImportFile, ModuleAuthority), ManifestError> {
+        self.validate_requested_portability(requested_or_joined)
+            .map_err(|error| package_path_manifest_error(requested_or_joined, error))?;
+        self.validate_requested_import(current_base, requested_or_joined, allow_cross_package)
+            .map_err(|error| package_path_manifest_error(requested_or_joined, error))?;
+        let resolved = self
+            .resolve_existing_module_file(requested_or_joined)
+            .map_err(|error| package_path_manifest_error(requested_or_joined, error))?
+            .ok_or_else(|| {
+                manifest_error(
+                    requested_or_joined,
+                    None,
+                    "模块不属于发现阶段已经打开的工具根",
+                )
+            })?;
+        let canonical = resolved.path().to_path_buf();
+        let authority = self
+            .authorize_module(requested_or_joined, &canonical)
+            .map_err(|error| package_path_manifest_error(requested_or_joined, error))?;
+        Ok((ResolvedImportFile::package(resolved), authority))
+    }
 }
 
 fn open_external_module_file(path: &Path) -> Result<ResolvedPackageFile, ManifestError> {
@@ -879,6 +911,44 @@ pub fn resolve_dependency_scoped_with_capabilities(
     current_base: &Path,
     name: &str,
 ) -> Result<(ResolvedDependency, ResolutionCapabilities), ManifestError> {
+    resolve_dependency_scoped_with_capabilities_inner(None, package_root, current_base, name)
+}
+
+/// 解析目录工具中的包依赖，并证明解析实际使用的应用根就是发现阶段的根能力。
+#[doc(hidden)]
+pub fn resolve_dependency_scoped_with_opened_capabilities(
+    opened_roots: &TrustedPackageRoots,
+    package_root: Option<&Path>,
+    current_base: &Path,
+    name: &str,
+) -> Result<(ResolvedDependency, ResolutionCapabilities), ManifestError> {
+    let expected_root = package_root
+        .or_else(|| opened_roots.matching_root(current_base))
+        .ok_or_else(|| manifest_error(current_base, None, "工具模块没有发现阶段的包根能力"))?;
+    if !opened_roots
+        .revalidate_exact_root(expected_root)
+        .map_err(|error| package_path_manifest_error(expected_root, error))?
+    {
+        return Err(manifest_error(
+            expected_root,
+            None,
+            "工具包根在目录发现后被替换；拒绝重新解析包依赖",
+        ));
+    }
+    resolve_dependency_scoped_with_capabilities_inner(
+        Some(opened_roots),
+        package_root,
+        current_base,
+        name,
+    )
+}
+
+fn resolve_dependency_scoped_with_capabilities_inner(
+    opened_roots: Option<&TrustedPackageRoots>,
+    package_root: Option<&Path>,
+    current_base: &Path,
+    name: &str,
+) -> Result<(ResolvedDependency, ResolutionCapabilities), ManifestError> {
     let manifest = match package_root {
         Some(root) => discover(root)?,
         None => discover(current_base)?,
@@ -892,6 +962,20 @@ pub fn resolve_dependency_scoped_with_capabilities(
     })?;
     let offline = std::env::var_os("YANXU_OFFLINE").is_some();
     let resolved = cached_or_resolve_graph(&manifest, offline)?;
+    if let Some(opened_roots) = opened_roots {
+        let expected_root = opened_roots
+            .exact_root_identity(&resolved.application_root)
+            .is_some();
+        let mut combined = opened_roots.clone();
+        let same_identity = combined.extend_opened(&resolved.application_roots).is_ok();
+        if !expected_root || !same_identity {
+            return Err(manifest_error(
+                &resolved.application_root,
+                None,
+                "工具包根在目录发现后被替换；拒绝重新解析包依赖",
+            ));
+        }
+    }
     let graph = &resolved.graph;
     let canonical_base =
         fs::canonicalize(current_base).unwrap_or_else(|_| current_base.to_path_buf());
@@ -10219,6 +10303,60 @@ mod tests {
 
         fs::remove_dir_all(&dependency).unwrap();
         fs::rename(original, dependency).unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tooling_dependency_resolution_binds_the_discovered_application_root() {
+        let root = temp("tooling-resolution-root");
+        let application = root.join("application");
+        let original = root.join("application-original");
+        let dependency = root.join("dependency");
+        let manifest_text =
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具='../dependency'\n";
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&dependency.join("主.yx"), "公 定 值：数 为 1；\n");
+        write(&application.join(MANIFEST_NAME), manifest_text);
+        write(&application.join("主.yx"), "引「包:工具」为 工具；\n");
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        let mut opened_roots = TrustedPackageRoots::default();
+        opened_roots.insert(&application).unwrap();
+
+        let (resolved, capabilities) = resolve_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &application,
+            "工具",
+        )
+        .unwrap();
+        assert_eq!(
+            read_dependency_entry(&resolved, &capabilities),
+            "公 定 值：数 为 1；\n"
+        );
+
+        fs::rename(&application, &original).unwrap();
+        write(&application.join(MANIFEST_NAME), manifest_text);
+        write(&application.join("主.yx"), "引「包:工具」为 工具；\n");
+        graph_cache()
+            .lock()
+            .expect("graph cache poisoned")
+            .remove(&graph_cache_key(&application));
+        let error = resolve_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &application,
+            "工具",
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("工具包根在目录发现后被替换"),
+            "{error}"
+        );
+
         fs::remove_dir_all(root).ok();
     }
 

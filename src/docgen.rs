@@ -7,7 +7,7 @@ use crate::type_model::{
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const BUILTIN_TYPES: &[(&str, &str)] = &[
     ("数", "有限浮点数"),
@@ -404,6 +404,7 @@ struct DocIndex {
     modules: BTreeMap<ModuleId, DocModule>,
     documented_modules: BTreeSet<ModuleId>,
     trusted_package_roots: crate::package::TrustedPackageRoots,
+    opened_module_roots_only: bool,
 }
 
 impl DocIndex {
@@ -415,6 +416,7 @@ impl DocIndex {
             modules: BTreeMap::from([(module_id, module)]),
             documented_modules: BTreeSet::new(),
             trusted_package_roots: crate::package::TrustedPackageRoots::default(),
+            opened_module_roots_only: false,
         }
     }
 
@@ -486,6 +488,7 @@ impl DocIndex {
             modules: BTreeMap::new(),
             documented_modules: BTreeSet::from([root_module.clone()]),
             trusted_package_roots,
+            opened_module_roots_only: false,
         };
         index.load_module(
             root_module,
@@ -496,7 +499,11 @@ impl DocIndex {
         Ok(index)
     }
 
-    fn from_directory(root: &Path, modules: &[(String, Vec<Stmt>)]) -> Result<Self, String> {
+    fn from_directory(
+        root: &Path,
+        modules: &[(String, Vec<Stmt>)],
+        trusted_package_roots: crate::package::TrustedPackageRoots,
+    ) -> Result<Self, String> {
         let root_module = modules.first().map_or_else(
             || ModuleId::for_source("<空文档目录>"),
             |(name, statements)| module_id_for_statements(statements, name),
@@ -505,7 +512,8 @@ impl DocIndex {
             root_module,
             modules: BTreeMap::new(),
             documented_modules: BTreeSet::new(),
-            trusted_package_roots: trusted_package_roots(root)?,
+            trusted_package_roots,
+            opened_module_roots_only: true,
         };
         for (name, statements) in modules {
             let module_id = module_id_for_statements(statements, name);
@@ -571,9 +579,17 @@ impl DocIndex {
             return Ok(ModuleId::standard(name));
         }
         let (path, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            let (dependency, capabilities) =
+            let (dependency, capabilities) = if self.opened_module_roots_only {
+                crate::package::resolve_dependency_scoped_with_opened_capabilities(
+                    &self.trusted_package_roots,
+                    None,
+                    directory,
+                    name,
+                )
+            } else {
                 crate::package::resolve_dependency_scoped_with_capabilities(None, directory, name)
-                    .map_err(|error| error.to_string())?;
+            }
+            .map_err(|error| error.to_string())?;
             capabilities
                 .extend(&mut self.trusted_package_roots)
                 .map_err(|error| error.to_string())?;
@@ -586,10 +602,14 @@ impl DocIndex {
                 (directory.join(requested), false)
             }
         };
-        let (resolved, _) = self
-            .trusted_package_roots
-            .resolve_import_file(directory, &path, package_import)
-            .map_err(|error| error.to_string())?;
+        let (resolved, _) = if self.opened_module_roots_only {
+            self.trusted_package_roots
+                .resolve_import_file_from_opened_roots(directory, &path, package_import)
+        } else {
+            self.trusted_package_roots
+                .resolve_import_file(directory, &path, package_import)
+        }
+        .map_err(|error| error.to_string())?;
         let canonical = resolved.path().to_path_buf();
         let module_id = ModuleId::for_path(&canonical);
         if self.modules.contains_key(&module_id) {
@@ -769,6 +789,13 @@ fn module_id_for_statements(statements: &[Stmt], fallback: &str) -> ModuleId {
 }
 
 pub fn markdown_directory(path: impl AsRef<Path>) -> Result<String, String> {
+    markdown_directory_with_hook(path, || Ok(()))
+}
+
+fn markdown_directory_with_hook(
+    path: impl AsRef<Path>,
+    after_snapshot: impl FnOnce() -> Result<(), String>,
+) -> Result<String, String> {
     let requested = path.as_ref();
     if fs::symlink_metadata(requested).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(format!("文档入口不得为符号链接“{}”", requested.display()));
@@ -815,6 +842,11 @@ pub fn markdown_directory(path: impl AsRef<Path>) -> Result<String, String> {
     trusted_package_roots
         .insert_discovered(&root)
         .map_err(|error| error.to_string())?;
+    if trusted_package_roots.matching_root(&root).is_none() {
+        trusted_package_roots
+            .insert(&root)
+            .map_err(|error| error.to_string())?;
+    }
     if trusted_package_roots
         .roots()
         .all(|package_root| package_root != root)
@@ -823,23 +855,15 @@ pub fn markdown_directory(path: impl AsRef<Path>) -> Result<String, String> {
             .authorize_module(&requested_absolute, &root)
             .map_err(|error| error.to_string())?;
     }
-    let mut files = Vec::new();
-    let mut portable_paths = BTreeMap::new();
-    visit(
-        &root,
-        &trusted_package_roots,
-        &mut portable_paths,
-        &mut files,
-    )?;
-    files.sort_by_key(|file| documentation_path_key(&trusted_package_roots, file));
+    let files = trusted_package_roots
+        .snapshot_module_directory(&root)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("文档目录不属于已打开的根能力“{}”", root.display()))?;
+    after_snapshot()?;
     let mut modules = Vec::new();
     for file in files {
-        let current_base = file.parent().unwrap_or(&root);
-        let (resolved, _) = trusted_package_roots
-            .resolve_import_file(current_base, &file, false)
-            .map_err(|error| error.to_string())?;
-        let canonical = resolved.path().to_path_buf();
-        let resolved = resolved.open().map_err(|error| error.to_string())?;
+        let canonical = file.path().to_path_buf();
+        let resolved = file.open().map_err(|error| error.to_string())?;
         let source = crate::package::read_resolved_module_source_snapshot(resolved)
             .map_err(|error| format!("不能读取“{}”：{error}", canonical.display()))?;
         let statements = crate::parse_named(&source, canonical.display().to_string())
@@ -853,7 +877,7 @@ pub fn markdown_directory(path: impl AsRef<Path>) -> Result<String, String> {
         modules.push((name, statements));
     }
 
-    let index = DocIndex::from_directory(&root, &modules)?;
+    let index = DocIndex::from_directory(&root, &modules, trusted_package_roots)?;
 
     let mut output = "# 言序模块文档\n\n## 模块索引\n\n".to_owned();
     for (name, _) in &modules {
@@ -872,14 +896,6 @@ pub fn markdown_directory(path: impl AsRef<Path>) -> Result<String, String> {
         output.push_str(&markdown_with_context(name, statements, &context));
     }
     Ok(output)
-}
-
-fn documentation_path_key(roots: &crate::package::TrustedPackageRoots, path: &Path) -> String {
-    roots
-        .matching_root(path)
-        .and_then(|root| path.strip_prefix(root).ok())
-        .and_then(|relative| crate::package::portable_package_path(relative).ok())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 pub fn stable_anchor(kind: &str, name: &str) -> String {
@@ -1413,58 +1429,6 @@ fn trusted_package_roots(directory: &Path) -> Result<crate::package::TrustedPack
     Ok(roots)
 }
 
-fn visit(
-    path: &Path,
-    trusted_package_roots: &crate::package::TrustedPackageRoots,
-    portable_paths: &mut BTreeMap<PathBuf, crate::package::PortablePackagePaths>,
-    files: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    for entry in
-        fs::read_dir(path).map_err(|error| format!("不能读取目录“{}”：{error}", path.display()))?
-    {
-        let path = entry.map_err(|error| error.to_string())?.path();
-        if let Some(root) = trusted_package_roots.matching_root(&path) {
-            let relative = path.strip_prefix(root).expect("matching package root");
-            match crate::package::package_path_decision(
-                relative,
-                crate::package::PackagePathPurpose::YxpEntry,
-            )
-            .map_err(|error| error.to_string())?
-            {
-                crate::package::PackagePathDecision::Include => {}
-                crate::package::PackagePathDecision::Exclude(_) => continue,
-            }
-            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-            let paths = portable_paths.entry(root.to_path_buf()).or_default();
-            if metadata.is_dir() {
-                paths
-                    .insert_directory(relative)
-                    .map_err(|error| error.to_string())?;
-            } else {
-                paths.insert(relative).map_err(|error| error.to_string())?;
-            }
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!("文档目录不得包含符号链接“{}”", path.display()));
-        }
-        let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
-        if metadata.is_dir() {
-            trusted_package_roots
-                .authorize_module(&path, &canonical)
-                .map_err(|error| error.to_string())?;
-            visit(&canonical, trusted_package_roots, portable_paths, files)?;
-        } else if metadata.is_file() && path.extension().is_some_and(|extension| extension == "yx")
-        {
-            trusted_package_roots
-                .authorize_module(&path, &canonical)
-                .map_err(|error| error.to_string())?;
-            files.push(canonical);
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1512,6 +1476,79 @@ mod tests {
         assert!(output.contains("[`甲`](#模块-甲)"));
         assert!(output.contains("[`子/乙`](#模块-子-乙)"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn directory_generation_reads_the_discovered_root_snapshot() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yanxu-doc-snapshot-{unique}"));
+        let backup = root.with_extension("original");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("模块.yx"),
+            "引「辅助.yx」为 辅助；\n公 法 建立（）：辅助.原类 则 归 辅助.原类（）；终\n",
+        )
+        .unwrap();
+        fs::write(root.join("辅助.yx"), "公 类 原类 则 终\n").unwrap();
+
+        let output = markdown_directory_with_hook(&root, || {
+            fs::rename(&root, &backup).map_err(|error| error.to_string())?;
+            fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+            fs::write(
+                root.join("模块.yx"),
+                "引「辅助.yx」为 辅助；\n公 法 建立（）：辅助.替换类 则 归 辅助.替换类（）；终\n",
+            )
+            .map_err(|error| error.to_string())?;
+            fs::write(root.join("辅助.yx"), "公 类 替换类 则 终\n")
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        assert!(
+            output.contains("[`辅助.原类`](#模块-辅助-类-原类)"),
+            "{output}"
+        );
+        assert!(!output.contains("替换类"), "{output}");
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn directory_generation_ignores_a_replacement_nested_package_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yanxu-doc-nested-snapshot-{unique}"));
+        let backup = root.with_extension("original");
+        fs::create_dir_all(root.join("子目录")).unwrap();
+        fs::write(root.join("子目录/入口.yx"), "公 引「辅助.yx」为 辅助；\n").unwrap();
+        fs::write(root.join("子目录/辅助.yx"), "公 定 原值：数 为 1；\n").unwrap();
+
+        let output = markdown_directory_with_hook(&root, || {
+            fs::rename(&root, &backup).map_err(|error| error.to_string())?;
+            fs::create_dir_all(root.join("子目录")).map_err(|error| error.to_string())?;
+            fs::write(
+                root.join("子目录/言序.toml"),
+                "[包]\n格式 = 2\n名称 = \"替换包\"\n版本 = \"0.1.0\"\n言序 = \">=1.1.15\"\n入口 = \"入口.yx\"\n\n[依赖]\n",
+            )
+            .map_err(|error| error.to_string())?;
+            fs::write(
+                root.join("子目录/入口.yx"),
+                "公 引「辅助.yx」为 辅助；\n",
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        assert!(output.contains("`原值`"), "{output}");
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
     }
 
     #[test]
