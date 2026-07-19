@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use syn::visit::{self, Visit};
-use syn::{Expr, Item, ItemFn, Lit, Pat, Type, Visibility};
+use syn::{Attribute, Expr, Item, ItemFn, ItemMod, Lit, Pat, Type, UseTree, Visibility};
 
 const BASELINE_TAG: &str = "v1.1.15";
 const BASELINE_COMMIT: &str = "baba646a666df45c53ac671a15357bfb79b0b6a4";
@@ -194,6 +194,81 @@ impl RepositoryView {
         paths.sort();
         Ok(paths)
     }
+
+    fn rust_sources(&self) -> Result<BTreeMap<String, String>, String> {
+        let mut paths = if let Some(tag) = self.tag {
+            let output = Command::new("git")
+                .args([
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    tag,
+                    "--",
+                    "src",
+                    "crates/yanxu-package/src",
+                ])
+                .current_dir(&self.root)
+                .output()
+                .map_err(|error| format!("cannot list {tag} Rust sources: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "cannot list {tag} Rust sources: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            String::from_utf8(output.stdout)
+                .map_err(|error| format!("Rust source path list is not UTF-8: {error}"))?
+                .lines()
+                .filter(|path| path.ends_with(".rs"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        } else {
+            let mut paths = Vec::new();
+            for directory in ["src", "crates/yanxu-package/src"] {
+                collect_current_rust_paths(&self.root, &self.root.join(directory), &mut paths)?;
+            }
+            paths
+        };
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .map(|path| self.read(&path).map(|source| (path, source)))
+            .collect()
+    }
+}
+
+fn collect_current_rust_paths(
+    repository: &Path,
+    directory: &Path,
+    paths: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("cannot list {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("cannot read entry in {}: {error}", directory.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_current_rust_paths(repository, &path, paths)?;
+        } else if file_type.is_file() && path.extension().is_some_and(|extension| extension == "rs")
+        {
+            let relative = path.strip_prefix(repository).map_err(|error| {
+                format!(
+                    "cannot make {} repository-relative: {error}",
+                    path.display()
+                )
+            })?;
+            paths.push(repository_path(relative)?);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -272,6 +347,283 @@ fn classifies_additions_removals_and_required_fields() {
         classify(&sequence_baseline, &sequence_changed).0,
         RequiredBump::Major
     );
+}
+
+#[test]
+fn reviewed_patch_changes_require_exact_paths_and_values() {
+    let path = "native_and_embedding_abi/rust/yanxu/stdlib/const/BYTES_MAX_VALUE_BYTES/value"
+        .split('/')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let baseline = Value::String("4 * 1024 * 1024".into());
+    let current = Value::String("16 * 1024 * 1024".into());
+    let mut changes = Vec::new();
+    compare_values(&baseline, &current, &mut path.clone(), &mut changes);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].bump, RequiredBump::Patch);
+
+    let changed_again = Value::String("32 * 1024 * 1024".into());
+    let mut changes = Vec::new();
+    compare_values(&baseline, &changed_again, &mut path.clone(), &mut changes);
+    assert_eq!(changes[0].bump, RequiredBump::Major);
+
+    let mut wrong_path = path;
+    *wrong_path.last_mut().unwrap() = "type".into();
+    let mut changes = Vec::new();
+    compare_values(&baseline, &current, &mut wrong_path, &mut changes);
+    assert_eq!(changes[0].bump, RequiredBump::Major);
+}
+
+#[test]
+fn nested_public_rust_addition_requires_minor() {
+    let baseline = fixture_sources(&[
+        ("src/lib.rs", "pub mod api;\n"),
+        ("src/api/mod.rs", "pub struct Stable;\n"),
+        ("crates/yanxu-package/src/lib.rs", ""),
+    ]);
+    let current = fixture_sources(&[
+        ("src/lib.rs", "pub mod api;\n"),
+        ("src/api/mod.rs", "pub struct Stable;\npub fn added() {}\n"),
+        ("crates/yanxu-package/src/lib.rs", ""),
+    ]);
+
+    let baseline = normalized(rust_public_surface_from_sources(&baseline).unwrap());
+    let current = normalized(rust_public_surface_from_sources(&current).unwrap());
+    assert_eq!(classify(&baseline, &current).0, RequiredBump::Minor);
+}
+
+#[test]
+fn doc_hidden_public_rust_addition_is_internal() {
+    let baseline = fixture_sources(&[
+        ("src/lib.rs", "pub mod api;\n"),
+        ("src/api.rs", "pub struct Stable;\n"),
+        ("crates/yanxu-package/src/lib.rs", ""),
+    ]);
+    let current = fixture_sources(&[
+        ("src/lib.rs", "pub mod api;\n"),
+        (
+            "src/api.rs",
+            concat!(
+                "pub struct Stable;\n",
+                "#[doc(hidden)]\npub fn internal() {}\n",
+                "#[doc(hidden)]\npub struct Internal;\n",
+                "impl Internal { pub fn method_on_hidden_type() {} }\n",
+                "impl Stable { #[doc(hidden)] pub fn hidden_method() {} }\n",
+                "mod private;\n",
+                "#[doc(hidden)]\npub use private::*;\n",
+            ),
+        ),
+        ("src/api/private.rs", "pub fn hidden_reexport() {}\n"),
+        ("crates/yanxu-package/src/lib.rs", ""),
+    ]);
+
+    let baseline = normalized(rust_public_surface_from_sources(&baseline).unwrap());
+    let current = normalized(rust_public_surface_from_sources(&current).unwrap());
+    assert_eq!(baseline, current);
+    assert_eq!(classify(&baseline, &current).0, RequiredBump::Patch);
+}
+
+#[test]
+fn package_crate_reexported_public_addition_requires_minor() {
+    let baseline = fixture_sources(&[
+        ("src/lib.rs", ""),
+        (
+            "crates/yanxu-package/src/lib.rs",
+            "mod package;\npub use package::*;\n",
+        ),
+        (
+            "crates/yanxu-package/src/package.rs",
+            "pub fn stable() {}\n",
+        ),
+    ]);
+    let current = fixture_sources(&[
+        ("src/lib.rs", ""),
+        (
+            "crates/yanxu-package/src/lib.rs",
+            "mod package;\npub use package::*;\n",
+        ),
+        (
+            "crates/yanxu-package/src/package.rs",
+            "pub fn stable() {}\npub fn added() {}\n",
+        ),
+    ]);
+
+    let baseline = normalized(rust_public_surface_from_sources(&baseline).unwrap());
+    let current = normalized(rust_public_surface_from_sources(&current).unwrap());
+    assert_eq!(classify(&baseline, &current).0, RequiredBump::Minor);
+}
+
+#[test]
+fn collects_public_rust_item_kinds_and_impl_members() {
+    let sources = fixture_sources(&[
+        (
+            "src/lib.rs",
+            concat!(
+                "pub fn function() {}\n",
+                "pub struct Record { pub field: u8, private: u8 }\n",
+                "pub enum Choice { First }\n",
+                "pub union Bits { pub integer: u32, pub number: f32 }\n",
+                "pub type Alias = u8;\n",
+                "pub const LIMIT: u8 = 1;\n",
+                "pub static VALUE: u8 = 1;\n",
+                "pub trait Contract { fn call(&self); }\n",
+                "pub use external::Thing;\n",
+                "#[macro_export]\nmacro_rules! exported { () => {} }\n",
+                "struct Private;\n",
+                "impl Private { pub fn not_publicly_reachable() {} }\n",
+                "impl Record {\n",
+                "    pub fn new() -> Self { Self { field: 0, private: 0 } }\n",
+                "    pub const ZERO: u8 = 0;\n",
+                "    pub type Item = u8;\n",
+                "}\n",
+            ),
+        ),
+        ("crates/yanxu-package/src/lib.rs", ""),
+    ]);
+    let surface = collect_crate_public_surface(&sources, "src/lib.rs")
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for expected in [
+        "fn/function",
+        "struct/Record",
+        "enum/Choice",
+        "union/Bits",
+        "type/Alias",
+        "const/LIMIT",
+        "static/VALUE",
+        "trait/Contract",
+        "use/external :: Thing",
+        "macro/exported",
+        "impl/Record/fn/new",
+        "impl/Record/const/ZERO",
+        "impl/Record/type/Item",
+    ] {
+        assert!(
+            surface.contains(expected),
+            "missing Rust surface {expected}"
+        );
+    }
+    assert!(!surface.contains("impl/Private/fn/not_publicly_reachable"));
+}
+
+#[test]
+fn public_constant_value_and_type_changes_require_review() {
+    let baseline = fixture_sources(&[
+        (
+            "src/lib.rs",
+            concat!(
+                "pub struct Record;\n",
+                "pub const LIMIT: u8 = 1;\n",
+                "pub static VALUE: u8 = 1;\n",
+                "impl Record { pub const ZERO: u8 = 0; }\n",
+            ),
+        ),
+        ("crates/yanxu-package/src/lib.rs", ""),
+    ]);
+    let changed_values = fixture_sources(&[
+        (
+            "src/lib.rs",
+            concat!(
+                "pub struct Record;\n",
+                "pub const LIMIT: u8 = 2;\n",
+                "pub static VALUE: u8 = 2;\n",
+                "impl Record { pub const ZERO: u8 = 1; }\n",
+            ),
+        ),
+        ("crates/yanxu-package/src/lib.rs", ""),
+    ]);
+    let changed_type = fixture_sources(&[
+        (
+            "src/lib.rs",
+            concat!(
+                "pub struct Record;\n",
+                "pub const LIMIT: u16 = 2;\n",
+                "pub static VALUE: u8 = 2;\n",
+                "impl Record { pub const ZERO: u8 = 1; }\n",
+            ),
+        ),
+        ("crates/yanxu-package/src/lib.rs", ""),
+    ]);
+
+    let baseline = normalized(rust_public_surface_from_sources(&baseline).unwrap());
+    let changed_values = normalized(rust_public_surface_from_sources(&changed_values).unwrap());
+    let changed_type = normalized(rust_public_surface_from_sources(&changed_type).unwrap());
+    assert_ne!(baseline, changed_values);
+    assert_eq!(classify(&baseline, &changed_values).0, RequiredBump::Major);
+    assert_eq!(classify(&baseline, &changed_type).0, RequiredBump::Major);
+}
+
+#[test]
+fn named_reexport_does_not_expose_unselected_public_items() {
+    let sources = fixture_sources(&[
+        ("src/lib.rs", ""),
+        (
+            "crates/yanxu-package/src/lib.rs",
+            "mod private;\npub use private::Selected;\n",
+        ),
+        (
+            "crates/yanxu-package/src/private.rs",
+            concat!(
+                "pub struct Selected;\n",
+                "impl Selected { pub fn selected_method() {} }\n",
+                "pub struct NotSelected;\n",
+                "impl NotSelected { pub fn unselected_method() {} }\n",
+                "pub fn unselected_function() {}\n",
+            ),
+        ),
+    ]);
+    let surface = collect_crate_public_surface(&sources, "crates/yanxu-package/src/lib.rs")
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    assert!(surface.contains("private/struct/Selected"));
+    assert!(surface.contains("impl/private::Selected/fn/selected_method"));
+    assert!(!surface.contains("private/struct/NotSelected"));
+    assert!(!surface.contains("impl/private::NotSelected/fn/unselected_method"));
+    assert!(!surface.contains("private/fn/unselected_function"));
+}
+
+#[test]
+fn inherent_impl_in_another_module_is_part_of_the_public_type_surface() {
+    let sources = fixture_sources(&[
+        ("src/lib.rs", "pub mod api;\npub mod extensions;\n"),
+        ("src/api.rs", "pub struct Public;\nstruct Private;\n"),
+        (
+            "src/extensions.rs",
+            concat!(
+                "impl crate::api::Public { pub fn cross_module() {} }\n",
+                "pub struct Local;\n",
+                "impl Local { pub fn local() {} }\n",
+            ),
+        ),
+        ("crates/yanxu-package/src/lib.rs", ""),
+    ]);
+    let surface = collect_crate_public_surface(&sources, "src/lib.rs")
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    assert!(surface.contains("impl/api::Public/fn/cross_module"));
+    assert!(surface.contains("impl/extensions::Local/fn/local"));
+}
+
+fn fixture_sources(files: &[(&str, &str)]) -> BTreeMap<String, String> {
+    files
+        .iter()
+        .map(|(path, source)| ((*path).to_owned(), (*source).to_owned()))
+        .collect()
 }
 
 #[test]
@@ -940,105 +1292,823 @@ fn collect_string_literals(stream: TokenStream, output: &mut Vec<String>) {
 }
 
 fn rust_public_surface(view: &RepositoryView) -> Result<Value, String> {
-    let mut files = Map::new();
-    for path in ["src/lib.rs", "src/embed.rs", "src/ffi.rs"] {
-        files.insert(path.into(), public_items(&view.read(path)?)?);
-    }
-    Ok(Value::Object(files))
+    rust_public_surface_from_sources(&view.rust_sources()?)
 }
 
-fn public_items(source: &str) -> Result<Value, String> {
-    let file = parse_source(source)?;
-    let mut items = Map::new();
-    for item in file.items {
-        match item {
-            Item::Fn(item) if is_public(&item.vis) => {
-                items.insert(
-                    format!("fn/{}", item.sig.ident),
-                    Value::String(compact_tokens(&item.sig)),
-                );
-            }
-            Item::Struct(item) if is_public(&item.vis) => {
-                let signature = format!(
-                    "{} {} {}",
-                    contract_attributes(&item.attrs),
-                    compact_tokens(&item.generics),
-                    public_struct_fields(&item.fields)
-                );
-                items.insert(format!("struct/{}", item.ident), Value::String(signature));
-            }
-            Item::Enum(item) if is_public(&item.vis) => {
-                let signature = format!(
-                    "{} {} {}",
-                    contract_attributes(&item.attrs),
-                    compact_tokens(&item.generics),
-                    compact_tokens(&item.variants)
-                );
-                items.insert(format!("enum/{}", item.ident), Value::String(signature));
-            }
-            Item::Type(item) if is_public(&item.vis) => {
-                items.insert(
-                    format!("type/{}", item.ident),
-                    Value::String(compact_tokens(&item)),
-                );
-            }
-            Item::Const(item) if is_public(&item.vis) => {
-                items.insert(
-                    format!("const/{}", item.ident),
-                    Value::String(compact_tokens(&item)),
-                );
-            }
-            Item::Static(item) if is_public(&item.vis) => {
-                items.insert(
-                    format!("static/{}", item.ident),
-                    Value::String(compact_tokens(&item)),
-                );
-            }
-            Item::Trait(item) if is_public(&item.vis) => {
-                items.insert(
-                    format!("trait/{}", item.ident),
-                    Value::String(compact_tokens(&item)),
-                );
-            }
-            Item::Mod(item) if is_public(&item.vis) => {
-                items.insert(format!("mod/{}", item.ident), Value::Bool(true));
-            }
-            Item::Use(item) if is_public(&item.vis) => {
-                items.insert(
-                    format!("use/{}", compact_tokens(&item.tree)),
-                    Value::Bool(true),
-                );
-            }
-            Item::Impl(item) => {
-                let owner = compact_tokens(&item.self_ty);
-                for member in item.items {
-                    match member {
-                        syn::ImplItem::Fn(method) if is_public(&method.vis) => {
-                            items.insert(
-                                format!("impl/{owner}/fn/{}", method.sig.ident),
-                                Value::String(compact_tokens(&method.sig)),
-                            );
+fn rust_public_surface_from_sources(sources: &BTreeMap<String, String>) -> Result<Value, String> {
+    Ok(json!({
+        "yanxu": collect_crate_public_surface(sources, "src/lib.rs")?,
+        "yanxu_package": collect_crate_public_surface(
+            sources,
+            "crates/yanxu-package/src/lib.rs",
+        )?,
+    }))
+}
+
+fn collect_crate_public_surface(
+    sources: &BTreeMap<String, String>,
+    entry: &str,
+) -> Result<Value, String> {
+    if !sources.contains_key(entry) {
+        return Err(format!("cannot find Rust crate entry {entry}"));
+    }
+    let module_directory = Path::new(entry)
+        .parent()
+        .ok_or_else(|| format!("Rust crate entry {entry} has no parent directory"))?;
+    let mut collector = RustPublicCollector {
+        sources,
+        surface: Map::new(),
+        reachable_types: BTreeSet::new(),
+        pending_impls: Vec::new(),
+        macro_visited: BTreeSet::new(),
+    };
+    collector.collect_file(entry, module_directory, &[], &ExportSelection::All)?;
+    collector.collect_exported_macros_file(entry, module_directory, &[])?;
+    collector.finish_impls();
+    Ok(Value::Object(collector.surface))
+}
+
+struct RustPublicCollector<'a> {
+    sources: &'a BTreeMap<String, String>,
+    surface: Map<String, Value>,
+    reachable_types: BTreeSet<String>,
+    pending_impls: Vec<PendingImpl>,
+    macro_visited: BTreeSet<String>,
+}
+
+struct PendingImpl {
+    owner_candidates: Vec<String>,
+    members: Vec<(String, Value)>,
+}
+
+#[derive(Debug, Clone)]
+enum ExportSelection {
+    All,
+    Names(BTreeSet<String>),
+}
+
+impl ExportSelection {
+    fn includes(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Names(names) => names.contains(name),
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        match (&mut *self, other) {
+            (Self::All, _) => {}
+            (selection, Self::All) => *selection = Self::All,
+            (Self::Names(names), Self::Names(other)) => names.extend(other),
+        }
+    }
+}
+
+impl RustPublicCollector<'_> {
+    fn collect_file(
+        &mut self,
+        source_path: &str,
+        module_directory: &Path,
+        module_path: &[String],
+        selection: &ExportSelection,
+    ) -> Result<(), String> {
+        let source = self
+            .sources
+            .get(source_path)
+            .ok_or_else(|| format!("cannot find Rust module source {source_path}"))?;
+        let file = parse_source(source).map_err(|error| format!("{source_path}: {error}"))?;
+        self.collect_items(
+            &file.items,
+            source_path,
+            module_directory,
+            module_path,
+            selection,
+        )
+    }
+
+    fn collect_items(
+        &mut self,
+        items: &[Item],
+        source_path: &str,
+        module_directory: &Path,
+        module_path: &[String],
+        selection: &ExportSelection,
+    ) -> Result<(), String> {
+        let modules = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Mod(module) => Some((module.ident.to_string(), module)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        for item in items {
+            match item {
+                Item::Fn(item)
+                    if selected_public(&item.sig.ident, &item.vis, &item.attrs, selection) =>
+                {
+                    self.insert(
+                        module_path,
+                        format!("fn/{}", item.sig.ident),
+                        Value::String(compact_tokens(&item.sig)),
+                    );
+                }
+                Item::Struct(item)
+                    if selected_public(&item.ident, &item.vis, &item.attrs, selection) =>
+                {
+                    self.reachable_types
+                        .insert(type_surface_key(module_path, &item.ident.to_string()));
+                    let signature = format!(
+                        "{} {} {} {}",
+                        contract_attributes(&item.attrs),
+                        compact_tokens(&item.generics),
+                        compact_tokens(&item.generics.where_clause),
+                        public_struct_fields(&item.fields)
+                    );
+                    self.insert(
+                        module_path,
+                        format!("struct/{}", item.ident),
+                        Value::String(signature),
+                    );
+                }
+                Item::Enum(item)
+                    if selected_public(&item.ident, &item.vis, &item.attrs, selection) =>
+                {
+                    self.reachable_types
+                        .insert(type_surface_key(module_path, &item.ident.to_string()));
+                    let signature = format!(
+                        "{} {} {} {}",
+                        contract_attributes(&item.attrs),
+                        compact_tokens(&item.generics),
+                        compact_tokens(&item.generics.where_clause),
+                        public_enum_variants(&item.variants)
+                    );
+                    self.insert(
+                        module_path,
+                        format!("enum/{}", item.ident),
+                        Value::String(signature),
+                    );
+                }
+                Item::Union(item)
+                    if selected_public(&item.ident, &item.vis, &item.attrs, selection) =>
+                {
+                    self.reachable_types
+                        .insert(type_surface_key(module_path, &item.ident.to_string()));
+                    let signature = format!(
+                        "{} {} {} {}",
+                        contract_attributes(&item.attrs),
+                        compact_tokens(&item.generics),
+                        compact_tokens(&item.generics.where_clause),
+                        public_named_fields(&item.fields),
+                    );
+                    self.insert(
+                        module_path,
+                        format!("union/{}", item.ident),
+                        Value::String(signature),
+                    );
+                }
+                Item::Type(item)
+                    if selected_public(&item.ident, &item.vis, &item.attrs, selection) =>
+                {
+                    self.insert(
+                        module_path,
+                        format!("type/{}", item.ident),
+                        Value::String(compact_tokens(item)),
+                    );
+                }
+                Item::Const(item)
+                    if selected_public(&item.ident, &item.vis, &item.attrs, selection) =>
+                {
+                    self.insert(
+                        module_path,
+                        format!("const/{}", item.ident),
+                        public_const_surface(item),
+                    );
+                }
+                Item::Static(item)
+                    if selected_public(&item.ident, &item.vis, &item.attrs, selection) =>
+                {
+                    self.insert(
+                        module_path,
+                        format!("static/{}", item.ident),
+                        Value::String(public_static_signature(item)),
+                    );
+                }
+                Item::Trait(item)
+                    if selected_public(&item.ident, &item.vis, &item.attrs, selection) =>
+                {
+                    self.insert(
+                        module_path,
+                        format!("trait/{}", item.ident),
+                        Value::String(public_trait_surface(item)),
+                    );
+                }
+                Item::TraitAlias(item)
+                    if selected_public(&item.ident, &item.vis, &item.attrs, selection) =>
+                {
+                    self.insert(
+                        module_path,
+                        format!("trait_alias/{}", item.ident),
+                        Value::String(compact_tokens(item)),
+                    );
+                }
+                Item::Mod(module)
+                    if selected_public(&module.ident, &module.vis, &module.attrs, selection) =>
+                {
+                    self.insert(
+                        module_path,
+                        format!("mod/{}", module.ident),
+                        Value::Bool(true),
+                    );
+                    self.collect_module(
+                        module,
+                        source_path,
+                        module_directory,
+                        module_path,
+                        &ExportSelection::All,
+                    )?;
+                }
+                Item::Use(item)
+                    if visible_public(&item.vis, &item.attrs)
+                        && selection_includes_use(selection, &item.tree) =>
+                {
+                    self.insert(
+                        module_path,
+                        format!("use/{}", compact_tokens(&item.tree)),
+                        Value::Bool(true),
+                    );
+                    for (root, nested_selection) in local_use_selections(&item.tree) {
+                        if let Some(module) = modules.get(&root) {
+                            self.collect_module(
+                                module,
+                                source_path,
+                                module_directory,
+                                module_path,
+                                &nested_selection,
+                            )?;
                         }
-                        syn::ImplItem::Const(value) if is_public(&value.vis) => {
-                            items.insert(
-                                format!("impl/{owner}/const/{}", value.ident),
-                                Value::String(compact_tokens(&value)),
-                            );
-                        }
-                        syn::ImplItem::Type(value) if is_public(&value.vis) => {
-                            items.insert(
-                                format!("impl/{owner}/type/{}", value.ident),
-                                Value::String(compact_tokens(&value)),
-                            );
-                        }
-                        _ => {}
                     }
                 }
+                Item::Impl(item) if item.trait_.is_none() && !is_doc_hidden(&item.attrs) => {
+                    if let Some(pending) = pending_public_impl(item, module_path) {
+                        self.pending_impls.push(pending);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_module(
+        &mut self,
+        module: &ItemMod,
+        source_path: &str,
+        module_directory: &Path,
+        parent_module_path: &[String],
+        selection: &ExportSelection,
+    ) -> Result<(), String> {
+        let mut module_path = parent_module_path.to_vec();
+        module_path.push(module.ident.to_string());
+        if let Some((_, items)) = &module.content {
+            return self.collect_items(
+                items,
+                source_path,
+                &module_directory.join(module.ident.to_string()),
+                &module_path,
+                selection,
+            );
+        }
+
+        let resolved = resolve_module_source(self.sources, module_directory, module)?;
+        let resolved_path = Path::new(&resolved);
+        let parent = resolved_path
+            .parent()
+            .ok_or_else(|| format!("Rust module source {resolved} has no parent directory"))?;
+        let child_directory = if resolved_path
+            .file_name()
+            .is_some_and(|name| name == "mod.rs")
+        {
+            parent.to_owned()
+        } else {
+            parent.join(module.ident.to_string())
+        };
+        self.collect_file(&resolved, &child_directory, &module_path, selection)
+    }
+
+    fn collect_exported_macros_file(
+        &mut self,
+        source_path: &str,
+        module_directory: &Path,
+        module_path: &[String],
+    ) -> Result<(), String> {
+        let source = self
+            .sources
+            .get(source_path)
+            .ok_or_else(|| format!("cannot find Rust module source {source_path}"))?;
+        let file = parse_source(source).map_err(|error| format!("{source_path}: {error}"))?;
+        self.collect_exported_macros_items(&file.items, source_path, module_directory, module_path)
+    }
+
+    fn collect_exported_macros_items(
+        &mut self,
+        items: &[Item],
+        source_path: &str,
+        module_directory: &Path,
+        module_path: &[String],
+    ) -> Result<(), String> {
+        let visit_key = format!("{source_path}\0{}", module_path.join("::"));
+        if !self.macro_visited.insert(visit_key) {
+            return Ok(());
+        }
+        for item in items {
+            match item {
+                Item::Macro(item)
+                    if has_attribute(&item.attrs, "macro_export")
+                        && !is_doc_hidden(&item.attrs) =>
+                {
+                    let Some(ident) = &item.ident else {
+                        continue;
+                    };
+                    self.surface.insert(
+                        format!("macro/{ident}"),
+                        Value::String(compact_tokens(&item.mac)),
+                    );
+                }
+                Item::Mod(module) => {
+                    let mut child_module_path = module_path.to_vec();
+                    child_module_path.push(module.ident.to_string());
+                    if let Some((_, items)) = &module.content {
+                        self.collect_exported_macros_items(
+                            items,
+                            source_path,
+                            &module_directory.join(module.ident.to_string()),
+                            &child_module_path,
+                        )?;
+                    } else {
+                        let resolved =
+                            resolve_module_source(self.sources, module_directory, module)?;
+                        let resolved_path = Path::new(&resolved);
+                        let parent = resolved_path.parent().ok_or_else(|| {
+                            format!("Rust module source {resolved} has no parent directory")
+                        })?;
+                        let child_directory = if resolved_path
+                            .file_name()
+                            .is_some_and(|name| name == "mod.rs")
+                        {
+                            parent.to_owned()
+                        } else {
+                            parent.join(module.ident.to_string())
+                        };
+                        self.collect_exported_macros_file(
+                            &resolved,
+                            &child_directory,
+                            &child_module_path,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_impls(&mut self) {
+        for pending in std::mem::take(&mut self.pending_impls) {
+            let owner = pending
+                .owner_candidates
+                .iter()
+                .find(|candidate| self.reachable_types.contains(*candidate))
+                .cloned();
+            let Some(owner) = owner else {
+                continue;
+            };
+            for (member, value) in pending.members {
+                self.surface.insert(format!("impl/{owner}/{member}"), value);
+            }
+        }
+    }
+
+    fn insert(&mut self, module_path: &[String], item: String, value: Value) {
+        let key = if module_path.is_empty() {
+            item
+        } else {
+            format!("{}/{}", module_path.join("/"), item)
+        };
+        self.surface.insert(key, value);
+    }
+}
+
+fn resolve_module_source(
+    sources: &BTreeMap<String, String>,
+    module_directory: &Path,
+    module: &ItemMod,
+) -> Result<String, String> {
+    if let Some(explicit) = module_path_attribute(&module.attrs)? {
+        let path = repository_path(&module_directory.join(explicit))?;
+        return sources.contains_key(&path).then_some(path).ok_or_else(|| {
+            format!(
+                "cannot find #[path] source for module {} declared under {}",
+                module.ident,
+                module_directory.display()
+            )
+        });
+    }
+
+    let stem = module_directory.join(module.ident.to_string());
+    let candidates = [stem.with_extension("rs"), stem.join("mod.rs")]
+        .into_iter()
+        .map(|path| repository_path(&path))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|path| sources.contains_key(path))
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err(format!(
+            "cannot find source for module {} declared under {}",
+            module.ident,
+            module_directory.display()
+        )),
+        _ => Err(format!(
+            "module {} has ambiguous sources: {}",
+            module.ident,
+            candidates.join(", ")
+        )),
+    }
+}
+
+fn module_path_attribute(attributes: &[Attribute]) -> Result<Option<PathBuf>, String> {
+    let mut path = None;
+    for attribute in attributes {
+        if !attribute.path().is_ident("path") {
+            continue;
+        }
+        let syn::Meta::NameValue(value) = &attribute.meta else {
+            return Err("Rust module #[path] must be a string value".into());
+        };
+        let Expr::Lit(literal) = &value.value else {
+            return Err("Rust module #[path] must be a string literal".into());
+        };
+        let Lit::Str(value) = &literal.lit else {
+            return Err("Rust module #[path] must be a string literal".into());
+        };
+        if path.replace(PathBuf::from(value.value())).is_some() {
+            return Err("Rust module has more than one #[path] attribute".into());
+        }
+    }
+    Ok(path)
+}
+
+fn repository_path(path: &Path) -> Result<String, String> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                components.pop().ok_or_else(|| {
+                    format!("repository path escapes its root: {}", path.display())
+                })?;
+            }
+            std::path::Component::Normal(component) => {
+                components.push(
+                    component.to_str().ok_or_else(|| {
+                        format!("repository path is not UTF-8: {}", path.display())
+                    })?,
+                );
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!(
+                    "repository path is not relative: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(components.join("/"))
+}
+
+#[derive(Debug)]
+struct UseTarget {
+    path: Vec<String>,
+    glob: bool,
+}
+
+fn local_use_selections(tree: &UseTree) -> BTreeMap<String, ExportSelection> {
+    let mut targets = Vec::new();
+    collect_use_targets(tree, &mut Vec::new(), &mut targets);
+    let mut selections = BTreeMap::new();
+    for mut target in targets {
+        while target
+            .path
+            .first()
+            .is_some_and(|name| matches!(name.as_str(), "self" | "crate" | "super"))
+        {
+            target.path.remove(0);
+        }
+        if target.path.is_empty() {
+            continue;
+        }
+        let root = target.path.remove(0);
+        let selection = if target.glob || target.path.is_empty() {
+            ExportSelection::All
+        } else {
+            ExportSelection::Names(BTreeSet::from([target.path.remove(0)]))
+        };
+        selections
+            .entry(root)
+            .and_modify(|existing: &mut ExportSelection| existing.merge(selection.clone()))
+            .or_insert(selection);
+    }
+    selections
+}
+
+fn collect_use_targets(tree: &UseTree, prefix: &mut Vec<String>, targets: &mut Vec<UseTarget>) {
+    match tree {
+        UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            collect_use_targets(&path.tree, prefix, targets);
+            prefix.pop();
+        }
+        UseTree::Name(name) => {
+            let mut path = prefix.clone();
+            path.push(name.ident.to_string());
+            targets.push(UseTarget { path, glob: false });
+        }
+        UseTree::Rename(rename) => {
+            let mut path = prefix.clone();
+            path.push(rename.ident.to_string());
+            targets.push(UseTarget { path, glob: false });
+        }
+        UseTree::Group(group) => {
+            for tree in &group.items {
+                collect_use_targets(tree, prefix, targets);
+            }
+        }
+        UseTree::Glob(_) => targets.push(UseTarget {
+            path: prefix.clone(),
+            glob: true,
+        }),
+    }
+}
+
+fn selection_includes_use(selection: &ExportSelection, tree: &UseTree) -> bool {
+    let ExportSelection::Names(selected) = selection else {
+        return true;
+    };
+    let mut exported = BTreeSet::new();
+    if collect_use_export_names(tree, &mut exported) {
+        return true;
+    }
+    !selected.is_disjoint(&exported)
+}
+
+fn collect_use_export_names(tree: &UseTree, names: &mut BTreeSet<String>) -> bool {
+    match tree {
+        UseTree::Path(path) => collect_use_export_names(&path.tree, names),
+        UseTree::Name(name) => {
+            names.insert(name.ident.to_string());
+            false
+        }
+        UseTree::Rename(rename) => {
+            names.insert(rename.rename.to_string());
+            false
+        }
+        UseTree::Group(group) => group.items.iter().fold(false, |glob, tree| {
+            collect_use_export_names(tree, names) || glob
+        }),
+        UseTree::Glob(_) => true,
+    }
+}
+
+fn selected_public(
+    ident: &syn::Ident,
+    visibility: &Visibility,
+    attributes: &[Attribute],
+    selection: &ExportSelection,
+) -> bool {
+    visible_public(visibility, attributes) && selection.includes(&ident.to_string())
+}
+
+fn visible_public(visibility: &Visibility, attributes: &[Attribute]) -> bool {
+    is_public(visibility) && !is_doc_hidden(attributes)
+}
+
+fn is_doc_hidden(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        if !attribute.path().is_ident("doc") {
+            return false;
+        }
+        let mut hidden = false;
+        let _ = attribute.parse_nested_meta(|meta| {
+            if meta.path.is_ident("hidden") {
+                hidden = true;
+            }
+            Ok(())
+        });
+        hidden
+    })
+}
+
+fn pending_public_impl(item: &syn::ItemImpl, module_path: &[String]) -> Option<PendingImpl> {
+    let (segments, root_qualified) = self_type_segments(&item.self_ty)?;
+    let mut owner_candidates = Vec::new();
+    if root_qualified || segments.first().is_some_and(|segment| segment == "crate") {
+        owner_candidates.push(
+            segments
+                .iter()
+                .filter(|segment| segment.as_str() != "crate")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("::"),
+        );
+    } else if segments.first().is_some_and(|segment| segment == "self") {
+        owner_candidates.push(
+            module_path
+                .iter()
+                .cloned()
+                .chain(segments.iter().skip(1).cloned())
+                .collect::<Vec<_>>()
+                .join("::"),
+        );
+    } else if segments.first().is_some_and(|segment| segment == "super") {
+        let mut base = module_path.to_vec();
+        let mut remainder = segments.as_slice();
+        while remainder.first().is_some_and(|segment| segment == "super") {
+            base.pop()?;
+            remainder = &remainder[1..];
+        }
+        owner_candidates.push(
+            base.into_iter()
+                .chain(remainder.iter().cloned())
+                .collect::<Vec<_>>()
+                .join("::"),
+        );
+    } else {
+        owner_candidates.push(
+            module_path
+                .iter()
+                .cloned()
+                .chain(segments.iter().cloned())
+                .collect::<Vec<_>>()
+                .join("::"),
+        );
+        if module_path.is_empty() {
+            owner_candidates.push(segments.join("::"));
+        }
+    }
+    owner_candidates.retain(|candidate| !candidate.is_empty());
+    owner_candidates.dedup();
+
+    let context = format!(
+        "{} {}",
+        compact_tokens(&item.generics),
+        compact_tokens(&item.generics.where_clause),
+    );
+    let mut members = Vec::new();
+    for member in &item.items {
+        match member {
+            syn::ImplItem::Fn(method) if visible_public(&method.vis, &method.attrs) => {
+                members.push((
+                    format!("fn/{}", method.sig.ident),
+                    Value::String(format!("{context} {}", compact_tokens(&method.sig))),
+                ));
+            }
+            syn::ImplItem::Const(value) if visible_public(&value.vis, &value.attrs) => {
+                members.push((
+                    format!("const/{}", value.ident),
+                    Value::String(format!("{context} {}", public_impl_const_signature(value))),
+                ));
+            }
+            syn::ImplItem::Type(value) if visible_public(&value.vis, &value.attrs) => {
+                members.push((
+                    format!("type/{}", value.ident),
+                    Value::String(format!("{context} {}", compact_tokens(value))),
+                ));
             }
             _ => {}
         }
     }
-    Ok(Value::Object(items))
+    (!members.is_empty()).then_some(PendingImpl {
+        owner_candidates,
+        members,
+    })
+}
+
+fn self_type_segments(ty: &Type) -> Option<(Vec<String>, bool)> {
+    let ty = match ty {
+        Type::Group(group) => group.elem.as_ref(),
+        Type::Paren(paren) => paren.elem.as_ref(),
+        other => other,
+    };
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    Some((
+        path.path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect(),
+        path.path.leading_colon.is_some(),
+    ))
+}
+
+fn type_surface_key(module_path: &[String], name: &str) -> String {
+    if module_path.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}::{name}", module_path.join("::"))
+    }
+}
+
+fn public_const_surface(item: &syn::ItemConst) -> Value {
+    json!({
+        "generics": compact_tokens(&item.generics),
+        "type": compact_tokens(&item.ty),
+        "where": compact_tokens(&item.generics.where_clause),
+        "value": compact_tokens(&item.expr),
+    })
+}
+
+fn public_static_signature(item: &syn::ItemStatic) -> String {
+    format!(
+        "{} {} {}",
+        compact_tokens(&item.mutability),
+        compact_tokens(&item.ty),
+        compact_tokens(&item.expr),
+    )
+}
+
+fn public_impl_const_signature(item: &syn::ImplItemConst) -> String {
+    format!(
+        "{} {} {} {}",
+        compact_tokens(&item.generics),
+        compact_tokens(&item.ty),
+        compact_tokens(&item.generics.where_clause),
+        compact_tokens(&item.expr),
+    )
+}
+
+fn has_attribute(attributes: &[Attribute], name: &str) -> bool {
+    attributes
+        .iter()
+        .any(|attribute| attribute.path().is_ident(name))
+}
+
+fn public_enum_variants(
+    variants: &syn::punctuated::Punctuated<syn::Variant, syn::Token![,]>,
+) -> String {
+    variants
+        .iter()
+        .filter(|variant| !is_doc_hidden(&variant.attrs))
+        .map(|variant| {
+            let discriminant = variant
+                .discriminant
+                .as_ref()
+                .map(|(_, expression)| compact_tokens(expression))
+                .unwrap_or_default();
+            format!(
+                "{} {} {} {discriminant}",
+                contract_attributes(&variant.attrs),
+                variant.ident,
+                compact_tokens(&variant.fields),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn public_trait_surface(item: &syn::ItemTrait) -> String {
+    let members = item
+        .items
+        .iter()
+        .filter(|member| !trait_item_doc_hidden(member))
+        .map(compact_tokens)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{} {} {} {} {} {} {members}",
+        contract_attributes(&item.attrs),
+        compact_tokens(&item.unsafety),
+        compact_tokens(&item.auto_token),
+        compact_tokens(&item.generics),
+        compact_tokens(&item.supertraits),
+        compact_tokens(&item.generics.where_clause),
+    )
+}
+
+fn trait_item_doc_hidden(item: &syn::TraitItem) -> bool {
+    match item {
+        syn::TraitItem::Const(item) => is_doc_hidden(&item.attrs),
+        syn::TraitItem::Fn(item) => is_doc_hidden(&item.attrs),
+        syn::TraitItem::Type(item) => is_doc_hidden(&item.attrs),
+        syn::TraitItem::Macro(item) => is_doc_hidden(&item.attrs),
+        syn::TraitItem::Verbatim(_) => false,
+        _ => false,
+    }
 }
 
 fn contract_attributes(attributes: &[syn::Attribute]) -> String {
@@ -1055,7 +2125,24 @@ fn contract_attributes(attributes: &[syn::Attribute]) -> String {
 fn public_struct_fields(fields: &syn::Fields) -> String {
     fields
         .iter()
-        .filter(|field| is_public(&field.vis))
+        .filter(|field| visible_public(&field.vis, &field.attrs))
+        .map(|field| {
+            let name = field
+                .ident
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            format!("{name}:{}", compact_tokens(&field.ty))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn public_named_fields(fields: &syn::FieldsNamed) -> String {
+    fields
+        .named
+        .iter()
+        .filter(|field| visible_public(&field.vis, &field.attrs))
         .map(|field| {
             let name = field
                 .ident
@@ -1277,11 +2364,42 @@ fn compare_values(
         }
         _ if baseline == current => {}
         _ => changes.push(SurfaceChange {
-            bump: RequiredBump::Major,
+            bump: reviewed_patch_change(path, baseline, current)
+                .then_some(RequiredBump::Patch)
+                .unwrap_or(RequiredBump::Major),
             kind: "changed",
             path: display_path(path),
         }),
     }
+}
+
+fn reviewed_patch_change(path: &[String], baseline: &Value, current: &Value) -> bool {
+    let (Some(baseline), Some(current)) = (baseline.as_str(), current.as_str()) else {
+        return false;
+    };
+    [
+        (
+            "/native_and_embedding_abi/rust/yanxu/stdlib/const/BYTES_MAX_VALUE_BYTES/value",
+            "4 * 1024 * 1024",
+            "16 * 1024 * 1024",
+        ),
+        (
+            "/native_and_embedding_abi/rust/yanxu/stdlib/const/PROCESS_MAX_TIMEOUT_MILLIS/value",
+            "300_000",
+            "24 * 60 * 60 * 1_000",
+        ),
+        (
+            "/native_and_embedding_abi/rust/yanxu_package/package/const/DEFAULT_REGISTRY/value",
+            "\"https://packages.yanxu.dev/v1\"",
+            "\"https://get.yanxu.dev/packages/v1\"",
+        ),
+    ]
+    .into_iter()
+    .any(|(approved_path, approved_baseline, approved_current)| {
+        display_path(path) == approved_path
+            && baseline == approved_baseline
+            && current == approved_current
+    })
 }
 
 fn addition_bump(path: &[String], current: &Value) -> RequiredBump {

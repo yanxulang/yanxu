@@ -14,7 +14,8 @@ use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 pub const API_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const BYTES_MAX_VALUE_BYTES: usize = crate::budget::MAX_BYTE_VALUE_BYTES as usize;
+pub const BYTES_MAX_VALUE_BYTES: usize = 16 * 1024 * 1024;
+const _: () = assert!(BYTES_MAX_VALUE_BYTES as u64 == crate::budget::MAX_BYTE_VALUE_BYTES);
 pub const SECURE_RANDOM_MAX_BYTES: usize = 1024 * 1024;
 pub const PROCESS_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const PROCESS_MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1_000;
@@ -1068,7 +1069,8 @@ impl std::fmt::Display for NetworkError {
 
 impl std::error::Error for NetworkError {}
 
-pub const SOCKET_MAX_READ_BYTES: u64 = crate::budget::MAX_SOCKET_READ_BYTES;
+pub const SOCKET_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+const _: () = assert!(SOCKET_MAX_READ_BYTES == crate::budget::MAX_SOCKET_READ_BYTES);
 pub const SOCKET_MAX_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 pub const SOCKET_MAX_OPEN_RESOURCES: usize = 128;
 pub const SOCKET_MAX_OPEN_LISTENERS: usize = 16;

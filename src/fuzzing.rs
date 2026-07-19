@@ -33,6 +33,7 @@ pub fn bytecode_archive(data: &[u8]) {
     }
 }
 
+#[doc(hidden)]
 pub fn application_archive(data: &[u8]) {
     if let Ok(archive) = crate::application::deserialize(data) {
         let encoded =
@@ -41,6 +42,7 @@ pub fn application_archive(data: &[u8]) {
     }
 }
 
+#[doc(hidden)]
 pub fn manifest(data: &[u8]) {
     let Some(path) = structured_input_path("manifest", crate::package::MANIFEST_NAME, data) else {
         return;
@@ -48,6 +50,7 @@ pub fn manifest(data: &[u8]) {
     let _ = crate::package::load(path);
 }
 
+#[doc(hidden)]
 pub fn lockfile(data: &[u8]) {
     let Some(path) = structured_input_path("lock", crate::package::LOCK_NAME, data) else {
         return;
@@ -55,6 +58,7 @@ pub fn lockfile(data: &[u8]) {
     let _ = crate::package::read_lock(path);
 }
 
+#[doc(hidden)]
 pub fn engineering_protocol(data: &[u8]) {
     if data.len() > STRUCTURED_INPUT_LIMIT {
         return;
