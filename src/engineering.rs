@@ -14,6 +14,21 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub const ENGINEERING_PROTOCOL_VERSION: u32 = 1;
+const AUDIT_CAPABILITY_SCHEMA_VERSION: u64 = 1;
+const AUDIT_CAPABILITY_CHECKS: [&str; 12] = [
+    "lock_checksum_sha256",
+    "source_transport",
+    "git_exact_revision",
+    "spdx_license",
+    "registry_yanked",
+    "registry_vulnerabilities",
+    "duplicate_versions",
+    "target_match",
+    "native_abi",
+    "native_target",
+    "native_checksum",
+    "native_provenance",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineeringError {
@@ -113,8 +128,18 @@ fn handshake() -> Value {
             "v2": crate::native_abi_v2::capabilities(),
         },
         "permission_capabilities": package::PERMISSION_CAPABILITIES,
+        "operation_capabilities": {
+            "audit": audit_capabilities(),
+        },
         "target": package::current_target(),
         "operations": ["handshake", "template", "inspect", "edit", "edit_application", "resolve", "graph", "plan_update", "outdated", "why", "doctor", "workspace", "pack", "bundle", "vendor", "audit"],
+    })
+}
+
+fn audit_capabilities() -> Value {
+    json!({
+        "schema_version": AUDIT_CAPABILITY_SCHEMA_VERSION,
+        "checks": AUDIT_CAPABILITY_CHECKS,
     })
 }
 
@@ -466,6 +491,7 @@ fn audit(request: &Value) -> Result<Value, EngineeringError> {
         })
         .collect::<Vec<_>>();
     Ok(json!({
+        "audit_capabilities": audit_capabilities(),
         "ok": warnings == 0,
         "warnings": warnings,
         "packages": graph.packages.len(),
@@ -1139,6 +1165,53 @@ mod tests {
         let path = path.as_ref();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn audit_declares_and_echoes_the_stable_capability() {
+        let expected = json!({
+            "schema_version": 1,
+            "checks": [
+                "lock_checksum_sha256",
+                "source_transport",
+                "git_exact_revision",
+                "spdx_license",
+                "registry_yanked",
+                "registry_vulnerabilities",
+                "duplicate_versions",
+                "target_match",
+                "native_abi",
+                "native_target",
+                "native_checksum",
+                "native_provenance",
+            ],
+        });
+        let handshake = handle(&json!({
+            "protocol_version": ENGINEERING_PROTOCOL_VERSION,
+            "operation": "handshake",
+        }))
+        .unwrap();
+        assert_eq!(handshake["operation_capabilities"]["audit"], expected);
+
+        let root = temporary_root("audit-capability");
+        write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='审计能力'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(root.join("主.yx"), "言 1；\n");
+        let result = handle(&json!({
+            "protocol_version": ENGINEERING_PROTOCOL_VERSION,
+            "operation": "audit",
+            "path": root,
+            "offline": true,
+        }))
+        .unwrap();
+        assert_eq!(result["audit_capabilities"], expected);
+        assert_eq!(
+            result["audit_capabilities"],
+            handshake["operation_capabilities"]["audit"]
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
