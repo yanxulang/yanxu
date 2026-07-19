@@ -3796,19 +3796,12 @@ impl Vm {
                 checksum: module.metadata.checksum.clone(),
                 size: module.metadata.size,
             };
-            let authority = if matches!(package_name, "yanxu-gui" | "言窗")
-                && self.permissions.graphical_interface_allowed()
-            {
-                native_abi_v2::NativeLoadAuthority::OfficialGui
-            } else {
-                native_abi_v2::NativeLoadAuthority::NativeExtension
-            };
             let extension = native_abi_v2::NativeExtensionV2::load_verified_bytes(
                 &module.bytes,
                 &artifact,
                 &self.permissions,
                 package_name,
-                authority,
+                native_abi_v2::NativeLoadAuthority::NativeExtension,
             )
             .map_err(|runtime_error| native_v2_error(span, runtime_error))?;
             let extension = Rc::new(extension);
@@ -3843,20 +3836,12 @@ impl Vm {
         }
         let dependency = matches.pop().expect("one native dependency");
         let artifact = dependency.locked.native.as_ref().expect("filtered native");
-        let authority = if artifact.abi == native_abi_v2::NATIVE_ABI_VERSION_V2
-            && matches!(package_name, "yanxu-gui" | "言窗")
-            && self.permissions.graphical_interface_allowed()
-        {
-            native_abi_v2::NativeLoadAuthority::OfficialGui
-        } else {
-            native_abi_v2::NativeLoadAuthority::NativeExtension
-        };
         let extension = native_abi_v2::NativeExtensionV2::load_verified(
             dependency.root.join(&artifact.path),
             artifact,
             &self.permissions,
             package_name,
-            authority,
+            native_abi_v2::NativeLoadAuthority::NativeExtension,
         )
         .map_err(|runtime_error| native_v2_error(span, runtime_error))?;
         let extension = Rc::new(extension);

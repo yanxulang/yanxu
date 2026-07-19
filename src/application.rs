@@ -1087,6 +1087,11 @@ fn validate_native_modules(
             package::NATIVE_ARTIFACT_MAX_COUNT
         )));
     }
+    if !archive.native_modules.is_empty() && !archive.permissions.native_extensions {
+        return Err(application_error(
+            "YXB 包含原生模块；应用必须在顶层【权限】中显式申请 原生扩展 = true，图形界面权限不能代替原生加载授权",
+        ));
+    }
     let mut total = 0_u64;
     let mut decoded = BTreeMap::new();
     for (package_name, module) in &archive.native_modules {
@@ -1724,7 +1729,8 @@ mod tests {
 
     #[test]
     fn yxb_native_modules_reject_tampering_target_paths_and_count_attacks() {
-        let (root, mut archive) = compile_test_application("言 1；\n", "图形界面=true");
+        let (root, mut archive) =
+            compile_test_application("言 1；\n", "图形界面=true\n原生扩展=true");
         let bytes = b"locked native bytes";
         let checksum = format!("{:x}", Sha256::digest(bytes));
         let module = ApplicationNativeModule {
@@ -1743,6 +1749,19 @@ mod tests {
             .insert("yanxu-gui".into(), module.clone());
         archive.content_checksum = archive_checksum(&archive).unwrap();
         assert_eq!(decode_native_modules(&archive).unwrap().len(), 1);
+
+        let mut gui_only = archive.clone();
+        gui_only.permissions.native_extensions = false;
+        gui_only.content_checksum = archive_checksum(&gui_only).unwrap();
+        let error = validate_archive(&gui_only).unwrap_err();
+        assert!(error.message.contains("原生扩展 = true"), "{error}");
+        assert!(
+            serialize(&gui_only)
+                .unwrap_err()
+                .message
+                .contains("原生扩展")
+        );
+
         let serialized = serialize(&archive).unwrap();
         let decoded = deserialize(&serialized).unwrap();
         assert_eq!(decoded.native_modules, archive.native_modules);
