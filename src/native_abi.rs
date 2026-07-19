@@ -33,17 +33,15 @@ const NATIVE_MAX_ERROR_CODE_BYTES: usize = 256;
 const NATIVE_MAX_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Opens an already verified library with a dependency search policy that does
-/// not consult the process current directory on Windows. The DLL's own private
-/// content-addressed directory and trusted system/application locations remain
-/// available for legitimate dependencies.
+/// not consult the process current directory, application directory, or user
+/// DLL directories on Windows. Only the private content-addressed directory and
+/// System32 remain available for dependencies declared by the verified image.
 #[cfg(all(not(target_family = "wasm"), target_os = "windows"))]
 pub(crate) unsafe fn load_dynamic_library_safely(
     path: &Path,
 ) -> Result<libloading::Library, libloading::Error> {
-    use libloading::os::windows::{
-        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-    };
-    let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+    use libloading::os::windows::{LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
     // SAFETY: The caller owns the verified path and accepts module initialization.
     unsafe { libloading::os::windows::Library::load_with_flags(path, flags) }
         .map(libloading::Library::from)
@@ -53,8 +51,11 @@ pub(crate) unsafe fn load_dynamic_library_safely(
 pub(crate) unsafe fn load_dynamic_library_safely(
     path: &Path,
 ) -> Result<libloading::Library, libloading::Error> {
-    // SAFETY: The caller owns the verified path and accepts module initialization.
-    unsafe { libloading::Library::new(path) }
+    use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
+
+    // SAFETY: The caller owns the verified path and accepts module initialization. Eager
+    // resolution prevents a later call from discovering a dependency that escaped validation.
+    unsafe { Library::open(Some(path), RTLD_NOW | RTLD_LOCAL) }.map(libloading::Library::from)
 }
 
 pub type NativeFreeBytes = unsafe extern "C" fn(*mut u8, usize);
@@ -391,7 +392,7 @@ fn reopen_staged_file(file: &std::fs::File, share_mode: u32) -> Result<std::fs::
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn absolute_native_artifact_path(path: &Path) -> Result<PathBuf, NativeError> {
+pub(crate) fn absolute_native_artifact_path(path: &Path) -> Result<PathBuf, NativeError> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
@@ -401,7 +402,9 @@ fn absolute_native_artifact_path(path: &Path) -> Result<PathBuf, NativeError> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn open_native_artifact(path: &Path) -> Result<crate::package::ResolvedPackageFile, NativeError> {
+pub(crate) fn open_native_artifact(
+    path: &Path,
+) -> Result<crate::package::ResolvedPackageFile, NativeError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

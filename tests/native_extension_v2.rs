@@ -11,7 +11,7 @@ use yanxu::native_abi_v2::{
     NATIVE_V2_INTEGER, NATIVE_V2_OK, NativeExtensionV2, NativeLoadAuthority, NativeV2CallResult,
     YanxuNativeErrorV2, YanxuNativeHostV2, YanxuValueV2,
 };
-use yanxu::package::NativeArtifact;
+use yanxu::package::{NativeArtifact, PackagePathPurpose, TrustedPackageRoots};
 use yanxu::permissions::PermissionSet;
 
 fn library_path() -> PathBuf {
@@ -180,6 +180,202 @@ fn v2_rejects_gui_only_authority_even_for_official_names() {
             assert!(denied.message.contains("原生扩展"));
         }
     }
+}
+
+#[test]
+fn v2_rejects_authenticated_bytes_that_are_not_a_host_dynamic_library() {
+    let bytes = b"authenticated-but-not-a-dynamic-library";
+    let artifact = NativeArtifact {
+        abi: 2,
+        target: yanxu::package::current_target(),
+        path: "invalid-native-library".into(),
+        checksum: format!("{:x}", Sha256::digest(bytes)),
+        size: bytes.len() as u64,
+    };
+    let failure = match NativeExtensionV2::load_verified_bytes(
+        bytes,
+        &artifact,
+        &PermissionSet::sandboxed().allow_native_extensions(),
+        "v2-example",
+        NativeLoadAuthority::NativeExtension,
+    ) {
+        Ok(_) => panic!("非动态库字节不得进入系统装载器"),
+        Err(error) => error,
+    };
+    assert_eq!(failure.code, "NATIVE_FORMAT");
+}
+
+fn temporary_native_root(tag: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "yanxu-native-v2-{tag}-{}-{unique}",
+        std::process::id()
+    ))
+}
+
+#[test]
+fn opened_v2_artifact_token_does_not_follow_same_length_path_replacement() {
+    let source_library = library_path();
+    let root = temporary_native_root("file-token");
+    std::fs::create_dir_all(&root).unwrap();
+    let library = root.join(format!("extension{}", std::env::consts::DLL_SUFFIX));
+    std::fs::copy(&source_library, &library).unwrap();
+    let artifact = artifact(&library);
+    let mut roots = TrustedPackageRoots::new();
+    roots.insert(&root).unwrap();
+    let source = roots
+        .resolve_existing_file(&library, PackagePathPurpose::ManifestReference)
+        .unwrap()
+        .unwrap();
+
+    let parked = root.join(format!("parked{}", std::env::consts::DLL_SUFFIX));
+    let replaced = std::fs::rename(&library, &parked).is_ok();
+    if replaced {
+        std::fs::write(&library, vec![0_u8; artifact.size as usize]).unwrap();
+    }
+    let extension = NativeExtensionV2::load_verified_file(
+        source,
+        &artifact,
+        &PermissionSet::sandboxed().allow_native_extensions(),
+        "v2-example",
+        NativeLoadAuthority::NativeExtension,
+    )
+    .unwrap();
+    assert_eq!(extension.name(), "v2-example");
+    if replaced {
+        assert_eq!(std::fs::metadata(&library).unwrap().len(), artifact.size);
+        assert_ne!(
+            format!("{:x}", Sha256::digest(std::fs::read(&library).unwrap())),
+            artifact.checksum
+        );
+    }
+    drop(extension);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn opened_v2_artifact_token_does_not_follow_replaced_package_root() {
+    let source_library = library_path();
+    let root = temporary_native_root("root-token");
+    std::fs::create_dir_all(&root).unwrap();
+    let library = root.join(format!("extension{}", std::env::consts::DLL_SUFFIX));
+    std::fs::copy(&source_library, &library).unwrap();
+    let artifact = artifact(&library);
+    let mut roots = TrustedPackageRoots::new();
+    roots.insert(&root).unwrap();
+    let source = roots
+        .resolve_existing_file(&library, PackagePathPurpose::ManifestReference)
+        .unwrap()
+        .unwrap();
+
+    let parked = root.with_extension("opened-root");
+    let replaced = std::fs::rename(&root, &parked).is_ok();
+    if replaced {
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(format!("extension{}", std::env::consts::DLL_SUFFIX)),
+            vec![0_u8; artifact.size as usize],
+        )
+        .unwrap();
+    }
+    let extension = NativeExtensionV2::load_verified_file(
+        source,
+        &artifact,
+        &PermissionSet::sandboxed().allow_native_extensions(),
+        "v2-example",
+        NativeLoadAuthority::NativeExtension,
+    )
+    .unwrap();
+    assert_eq!(extension.name(), "v2-example");
+    drop(extension);
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    if parked.exists() {
+        std::fs::remove_dir_all(&parked).unwrap();
+    }
+}
+
+#[test]
+fn vm_rejects_transitive_native_package_without_a_direct_dependency_edge() {
+    let source_library = library_path();
+    let root = temporary_native_root("transitive-edge");
+    let middle = root.join("middle");
+    let native = root.join("native");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(middle.join("src")).unwrap();
+    std::fs::create_dir_all(native.join("src")).unwrap();
+    let staged_name = format!("backend{}", std::env::consts::DLL_SUFFIX);
+    let staged_library = native.join(&staged_name);
+    std::fs::copy(&source_library, &staged_library).unwrap();
+    let bytes = std::fs::read(&staged_library).unwrap();
+    let checksum = format!("{:x}", Sha256::digest(&bytes));
+    let (os, architecture) = if cfg!(target_os = "windows") {
+        (
+            "windows",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            },
+        )
+    } else if cfg!(target_os = "macos") {
+        (
+            "macos",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            },
+        )
+    } else {
+        (
+            "linux",
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            },
+        )
+    };
+    std::fs::write(
+        native.join("言序.toml"),
+        format!(
+            "[包]\n格式=2\n名称='v2-example'\n版本='0.1.0'\n言序='>=1.1.7'\n入口='src/主.yx'\n[导出]\n默认='src/主.yx'\n[\"原生\"]\nABI=2\n[\"原生\".{os}.{architecture}]\n文件='{staged_name}'\n校验和='{checksum}'\n大小={}\n",
+            bytes.len()
+        ),
+    )
+    .unwrap();
+    std::fs::write(native.join("src/主.yx"), "公 定 ABI：数 为 2；\n").unwrap();
+    std::fs::write(
+        middle.join("言序.toml"),
+        "[包]\n格式=2\n名称='middle'\n版本='0.1.0'\n言序='>=1.1.7'\n入口='src/主.yx'\n[依赖]\n后端={包='v2-example',路径='../native',版='^0.1'}\n[导出]\n默认='src/主.yx'\n",
+    )
+    .unwrap();
+    std::fs::write(middle.join("src/主.yx"), "公 定 值：数 为 1；\n").unwrap();
+    std::fs::write(
+        root.join("言序.toml"),
+        "[包]\n格式=2\n名称='transitive-native-test'\n版本='0.1.0'\n言序='>=1.1.7'\n入口='src/主.yx'\n[依赖]\n中间={包='middle',路径='middle',版='^0.1'}\n[权限]\n原生扩展=true\n[导出]\n默认='src/主.yx'\n",
+    )
+    .unwrap();
+    let source = "引「标准:原生」为 原生；定 后端 为 原生.加载（「v2-example」）；";
+    let entry = root.join("src/主.yx");
+    std::fs::write(&entry, source).unwrap();
+    let statements = yanxu::parse_named(source, entry.display().to_string()).unwrap();
+    let chunk = yanxu::bytecode::compile(&statements).unwrap();
+    let mut vm = yanxu::vm::Vm::silent();
+    let failure = vm
+        .execute_in_directory(&chunk, entry.parent().unwrap())
+        .unwrap_err();
+    assert!(
+        failure.message.contains("当前包没有直接声明"),
+        "意外错误：{}",
+        failure.message
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
