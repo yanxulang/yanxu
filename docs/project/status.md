@@ -4,7 +4,7 @@
 
 ## 当前版本
 
-- 当前源码版本：`1.1.17`
+- 当前源码版本：`1.1.18`
 - 正式语言规范：版本 `1`
 - 最早受兼容语料持续验证的源码版本：`0.3`
 - Rust 最低支持版本：`1.89`；六个原生目标与 WASI 均在最低版本工具链执行构建门禁
@@ -27,7 +27,7 @@
 ```json
 {
   "status_schema": 1,
-  "current_version": "1.1.17",
+  "current_version": "1.1.18",
   "language_spec_version": 1,
   "manifest_format": { "current": 2, "readable": [1, 2] },
   "lock_format": { "current": 2, "readable": [1, 2] },
