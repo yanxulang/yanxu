@@ -66,22 +66,7 @@ impl ProjectLock {
 
         #[cfg(not(target_os = "wasi"))]
         {
-            for attempt in 0..CACHE_LOCK_BIND_ATTEMPTS {
-                match Self::acquire_under_once(root, components) {
-                    Ok(lock) => return Ok(lock),
-                    Err(error)
-                        if attempt + 1 < CACHE_LOCK_BIND_ATTEMPTS
-                            && matches!(
-                                error.kind(),
-                                io::ErrorKind::NotFound | io::ErrorKind::Interrupted
-                            ) =>
-                    {
-                        std::thread::yield_now();
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            unreachable!("bounded cache-lock binding loop always returns")
+            Self::acquire_under_with_hook(root, components, || {})
         }
         #[cfg(target_os = "wasi")]
         {
@@ -92,7 +77,35 @@ impl ProjectLock {
     }
 
     #[cfg(not(target_os = "wasi"))]
-    fn acquire_under_once(root: &Path, components: &[&str]) -> io::Result<Self> {
+    fn acquire_under_with_hook(
+        root: &Path,
+        components: &[&str],
+        mut before_file_open: impl FnMut(),
+    ) -> io::Result<Self> {
+        for attempt in 0..CACHE_LOCK_BIND_ATTEMPTS {
+            match Self::acquire_under_once(root, components, &mut before_file_open) {
+                Ok(lock) => return Ok(lock),
+                Err(error)
+                    if attempt + 1 < CACHE_LOCK_BIND_ATTEMPTS
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::Interrupted
+                        ) =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded cache-lock binding loop always returns")
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    fn acquire_under_once(
+        root: &Path,
+        components: &[&str],
+        before_file_open: &mut impl FnMut(),
+    ) -> io::Result<Self> {
         let mut directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
         for component in components {
             match directory.create_dir(component) {
@@ -116,6 +129,7 @@ impl ProjectLock {
             .truncate(false)
             .follow(FollowSymlinks::No)
             .nonblock(true);
+        before_file_open();
         let file = state.open_with(LOCK_NAME, &options)?.into_std();
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata_is_reparse(&metadata) {
@@ -315,6 +329,26 @@ mod tests {
         atomic_write(&path, b"complete\n").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"complete\n");
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_lock_rebinds_after_its_open_directory_is_removed() {
+        let root = temp("lock-rebind");
+        fs::create_dir_all(&root).unwrap();
+        let lock_root = root.join(".locks").join("checksum");
+        let mut removed = false;
+        let lock = ProjectLock::acquire_under_with_hook(&root, &[".locks", "checksum"], || {
+            if !removed {
+                fs::remove_dir_all(&lock_root).unwrap();
+                removed = true;
+            }
+        })
+        .unwrap();
+        assert!(removed);
+        assert!(lock_root.join(".yanxu/package.lock").is_file());
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

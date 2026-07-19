@@ -7397,119 +7397,15 @@ fn acquire_resolution_generation_lock(
             ));
         }
     }
-    #[cfg(not(target_os = "wasi"))]
-    let lock = {
-        let mut cache_roots = TrustedPackageRoots::new();
-        cache_roots
-            .insert(cache)
-            .map_err(|error| package_path_manifest_error(cache, error))?;
-        let cache_directory = cache_roots
-            .clone_exact_root_directory(cache)
-            .map_err(|error| {
-                manifest_error(
-                    cache,
-                    None,
-                    format!("不能复制依赖 generation 缓存根句柄：{error}"),
-                )
-            })?
-            .ok_or_else(|| manifest_error(cache, None, "依赖 generation 缓存根句柄不存在"))?;
-        let locks_directory = cache_directory
-            .open_dir_nofollow(".locks")
-            .map_err(|error| {
-                manifest_error(
-                    &locks,
-                    None,
-                    format!("不能按目录能力打开依赖 generation 缓存锁目录：{error}"),
-                )
-            })?;
-        match locks_directory.create_dir(checksum) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(manifest_error(
-                    &lock_root,
-                    None,
-                    format!("不能按目录能力创建依赖 generation 缓存锁组件：{error}"),
-                ));
-            }
-        }
-        let lock_directory = locks_directory
-            .open_dir_nofollow(checksum)
-            .map_err(|error| {
-                manifest_error(
-                    &lock_root,
-                    None,
-                    format!("不能按目录能力打开依赖 generation 缓存锁组件：{error}"),
-                )
-            })?;
-        match lock_directory.create_dir(".yanxu") {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(manifest_error(
-                    lock_root.join(".yanxu"),
-                    None,
-                    format!("不能按目录能力创建依赖 generation 缓存锁状态：{error}"),
-                ));
-            }
-        }
-        let state_directory = lock_directory
-            .open_dir_nofollow(".yanxu")
-            .map_err(|error| {
-                manifest_error(
-                    lock_root.join(".yanxu"),
-                    None,
-                    format!("不能按目录能力打开依赖 generation 缓存锁状态：{error}"),
-                )
-            })?;
-        let mut options = cap_std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .follow(FollowSymlinks::No)
-            .nonblock(true);
-        let file = state_directory
-            .open_with("package.lock", &options)
-            .map_err(|error| {
-                manifest_error(
-                    lock_root.join(".yanxu/package.lock"),
-                    None,
-                    format!("不能按目录能力打开依赖 generation 缓存锁文件：{error}"),
-                )
-            })?
-            .into_std();
-        let metadata = file.metadata().map_err(|error| {
-            manifest_error(
-                lock_root.join(".yanxu/package.lock"),
-                None,
-                format!("不能检查已打开的依赖 generation 缓存锁文件：{error}"),
-            )
-        })?;
-        if !is_regular_file_metadata(&metadata) {
-            return Err(manifest_error(
-                lock_root.join(".yanxu/package.lock"),
-                None,
-                "依赖 generation 缓存锁文件不得为链接、重解析点或特殊文件",
-            ));
-        }
-        crate::storage::ProjectLock::acquire_opened(file).map_err(|error| {
+    let lock = crate::storage::ProjectLock::acquire_under(cache, &[".locks", checksum]).map_err(
+        |error| {
             manifest_error(
                 &lock_root,
                 None,
                 format!("不能取得依赖 generation 缓存锁：{error}"),
             )
-        })?
-    };
-    #[cfg(target_os = "wasi")]
-    let lock = crate::storage::ProjectLock::acquire(&lock_root).map_err(|error| {
-        manifest_error(
-            &lock_root,
-            None,
-            format!("不能取得依赖 generation 缓存锁：{error}"),
-        )
-    })?;
+        },
+    )?;
     let canonical_lock = fs::canonicalize(&lock_root).map_err(|error| {
         manifest_error(
             &lock_root,
