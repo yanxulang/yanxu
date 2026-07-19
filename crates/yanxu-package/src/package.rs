@@ -24,6 +24,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use unicode_normalization::UnicodeNormalization;
 
 pub const MANIFEST_NAME: &str = "言序.toml";
 pub const LOCK_NAME: &str = "言序.lock";
@@ -45,6 +46,7 @@ const REGISTRY_RELEASE_URL_MAX_BYTES: usize = 4_096;
 const REGISTRY_VULNERABILITY_MAX_COUNT: usize = 1_024;
 const REGISTRY_VULNERABILITY_ID_MAX_BYTES: usize = 256;
 const REGISTRY_VULNERABILITY_SUMMARY_MAX_BYTES: usize = 8_192;
+const MANIFEST_TOML_SYNTAX_ERROR: &str = "TOML 格式无效；请检查对应行的语法";
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,29 +194,39 @@ pub enum Dependency {
 impl fmt::Display for Dependency {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Path { path, requirement } => write!(
-                formatter,
-                "路径 {}{}",
-                path.display(),
-                requirement
-                    .as_ref()
-                    .map_or_else(String::new, |version| format!(" ({version})"))
-            ),
+            Self::Path { path, requirement } => {
+                let path = safe_local_source_path_for_display(path);
+                write!(
+                    formatter,
+                    "路径 {path}{}",
+                    requirement
+                        .as_ref()
+                        .map_or_else(String::new, |version| format!(" ({version})"))
+                )
+            }
             Self::Git {
                 url,
                 revision,
                 requirement,
-            } => write!(
-                formatter,
-                "Git {url}#{revision}{}",
-                requirement
-                    .as_ref()
-                    .map_or_else(String::new, |version| format!(" ({version})"))
-            ),
+            } => {
+                let url = safe_git_source_value_for_display(url);
+                let revision = safe_git_revision_for_display(revision);
+                write!(
+                    formatter,
+                    "Git {url}#{revision}{}",
+                    requirement
+                        .as_ref()
+                        .map_or_else(String::new, |version| format!(" ({version})"))
+                )
+            }
             Self::Registry {
                 requirement,
                 registry,
-            } => write!(formatter, "索引 {registry} ({requirement})"),
+            } => write!(
+                formatter,
+                "索引 {} ({requirement})",
+                safe_registry_source_value_for_display(registry)
+            ),
         }
     }
 }
@@ -673,7 +685,8 @@ pub fn read_lock(path: impl AsRef<Path>) -> Result<LockFile, ManifestError> {
     let text = fs::read_to_string(path)
         .map_err(|error| manifest_error(path, None, format!("不能读取锁文件：{error}")))?;
     let lock: LockFile = toml::from_str(&text)
-        .map_err(|error| manifest_error(path, None, format!("锁文件格式无效：{error}")))?;
+        .map_err(|_| manifest_error(path, None, "锁文件格式无效；请检查或重新生成锁文件"))?;
+    validate_lock_source_security(path, &lock)?;
     if !SUPPORTED_LOCK_FORMATS.contains(&lock.lock_version) {
         return Err(manifest_error(
             path,
@@ -773,6 +786,10 @@ pub fn edit_dependency(
 ) -> Result<Manifest, ManifestError> {
     validate_package_name(alias)
         .map_err(|message| manifest_error(manifest_path.as_ref(), None, message))?;
+    if let Some(dependency) = dependency {
+        validate_dependency_source_security(dependency)
+            .map_err(|message| manifest_error(manifest_path.as_ref(), None, message))?;
+    }
     let manifest_path = manifest_path.as_ref();
     let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let _project_lock = acquire_project_lock(root)?;
@@ -781,7 +798,7 @@ pub fn edit_dependency(
     load(manifest_path)?;
     let normalized = normalize_manifest_toml(&original);
     let mut document: toml::Value = toml::from_str(&normalized)
-        .map_err(|error| manifest_error(manifest_path, None, error.to_string()))?;
+        .map_err(|error| sanitized_manifest_toml_error(manifest_path, &normalized, &error))?;
     let root = document
         .as_table_mut()
         .ok_or_else(|| manifest_error(manifest_path, None, "清单根必须为 TOML 表"))?;
@@ -853,7 +870,7 @@ pub fn edit_application(
     load(manifest_path)?;
     let normalized = normalize_manifest_toml(&original);
     let mut document: toml::Value = toml::from_str(&normalized)
-        .map_err(|error| manifest_error(manifest_path, None, error.to_string()))?;
+        .map_err(|error| sanitized_manifest_toml_error(manifest_path, &normalized, &error))?;
     let document = document
         .as_table_mut()
         .ok_or_else(|| manifest_error(manifest_path, None, "清单根必须为 TOML 表"))?;
@@ -1024,16 +1041,8 @@ fn cached_or_resolve_graph(
 
 fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestError> {
     let normalized = normalize_manifest_toml(text);
-    let document: toml::Value = toml::from_str(&normalized).map_err(|error| {
-        let line = error.span().map(|span| {
-            normalized[..span.start]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count()
-                + 1
-        });
-        manifest_error(&path, line, format!("TOML 格式无效：{error}"))
-    })?;
+    let document: toml::Value = toml::from_str(&normalized)
+        .map_err(|error| sanitized_manifest_toml_error(&path, &normalized, &error))?;
     let package = table_alias(&document, &["包", "package"])
         .ok_or_else(|| manifest_error(&path, None, "缺少【包】表"))?;
     let format_version = integer_alias(package, &["格式", "format"]).unwrap_or(1);
@@ -1243,6 +1252,18 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
     })
 }
 
+fn sanitized_manifest_toml_error(
+    path: &Path,
+    normalized: &str,
+    error: &toml::de::Error,
+) -> ManifestError {
+    let line = error
+        .span()
+        .and_then(|span| normalized.as_bytes().get(..span.start))
+        .map(|prefix| prefix.iter().filter(|byte| **byte == b'\n').count() + 1);
+    manifest_error(path, line, MANIFEST_TOML_SYNTAX_ERROR)
+}
+
 /// 将言序允许的中文裸键补成标准 TOML 引号键。
 ///
 /// TOML 裸键仅接受 ASCII，而言序清单允许惯用的`[包]`、`名 =`。这里仅
@@ -1310,10 +1331,13 @@ fn parse_dependency(
     name: &str,
 ) -> Result<Dependency, ManifestError> {
     if let Some(path) = value.as_str() {
-        return Ok(Dependency::Path {
+        let dependency = Dependency::Path {
             path: PathBuf::from(path),
             requirement: None,
-        });
+        };
+        validate_dependency_source_security(&dependency)
+            .map_err(|message| manifest_error(manifest_path, None, message))?;
+        return Ok(dependency);
     }
     let table = value.as_table().ok_or_else(|| {
         manifest_error(
@@ -1333,29 +1357,38 @@ fn parse_dependency(
             )
         })?;
     if let Some(path) = string_alias(table, &["路径", "path"]) {
-        return Ok(Dependency::Path {
+        let dependency = Dependency::Path {
             path: PathBuf::from(path),
             requirement,
-        });
+        };
+        validate_dependency_source_security(&dependency)
+            .map_err(|message| manifest_error(manifest_path, None, message))?;
+        return Ok(dependency);
     }
     if let Some(url) = string_alias(table, &["git", "Git"]) {
-        return Ok(Dependency::Git {
+        let dependency = Dependency::Git {
             url: url.into(),
             revision: string_alias(table, &["修订", "rev", "revision"])
                 .unwrap_or("HEAD")
                 .into(),
             requirement,
-        });
+        };
+        validate_dependency_source_security(&dependency)
+            .map_err(|message| manifest_error(manifest_path, None, message))?;
+        return Ok(dependency);
     }
     let requirement = requirement.ok_or_else(|| {
         manifest_error(manifest_path, None, format!("索引依赖“{name}”必须给出“版”"))
     })?;
-    Ok(Dependency::Registry {
+    let dependency = Dependency::Registry {
         requirement,
         registry: string_alias(table, &["源", "registry"])
             .unwrap_or(DEFAULT_REGISTRY)
             .into(),
-    })
+    };
+    validate_dependency_source_security(&dependency)
+        .map_err(|message| manifest_error(manifest_path, None, message))?;
+    Ok(dependency)
 }
 
 fn dependency_package_name(
@@ -2008,6 +2041,8 @@ fn resolve_one(
     locked: Option<&LockedPackage>,
     offline: bool,
 ) -> Result<ResolvedDependency, ManifestError> {
+    validate_dependency_source_security(dependency)
+        .map_err(|message| manifest_error(&manifest.path, None, message))?;
     if let Some(locked) = locked
         && let Some(root) = find_vendored_package(&manifest.root, locked)?
     {
@@ -2163,22 +2198,22 @@ fn resolve_git(
     revision: &str,
     offline: bool,
 ) -> Result<(PathBuf, String), ManifestError> {
+    validate_source_url_security(url)
+        .map_err(|message| manifest_error("Git 来源", None, message))?;
     if !secure_git_source(url) {
         return Err(manifest_error(
-            Path::new(url),
+            "Git 来源",
             None,
             "远程 Git 依赖须使用 HTTPS 或 SSH",
         ));
     }
-    if revision.is_empty()
-        || revision.starts_with('-')
-        || revision.chars().any(|character| character.is_control())
-    {
-        return Err(manifest_error(Path::new(url), None, "Git 修订名称不合法"));
-    }
+    validate_git_revision_security(revision)
+        .map_err(|message| manifest_error("Git 来源", None, message))?;
     let cache = cache_root().join("git").join(short_hash(url));
     if !cache.join(".git").is_dir() {
         if offline {
+            let url = safe_git_source_value_for_display(url);
+            let revision = safe_git_revision_for_display(revision);
             return Err(manifest_error(
                 &cache,
                 None,
@@ -2257,17 +2292,487 @@ fn resolve_git(
     Ok((cache, String::from_utf8_lossy(&output.stdout).trim().into()))
 }
 
-fn secure_git_source(url: &str) -> bool {
-    if url.is_empty() || url.starts_with('-') || url.chars().any(char::is_control) {
+const SOURCE_SECURITY_ERROR: &str = "依赖来源不得包含内嵌凭据、不安全用户信息、片段或敏感查询参数；请改用凭据管理器、SSH 密钥管理器或外部认证配置";
+const GIT_REVISION_ERROR: &str = "Git 修订名称不合法";
+const SOURCE_VALUE_MAX_BYTES: usize = 16 * 1024;
+const SOURCE_QUERY_MAX_BYTES: usize = 4 * 1024;
+const SOURCE_QUERY_MAX_FIELDS: usize = 128;
+const SOURCE_PERCENT_DECODE_ROUNDS: usize = 3;
+const SSH_USERNAME_MAX_BYTES: usize = 128;
+const SSH_HOST_MAX_BYTES: usize = 255;
+const GIT_REVISION_MAX_BYTES: usize = 1_024;
+const HIDDEN_SOURCE_VALUE: &str = "<已隐藏的不安全来源>";
+
+fn source_text_is_bounded(source: &str) -> bool {
+    !source.is_empty()
+        && source.len() <= SOURCE_VALUE_MAX_BYTES
+        && !source.chars().any(char::is_control)
+}
+
+fn sensitive_query_key(key: &str) -> bool {
+    let compact = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "signature",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "authorization",
+        "oauth",
+        "bearer",
+        "sessionkey",
+        "sessionid",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+        || key
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|segment| !segment.is_empty())
+            .any(|segment| {
+                matches!(
+                    segment.to_ascii_lowercase().as_str(),
+                    "auth" | "authorization" | "oauth" | "key" | "sig" | "code"
+                )
+            })
+}
+
+fn inspect_query_layer(query: &str) -> Result<(), &'static str> {
+    if query.len() > SOURCE_QUERY_MAX_BYTES
+        || query.contains('#')
+        || query.chars().any(char::is_control)
+    {
+        return Err(SOURCE_SECURITY_ERROR);
+    }
+    let mut fields = 0usize;
+    for field in query.split(['&', ';', '?']) {
+        fields = fields.checked_add(1).ok_or(SOURCE_SECURITY_ERROR)?;
+        if fields > SOURCE_QUERY_MAX_FIELDS {
+            return Err(SOURCE_SECURITY_ERROR);
+        }
+        let key = field.split_once('=').map_or(field, |(key, _)| key);
+        if !key.is_ascii() {
+            return Err(SOURCE_SECURITY_ERROR);
+        }
+        let normalized = key.nfkc().collect::<String>();
+        if !normalized.is_ascii() || sensitive_query_key(&normalized) {
+            return Err(SOURCE_SECURITY_ERROR);
+        }
+    }
+    Ok(())
+}
+
+fn percent_decode_source_layer(value: &str) -> Result<String, &'static str> {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = bytes
+            .get(index + 1)
+            .copied()
+            .and_then(hex)
+            .ok_or(SOURCE_SECURITY_ERROR)?;
+        let low = bytes
+            .get(index + 2)
+            .copied()
+            .and_then(hex)
+            .ok_or(SOURCE_SECURITY_ERROR)?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(decoded).map_err(|_| SOURCE_SECURITY_ERROR)
+}
+
+fn percent_decode_source_shape_layer(value: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| {
+                Some((
+                    bytes.get(index + 1).copied().and_then(hex)?,
+                    bytes.get(index + 2).copied().and_then(hex)?,
+                ))
+            })
+            .flatten()
+            .map(|(high, low)| (high << 4) | low)
+            .filter(u8::is_ascii);
+        if let Some(byte) = escaped {
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).expect("ASCII percent decoding preserves UTF-8")
+}
+
+fn validate_source_query_security(source: &str) -> Result<(), &'static str> {
+    let Some((_, query)) = source.split_once('?') else {
+        return Ok(());
+    };
+    if query.len() > SOURCE_QUERY_MAX_BYTES {
+        return Err(SOURCE_SECURITY_ERROR);
+    }
+    let mut layer = query.to_owned();
+    for depth in 0..=SOURCE_PERCENT_DECODE_ROUNDS {
+        inspect_query_layer(&layer)?;
+        let decoded = percent_decode_source_layer(&layer)?;
+        if decoded == layer {
+            return Ok(());
+        }
+        if depth == SOURCE_PERCENT_DECODE_ROUNDS {
+            return Err(SOURCE_SECURITY_ERROR);
+        }
+        layer = decoded;
+    }
+    Err(SOURCE_SECURITY_ERROR)
+}
+
+fn validate_source_text(source: &str) -> Result<(), &'static str> {
+    if !source_text_is_bounded(source) {
+        return Err(SOURCE_SECURITY_ERROR);
+    }
+    validate_source_query_security(source)
+}
+
+fn valid_ssh_username(username: &str) -> bool {
+    !username.is_empty()
+        && username.len() <= SSH_USERNAME_MAX_BYTES
+        && username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn validate_url_source(source: &str) -> Result<url::Url, &'static str> {
+    validate_source_text(source)?;
+    let parsed = url::Url::parse(source).map_err(|_| SOURCE_SECURITY_ERROR)?;
+    if parsed.fragment().is_some() {
+        return Err(SOURCE_SECURITY_ERROR);
+    }
+    let authority = source
+        .split_once("://")
+        .map(|(_, remainder)| remainder.split(['/', '?', '#']).next().unwrap_or_default())
+        .ok_or(SOURCE_SECURITY_ERROR)?;
+    let at_count = authority.bytes().filter(|byte| *byte == b'@').count();
+    let has_user_information =
+        at_count != 0 || !parsed.username().is_empty() || parsed.password().is_some();
+    if has_user_information {
+        let ssh_scheme = matches!(parsed.scheme(), "ssh" | "git+ssh");
+        if !ssh_scheme
+            || at_count != 1
+            || parsed.password().is_some()
+            || !valid_ssh_username(parsed.username())
+        {
+            return Err(SOURCE_SECURITY_ERROR);
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_scp_like_git_source(source: &str) -> Result<Option<(&str, &str, &str)>, &'static str> {
+    if !source.contains('@') {
+        return Ok(None);
+    }
+    if source.bytes().filter(|byte| *byte == b'@').count() != 1 {
+        return Err(SOURCE_SECURITY_ERROR);
+    }
+    let (username, remainder) = source.split_once('@').ok_or(SOURCE_SECURITY_ERROR)?;
+    let Some((host, path)) = remainder.split_once(':') else {
+        if username.contains(':') {
+            return Err(SOURCE_SECURITY_ERROR);
+        }
+        return Ok(None);
+    };
+    if !valid_ssh_username(username)
+        || host.is_empty()
+        || host.len() > SSH_HOST_MAX_BYTES
+        || path.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || path.contains('#')
+    {
+        return Err(SOURCE_SECURITY_ERROR);
+    }
+    Ok(Some((username, host, path)))
+}
+
+fn looks_like_uri_scheme(source: &str) -> bool {
+    let Some((scheme, _)) = source.split_once(':') else {
+        return false;
+    };
+    if scheme.len() == 1 && scheme.as_bytes()[0].is_ascii_alphabetic() {
         return false;
     }
-    if let Some((scheme, _)) = url.split_once("://") {
-        return matches!(scheme, "file" | "https" | "ssh" | "git+ssh");
+    let mut bytes = scheme.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+#[doc(hidden)]
+pub fn validate_source_url_security(source: &str) -> Result<(), &'static str> {
+    validate_source_text(source)?;
+    if source.contains("://") {
+        validate_url_source(source)?;
+    } else if parse_scp_like_git_source(source)?.is_some() {
+        validate_source_query_security(source)?;
     }
-    Path::new(url).exists()
-        || url
-            .split_once(':')
-            .is_some_and(|(authority, path)| authority.contains('@') && !path.is_empty())
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn validate_local_source_path_text(source: &str) -> Result<(), &'static str> {
+    validate_source_text(source)?;
+    let mut layer = source.to_owned();
+    for depth in 0..=SOURCE_PERCENT_DECODE_ROUNDS {
+        validate_source_query_security(&layer)?;
+        if layer.contains("://")
+            || looks_like_uri_scheme(&layer)
+            || parse_scp_like_git_source(&layer)?.is_some()
+        {
+            return Err(SOURCE_SECURITY_ERROR);
+        }
+        let decoded = percent_decode_source_shape_layer(&layer);
+        if decoded == layer {
+            return Ok(());
+        }
+        if depth == SOURCE_PERCENT_DECODE_ROUNDS {
+            return Err(SOURCE_SECURITY_ERROR);
+        }
+        layer = decoded;
+    }
+    Err(SOURCE_SECURITY_ERROR)
+}
+
+#[doc(hidden)]
+pub fn validate_git_source_security(source: &str) -> Result<(), &'static str> {
+    validate_source_text(source)?;
+    if source.contains("://") {
+        let parsed = validate_url_source(source)?;
+        if !matches!(parsed.scheme(), "file" | "https" | "ssh" | "git+ssh")
+            || (parsed.scheme() != "file" && parsed.host_str().is_none())
+        {
+            return Err(SOURCE_SECURITY_ERROR);
+        }
+        return Ok(());
+    }
+    if source.contains('@') {
+        return parse_scp_like_git_source(source)
+            .and_then(|source| source.map(|_| ()).ok_or(SOURCE_SECURITY_ERROR));
+    }
+    validate_local_source_path_text(source)
+}
+
+#[doc(hidden)]
+pub fn validate_registry_source_security(source: &str) -> Result<(), &'static str> {
+    validate_source_text(source)?;
+    if source.contains("://") {
+        let parsed = validate_url_source(source)?;
+        if (parsed.scheme() == "https" && parsed.host_str().is_some()) || parsed.scheme() == "file"
+        {
+            return Ok(());
+        }
+        return Err(SOURCE_SECURITY_ERROR);
+    }
+    validate_local_source_path_text(source)
+}
+
+#[doc(hidden)]
+pub fn validate_artifact_source_security(source: &str) -> Result<(), &'static str> {
+    validate_registry_source_security(source)
+}
+
+#[doc(hidden)]
+pub fn validate_advisory_source_security(source: &str) -> Result<(), &'static str> {
+    let parsed = validate_url_source(source)?;
+    if parsed.scheme() == "https" && parsed.host_str().is_some() {
+        Ok(())
+    } else {
+        Err(SOURCE_SECURITY_ERROR)
+    }
+}
+
+fn validate_git_revision_security(revision: &str) -> Result<(), &'static str> {
+    if revision.is_empty()
+        || revision.len() > GIT_REVISION_MAX_BYTES
+        || revision.starts_with('-')
+        || revision.contains('#')
+        || revision.chars().any(char::is_control)
+    {
+        return Err(GIT_REVISION_ERROR);
+    }
+    validate_local_source_path_text(revision).map_err(|_| GIT_REVISION_ERROR)
+}
+
+#[doc(hidden)]
+pub fn secure_https_source(source: &str) -> bool {
+    validate_url_source(source)
+        .is_ok_and(|parsed| parsed.scheme() == "https" && parsed.host_str().is_some())
+}
+
+#[doc(hidden)]
+pub fn validate_dependency_source_security(dependency: &Dependency) -> Result<(), &'static str> {
+    match dependency {
+        Dependency::Path { path, .. } => path
+            .to_str()
+            .ok_or(SOURCE_SECURITY_ERROR)
+            .and_then(validate_local_source_path_text),
+        Dependency::Git { url, revision, .. } => validate_git_source_security(url)
+            .and_then(|()| validate_git_revision_security(revision)),
+        Dependency::Registry { registry, .. } => validate_registry_source_security(registry),
+    }
+}
+
+fn validate_locked_dependency_source(source: &str) -> Result<(), &'static str> {
+    let (kind, value) = source.split_once(':').ok_or(SOURCE_SECURITY_ERROR)?;
+    if value.is_empty() {
+        return Err(SOURCE_SECURITY_ERROR);
+    }
+    match kind {
+        "path" => validate_local_source_path_text(value),
+        "git" => validate_git_source_security(value),
+        "registry" => validate_registry_source_security(value),
+        _ => Err(SOURCE_SECURITY_ERROR),
+    }
+}
+
+fn validate_lock_source_security(path: &Path, lock: &LockFile) -> Result<(), ManifestError> {
+    if lock.packages.iter().any(|package| {
+        validate_locked_dependency_source(&package.source).is_err()
+            || package
+                .revision
+                .as_deref()
+                .is_some_and(|revision| validate_git_revision_security(revision).is_err())
+    }) {
+        return Err(manifest_error(path, None, SOURCE_SECURITY_ERROR));
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn safe_source_value_for_display(source: &str) -> String {
+    if validate_git_source_security(source).is_ok()
+        || validate_registry_source_security(source).is_ok()
+        || validate_advisory_source_security(source).is_ok()
+        || validate_local_source_path_text(source).is_ok()
+    {
+        source.to_owned()
+    } else {
+        HIDDEN_SOURCE_VALUE.into()
+    }
+}
+
+#[doc(hidden)]
+pub fn safe_local_source_path_for_display(path: &Path) -> String {
+    path.to_str()
+        .filter(|source| validate_local_source_path_text(source).is_ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| HIDDEN_SOURCE_VALUE.into())
+}
+
+#[doc(hidden)]
+pub fn safe_git_source_value_for_display(source: &str) -> String {
+    if validate_git_source_security(source).is_ok() {
+        source.to_owned()
+    } else {
+        HIDDEN_SOURCE_VALUE.into()
+    }
+}
+
+#[doc(hidden)]
+pub fn safe_registry_source_value_for_display(source: &str) -> String {
+    if validate_registry_source_security(source).is_ok() {
+        source.to_owned()
+    } else {
+        HIDDEN_SOURCE_VALUE.into()
+    }
+}
+
+#[doc(hidden)]
+pub fn safe_artifact_source_value_for_display(source: &str) -> String {
+    if validate_artifact_source_security(source).is_ok() {
+        source.to_owned()
+    } else {
+        HIDDEN_SOURCE_VALUE.into()
+    }
+}
+
+#[doc(hidden)]
+pub fn safe_advisory_source_value_for_display(source: &str) -> String {
+    if validate_advisory_source_security(source).is_ok() {
+        source.to_owned()
+    } else {
+        HIDDEN_SOURCE_VALUE.into()
+    }
+}
+
+#[doc(hidden)]
+pub fn safe_git_revision_for_display(revision: &str) -> String {
+    if validate_git_revision_security(revision).is_ok() {
+        revision.to_owned()
+    } else {
+        "<已隐藏的不安全修订>".into()
+    }
+}
+
+#[doc(hidden)]
+pub fn safe_dependency_source_for_display(source: &str) -> String {
+    if validate_locked_dependency_source(source).is_ok() {
+        source.to_owned()
+    } else {
+        match source.split_once(':').map(|(kind, _)| kind) {
+            Some("path") => format!("path:{HIDDEN_SOURCE_VALUE}"),
+            Some("git") => format!("git:{HIDDEN_SOURCE_VALUE}"),
+            Some("registry") => format!("registry:{HIDDEN_SOURCE_VALUE}"),
+            _ => HIDDEN_SOURCE_VALUE.into(),
+        }
+    }
+}
+
+fn secure_git_source(url: &str) -> bool {
+    if validate_git_source_security(url).is_err() || url.starts_with('-') {
+        return false;
+    }
+    if url.contains("://") {
+        return url::Url::parse(url).is_ok_and(|parsed| {
+            matches!(parsed.scheme(), "file" | "https" | "ssh" | "git+ssh")
+                && (parsed.scheme() == "file" || parsed.host_str().is_some())
+        });
+    }
+    Path::new(url).exists() || parse_scp_like_git_source(url).is_ok_and(|source| source.is_some())
 }
 
 fn resolve_registry(
@@ -2278,6 +2783,8 @@ fn resolve_registry(
     locked_checksum: Option<&str>,
     offline: bool,
 ) -> Result<ResolvedDependency, ManifestError> {
+    validate_source_url_security(registry)
+        .map_err(|message| manifest_error("索引来源", None, message))?;
     let source = format!("registry:{registry}");
     if let Some(registry_path) = local_registry_path(registry) {
         let package_root = registry_path.join(name);
@@ -2293,16 +2800,12 @@ fn resolve_registry(
         }
         return Ok(resolved);
     }
-    if !registry.starts_with("https://") {
-        return Err(manifest_error(
-            Path::new(registry),
-            None,
-            "远程包索引须使用 HTTPS",
-        ));
+    if !secure_https_source(registry) {
+        return Err(manifest_error("索引来源", None, "远程包索引须使用 HTTPS"));
     }
     if offline && locked.is_none() {
         return Err(manifest_error(
-            Path::new(registry),
+            "索引来源",
             None,
             format!("离线模式须由锁文件固定索引依赖“{name}”"),
         ));
@@ -2381,7 +2884,7 @@ fn resolve_registry(
             format!("索引版本 {version} 缺少合法的制品 SHA-256"),
         ));
     }
-    if !release.url.starts_with("https://") {
+    if !secure_https_source(&release.url) {
         return Err(manifest_error(
             &index_path,
             None,
@@ -3061,15 +3564,13 @@ pub fn registry_release_metadata(
     version: &Version,
     offline: bool,
 ) -> Result<Option<RegistryReleaseMetadata>, ManifestError> {
+    validate_source_url_security(registry)
+        .map_err(|message| manifest_error("索引来源", None, message))?;
     let index_path = if let Some(registry_path) = local_registry_path(registry) {
         registry_path.join(name).join("index.json")
     } else {
-        if !registry.starts_with("https://") {
-            return Err(manifest_error(
-                Path::new(registry),
-                None,
-                "远程包索引须使用 HTTPS",
-            ));
+        if !secure_https_source(registry) {
+            return Err(manifest_error("索引来源", None, "远程包索引须使用 HTTPS"));
         }
         let registry_cache = cache_root().join("registry").join(short_hash(registry));
         if !offline {
@@ -3250,6 +3751,9 @@ fn validate_registry_index(path: &Path, index: &RegistryIndex) -> Result<(), Man
                 "索引版本字段为空、过长或包含控制字符",
             ));
         }
+        if validate_artifact_source_security(&release.url).is_err() {
+            return Err(manifest_error(path, None, SOURCE_SECURITY_ERROR));
+        }
         let Some(vulnerabilities) = &release.vulnerabilities else {
             continue;
         };
@@ -3282,6 +3786,9 @@ fn validate_registry_index(path: &Path, index: &RegistryIndex) -> Result<(), Man
                     None,
                     format!("版本 {} 的漏洞元数据过长或包含控制字符", release.version),
                 ));
+            }
+            if !reference.is_empty() && validate_advisory_source_security(reference).is_err() {
+                return Err(manifest_error(path, None, SOURCE_SECURITY_ERROR));
             }
         }
     }
@@ -3365,6 +3872,7 @@ fn select_registry_version(
 }
 
 fn write_lock(path: &Path, lock: &LockFile) -> Result<(), ManifestError> {
+    validate_lock_source_security(path, lock)?;
     let text = toml::to_string_pretty(lock)
         .map_err(|error| manifest_error(path, None, format!("不能生成锁文件：{error}")))?;
     atomic_write(path, text.as_bytes(), "锁文件")
@@ -3530,7 +4038,8 @@ fn pack_package_with_limits_and_hook(
             None,
             format!(
                 "YXP 不能发布仅本机可用的依赖“{}”（{}）；请先改用可移植的 HTTPS/SSH Git 或远程索引来源",
-                dependency.locked.name, dependency.locked.source
+                dependency.locked.name,
+                safe_dependency_source_for_display(&dependency.locked.source)
             ),
         ));
     }
@@ -4610,6 +5119,15 @@ fn cache_root() -> PathBuf {
 }
 
 fn download(url: &str, destination: &Path) -> Result<(), ManifestError> {
+    validate_artifact_source_security(url)
+        .map_err(|message| manifest_error(destination, None, message))?;
+    if !secure_https_source(url) {
+        return Err(manifest_error(
+            destination,
+            None,
+            "远程下载来源须使用 HTTPS",
+        ));
+    }
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|error| manifest_error(destination, None, format!("不能创建下载目录：{error}")))?;
@@ -4710,17 +5228,20 @@ fn copy_registry_tree_with_checkpoint(
 fn run_command(command: &mut Command, path: &Path, action: &str) -> Result<(), ManifestError> {
     let output = command
         .output()
-        .map_err(|error| manifest_error(path, None, format!("{action}失败：{error}")))?;
+        .map_err(|_| manifest_error(path, None, format!("{action}失败：不能启动外部命令")))?;
     if output.status.success() {
         Ok(())
+    } else if let Some(code) = output.status.code() {
+        Err(manifest_error(
+            path,
+            None,
+            format!("{action}失败（退出码 {code}）"),
+        ))
     } else {
         Err(manifest_error(
             path,
             None,
-            format!(
-                "{action}失败：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
+            format!("{action}失败（进程异常终止）"),
         ))
     }
 }
@@ -4793,6 +5314,31 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    fn lock_with_source(source: impl Into<String>) -> LockFile {
+        LockFile {
+            lock_version: LOCK_FORMAT_VERSION,
+            manifest_checksum: "0".repeat(64),
+            target: current_target(),
+            generator: package_core_version(),
+            root_dependencies: BTreeMap::from([("fixture".into(), "fixture@1.0.0".into())]),
+            root_dev_dependencies: BTreeMap::new(),
+            packages: vec![LockedPackage {
+                id: "fixture@1.0.0".into(),
+                name: "fixture".into(),
+                version: "1.0.0".into(),
+                source: source.into(),
+                revision: Some("0".repeat(40)),
+                checksum: "0".repeat(64),
+                entry: "main.yx".into(),
+                dependencies: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                target: current_target(),
+                native: None,
+                minimum_yanxu: None,
+            }],
+        }
+    }
+
     #[test]
     fn format_diagnostics_report_the_running_package_version() {
         let unsupported_build = parse(
@@ -4818,6 +5364,49 @@ mod tests {
                 .message
                 .contains(&format!("言序 {}", env!("CARGO_PKG_VERSION")))
         );
+    }
+
+    #[test]
+    fn malformed_manifest_toml_diagnostics_never_echo_sensitive_source_lines() {
+        let package = "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\n";
+        let cases = [
+            (
+                "userinfo",
+                "userinfo-value-must-not-appear",
+                format!(
+                    "{package}fixture = {{ git = https://user:userinfo-value-must-not-appear@example.invalid/package.git }}\n"
+                ),
+            ),
+            (
+                "query",
+                "query-value-must-not-appear",
+                format!(
+                    "{package}fixture = {{ git = \"https://example.invalid/package.git?access_token=query-value-must-not-appear\" invalid = true }}\n"
+                ),
+            ),
+            (
+                "fragment",
+                "fragment-value-must-not-appear",
+                format!(
+                    "{package}fixture = {{ git = \"https://example.invalid/package.git#fragment-value-must-not-appear\", revision = }}\n"
+                ),
+            ),
+        ];
+
+        for (name, marker, contents) in cases {
+            let root = temp(&format!("malformed-sensitive-{name}"));
+            let manifest_path = root.join(MANIFEST_NAME);
+            write(&manifest_path, &contents);
+            let error = load(&manifest_path).unwrap_err();
+            assert_eq!(error.message, MANIFEST_TOML_SYNTAX_ERROR);
+            assert!(error.line.is_some());
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains(marker), "{diagnostic}");
+            assert!(!diagnostic.contains("https://"), "{diagnostic}");
+            assert!(!diagnostic.contains("access_token"), "{diagnostic}");
+            assert!(!diagnostic.contains("fragment-value"), "{diagnostic}");
+            fs::remove_dir_all(root).ok();
+        }
     }
 
     #[test]
@@ -6810,6 +7399,340 @@ mod tests {
         )
         .unwrap_err();
         assert!(metadata_error.message.contains("索引须使用 HTTPS"));
+    }
+
+    #[test]
+    fn source_policy_rejects_encoded_confusable_and_malformed_secret_shapes() {
+        let marker = "source-policy-value-must-not-appear";
+        let unsafe_sources = [
+            format!("plain?access_token={marker}"),
+            format!("plain?authorization_code={marker}"),
+            format!("plain?x-sig={marker}"),
+            format!("plain?ref=stable;access_token={marker}"),
+            format!("plain?ref=stable%26access_token={marker}"),
+            format!("plain?ref=stable%3Baccess_token={marker}"),
+            format!("plain?%2561ccess_%2574oken={marker}"),
+            format!("plain?%252561ccess_%252574oken={marker}"),
+            format!("plain?%25252561ccess_%25252574oken={marker}"),
+            format!("plain?ａｃｃｅｓｓ＿ｔｏｋｅｎ={marker}"),
+            format!("plain?sеcret={marker}"),
+            format!("plain?ref=%2&value={marker}"),
+            format!("https:user:{marker}@example.invalid/package.git"),
+            format!("user:{marker}@example.invalid:group/package.git"),
+            format!("git@example.invalid@mirror.invalid:group/{marker}.git"),
+            format!("ssh://deploy%3Auser@example.invalid/group/{marker}.git"),
+            format!("git@bad;host.invalid:group/{marker}.git"),
+        ];
+        for source in unsafe_sources {
+            assert_eq!(
+                validate_source_url_security(&source),
+                Err(SOURCE_SECURITY_ERROR),
+                "unsafe source was accepted"
+            );
+            let displayed = safe_source_value_for_display(&source);
+            assert!(!displayed.contains(marker), "source leaked: {displayed}");
+        }
+
+        let too_many_fields = format!(
+            "plain?{}",
+            (0..=SOURCE_QUERY_MAX_FIELDS)
+                .map(|index| format!("field{index}=value"))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+        assert_eq!(
+            validate_source_url_security(&too_many_fields),
+            Err(SOURCE_SECURITY_ERROR)
+        );
+        assert_eq!(
+            validate_source_url_security(&"x".repeat(SOURCE_VALUE_MAX_BYTES + 1)),
+            Err(SOURCE_SECURITY_ERROR)
+        );
+        for source in [
+            "plain?ref=stable;channel=release",
+            "https://example.invalid/package.git?ref=stable&channel=release",
+            "ssh://deploy-user@example.invalid/group/package.git",
+            "deploy_user@example.invalid:group/package.git?ref=stable",
+        ] {
+            assert!(validate_source_url_security(source).is_ok(), "{source}");
+        }
+    }
+
+    #[test]
+    fn typed_sources_and_revisions_redact_network_user_information() {
+        for source in [
+            "https://example.invalid/group/package.git",
+            "ssh://git@example.invalid/group/package.git",
+            "ssh://deploy-user@example.invalid/group/package.git",
+            "git@example.invalid:group/package.git",
+        ] {
+            assert!(validate_git_source_security(source).is_ok(), "{source}");
+        }
+        for source in [
+            "http://example.invalid/package.git",
+            "ftp://example.invalid/package.git",
+            "ssh://user:password@example.invalid/package.git",
+            "user:password@example.invalid:group/package.git",
+            "git@example.invalid@mirror.invalid:group/package.git",
+        ] {
+            assert!(validate_git_source_security(source).is_err(), "{source}");
+        }
+
+        for revision in [
+            "HEAD",
+            "0123456789abcdef0123456789abcdef01234567",
+            "refs/heads/main",
+            "main~1",
+            "feature%ready",
+        ] {
+            assert!(
+                validate_git_revision_security(revision).is_ok(),
+                "{revision}"
+            );
+            assert_eq!(safe_git_revision_for_display(revision), revision);
+        }
+        let marker = "revision-value-must-not-appear";
+        for revision in [
+            format!("https://user:{marker}@example.invalid/repo"),
+            format!("user:{marker}@example.invalid"),
+            format!("user@example.invalid:refs/{marker}"),
+            format!("HEAD?access_token={marker}"),
+            format!("refs%3Faccess_token={marker}"),
+            format!("refs%253Fauthorization_code={marker}"),
+            format!("https%253A%252F%252Fuser%253A{marker}%2540example.invalid%252Frevision"),
+        ] {
+            assert!(validate_git_revision_security(&revision).is_err());
+            let displayed = safe_git_revision_for_display(&revision);
+            assert!(!displayed.contains(marker), "revision leaked: {displayed}");
+
+            let dependency = Dependency::Git {
+                url: "https://example.invalid/package.git".into(),
+                revision,
+                requirement: None,
+            };
+            let dependency_display = dependency.to_string();
+            assert!(
+                !dependency_display.contains(marker),
+                "dependency leaked: {dependency_display}"
+            );
+            assert!(validate_dependency_source_security(&dependency).is_err());
+        }
+    }
+
+    #[test]
+    fn path_sources_fail_at_parse_and_programmatic_resolution_boundaries() {
+        let root = temp("path-source-security");
+        fs::create_dir_all(&root).unwrap();
+        let marker = "path-source-value-must-not-appear";
+        for dependency in [
+            format!("fixture = '../dependency?access_token={marker}'"),
+            format!("fixture = {{路径='../dependency?authorization_code={marker}'}}"),
+        ] {
+            let text = format!(
+                "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\n{dependency}\n"
+            );
+            let error = parse(&text, root.join(MANIFEST_NAME), root.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains(marker), "{error}");
+        }
+
+        let safe = parse(
+            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture='../dependency#snapshot'\n",
+            root.join(MANIFEST_NAME),
+            root.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            safe.dependencies.get("fixture"),
+            Some(&Dependency::Path {
+                path: PathBuf::from("../dependency#snapshot"),
+                requirement: None,
+            })
+        );
+        let percent_path = parse(
+            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture='../100%/dep'\n",
+            root.join(MANIFEST_NAME),
+            root.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            percent_path.dependencies.get("fixture"),
+            Some(&Dependency::Path {
+                path: PathBuf::from("../100%/dep"),
+                requirement: None,
+            })
+        );
+
+        let encoded_network = format!(
+            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture='https%253A%252F%252Fuser%253A{marker}%2540example.invalid%252Fdep'\n"
+        );
+        let encoded_error = parse(&encoded_network, root.join(MANIFEST_NAME), root.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(!encoded_error.contains(marker), "{encoded_error}");
+
+        for encoded_query in [
+            format!("../dependency%3Faccess_token={marker}"),
+            format!("../dependency%253Fauthorization_code={marker}"),
+        ] {
+            let text = format!(
+                "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture={encoded_query:?}\n"
+            );
+            let error = parse(&text, root.join(MANIFEST_NAME), root.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains(marker), "{error}");
+        }
+
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n",
+        );
+        write(&root.join("main.yx"), "言 1；\n");
+        let mut manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        manifest.dependencies.insert(
+            "fixture".into(),
+            Dependency::Path {
+                path: PathBuf::from(format!("../dependency?x-sig={marker}")),
+                requirement: None,
+            },
+        );
+        manifest
+            .dependency_packages
+            .insert("fixture".into(), "fixture".into());
+        let error = resolve_graph(&manifest, true).unwrap_err().to_string();
+        assert!(!error.contains(marker), "{error}");
+        assert!(!root.join(LOCK_NAME).exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lock_sources_are_exact_bounded_and_redacted() {
+        for source in [
+            "path:../dependency#snapshot",
+            "git:https://example.invalid/package.git?ref=stable",
+            "git:ssh://git@example.invalid/group/package.git",
+            "registry:https://packages.example.invalid/v1?channel=stable",
+        ] {
+            assert!(
+                validate_locked_dependency_source(source).is_ok(),
+                "{source}"
+            );
+        }
+        let marker = "lock-source-value-must-not-appear";
+        for source in [
+            "path:".to_owned(),
+            format!("path:https://user:{marker}@example.invalid/package.git"),
+            format!("git:plain?authorization_code={marker}"),
+            format!("registry:https://packages.example.invalid/v1?x-sig={marker}"),
+            format!("gitx:https://example.invalid/{marker}.git"),
+        ] {
+            assert!(validate_locked_dependency_source(&source).is_err());
+            assert!(!safe_dependency_source_for_display(&source).contains(marker));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn external_command_failures_do_not_echo_stderr() {
+        let marker = "external-stderr-value-must-not-appear";
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(format!("printf '{marker}\\nsecond-line' >&2; exit 17"));
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command
+                .arg("/C")
+                .arg(format!("echo {marker} 1>&2 & exit /B 17"));
+            command
+        };
+        let error = run_command(&mut command, Path::new("external-command"), "执行外部命令")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(marker), "{error}");
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+        assert!(error.contains("退出码 17"), "{error}");
+    }
+
+    #[test]
+    fn unsafe_manifest_lock_and_registry_sources_never_echo_values() {
+        let root = temp("unsafe-persisted-source");
+        let marker = "persisted-value-must-not-appear";
+        let unsafe_url = format!("https://user:{marker}@example.invalid/package.git");
+        let manifest_path = root.join(MANIFEST_NAME);
+        write(
+            &manifest_path,
+            &format!(
+                "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture={{git={unsafe_url:?},修订='HEAD'}}\n"
+            ),
+        );
+        write(&root.join("main.yx"), "言 1；\n");
+        let manifest_error = load(&manifest_path).unwrap_err().to_string();
+        assert!(!manifest_error.contains(marker), "{manifest_error}");
+
+        let unsafe_lock = lock_with_source(format!("git:{unsafe_url}"));
+        let old_lock_path = root.join("old.lock");
+        write(
+            &old_lock_path,
+            &toml::to_string_pretty(&unsafe_lock).unwrap(),
+        );
+        let read_error = read_lock(&old_lock_path).unwrap_err().to_string();
+        assert!(!read_error.contains(marker), "{read_error}");
+
+        let new_lock_path = root.join("new.lock");
+        let write_error = write_lock(&new_lock_path, &unsafe_lock)
+            .unwrap_err()
+            .to_string();
+        assert!(!write_error.contains(marker), "{write_error}");
+        assert!(!new_lock_path.exists());
+
+        let artifact_index = root.join("artifact.json");
+        write(
+            &artifact_index,
+            &serde_json::to_string(&serde_json::json!({
+                "versions": [{
+                    "version": "1.0.0",
+                    "url": format!("https://user:{marker}@example.invalid/package.tar.gz"),
+                    "checksum": "a".repeat(64),
+                }]
+            }))
+            .unwrap(),
+        );
+        let artifact_error = read_registry_index(&artifact_index)
+            .unwrap_err()
+            .to_string();
+        assert!(!artifact_error.contains(marker), "{artifact_error}");
+
+        let advisory_index = root.join("advisory.json");
+        write(
+            &advisory_index,
+            &serde_json::to_string(&serde_json::json!({
+                "versions": [{
+                    "version": "1.0.0",
+                    "url": "https://example.invalid/package.tar.gz",
+                    "checksum": "a".repeat(64),
+                    "vulnerabilities": [{
+                        "id": "YXSA-2026-0001",
+                        "severity": "high",
+                        "summary": "fixture advisory",
+                        "url": format!("https://security.example.invalid/advisory?token={marker}"),
+                    }]
+                }]
+            }))
+            .unwrap(),
+        );
+        let advisory_error = read_registry_index(&advisory_index)
+            .unwrap_err()
+            .to_string();
+        assert!(!advisory_error.contains(marker), "{advisory_error}");
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
