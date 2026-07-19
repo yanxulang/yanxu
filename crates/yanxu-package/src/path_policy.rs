@@ -1626,6 +1626,12 @@ impl TrustedPackageRoots {
         self.matching(&path).map(|matched| matched.prefix)
     }
 
+    /// 返回包含路径的最深可信包根在打开时保存的规范身份，不根据环境路径重新解析。
+    pub(crate) fn matching_root_identity(&self, path: &Path) -> Option<&Path> {
+        let path = lexical_absolute(path).ok()?;
+        self.matching(&path).map(|matched| matched.identity)
+    }
+
     /// 若请求落在可信包根内，按可移植身份解析真实模块路径。
     /// 包外路径返回 `None`，由调用方沿用普通文件系统解析语义。
     /// 各平台都会通过保存的根能力绑定并复验最终文件或目录；返回路径只用于

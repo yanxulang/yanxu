@@ -955,6 +955,185 @@ pub fn resolve_dependency_scoped_with_opened_capabilities(
     )
 }
 
+/// 按真实包名选择当前模块所属的锁定包自身或它的直接锁定依赖，并返回解析阶段
+/// 已经打开的 generation 能力。该入口不改写锁文件；路径在选择前后都必须与
+/// 顶层执行建立的根能力保持同一身份。
+#[doc(hidden)]
+pub fn resolve_native_dependency_scoped_with_opened_capabilities(
+    opened_roots: &TrustedPackageRoots,
+    package_root: Option<&Path>,
+    current_base: &Path,
+    package_name: &str,
+) -> Result<(ResolvedDependency, ResolutionCapabilities), ManifestError> {
+    validate_package_name(package_name)
+        .map_err(|message| manifest_error(current_base, None, message))?;
+    let expected_root = package_root
+        .or_else(|| opened_roots.matching_root(current_base))
+        .ok_or_else(|| manifest_error(current_base, None, "当前模块没有执行阶段的包根能力"))?;
+    let current_root_identity = opened_roots
+        .matching_root_identity(current_base)
+        .ok_or_else(|| manifest_error(current_base, None, "当前模块不属于执行阶段的包根能力"))?;
+    if !opened_roots
+        .revalidate_exact_root(expected_root)
+        .map_err(|error| package_path_manifest_error(expected_root, error))?
+    {
+        return Err(manifest_error(
+            expected_root,
+            None,
+            "应用包根在执行开始后被替换；拒绝解析原生扩展",
+        ));
+    }
+    let manifest = load_manifest_from_roots(opened_roots, expected_root).map_err(|error| {
+        if error.message == "规范包清单不属于已打开的包根" {
+            manifest_error(
+                current_base,
+                None,
+                format!("装载原生包“{package_name}”时未找到 {MANIFEST_NAME}"),
+            )
+        } else {
+            error
+        }
+    })?;
+    let offline = std::env::var_os("YANXU_OFFLINE").is_some();
+    let resolved = cached_or_resolve_graph_read_only(&manifest, offline)?;
+    let expected_application_root = opened_roots
+        .exact_root_identity(&resolved.application_root)
+        .is_some();
+    let mut combined = opened_roots.clone();
+    let same_identity = combined.extend_opened(&resolved.application_roots).is_ok();
+    if !expected_application_root || !same_identity {
+        return Err(manifest_error(
+            &resolved.application_root,
+            None,
+            "应用包根在执行开始后被替换；拒绝解析原生扩展",
+        ));
+    }
+    cache_graph(&manifest, resolved.clone());
+
+    let owner = dependency_for_bound_current_root(&resolved, &manifest, current_root_identity)?;
+    if let Some(owner) = owner
+        && owner.locked.name == package_name
+    {
+        return Ok((owner.clone(), resolved.capabilities));
+    }
+    let dependency_edges = owner.map_or(&resolved.graph.root_dependencies, |dependency| {
+        &dependency.locked.dependencies
+    });
+    let mut seen = BTreeSet::new();
+    let mut matches = Vec::new();
+    for id in dependency_edges.values() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let dependency = resolved.graph.packages.get(id).ok_or_else(|| {
+            manifest_error(
+                manifest.root.join(LOCK_NAME),
+                None,
+                format!("锁文件依赖边指向不存在的包“{id}”"),
+            )
+        })?;
+        if dependency.locked.name == package_name {
+            matches.push(dependency.clone());
+        }
+    }
+    let dependency = match matches.len() {
+        1 => matches.pop().expect("one direct native dependency"),
+        0 => {
+            return Err(manifest_error(
+                &manifest.path,
+                None,
+                format!("当前包没有直接声明名为“{package_name}”的锁定依赖"),
+            ));
+        }
+        _ => {
+            return Err(manifest_error(
+                &manifest.path,
+                None,
+                format!("当前包直接依赖多个名为“{package_name}”的包，不能消歧"),
+            ));
+        }
+    };
+    Ok((dependency, resolved.capabilities))
+}
+
+fn dependency_for_bound_current_root<'a>(
+    resolved: &'a ResolvedGraphBundle,
+    manifest: &Manifest,
+    current_root: &Path,
+) -> Result<Option<&'a ResolvedDependency>, ManifestError> {
+    if current_root == resolved.application_root || current_root == manifest.root {
+        return Ok(None);
+    }
+    let mut owners = resolved.graph.packages.values().filter(|dependency| {
+        dependency.root == current_root
+            || resolved
+                .inputs
+                .iter()
+                .find(|input| input.package_id == dependency.locked.id)
+                .is_some_and(|input| {
+                    input.source_root == current_root || input.generation_root == current_root
+                })
+    });
+    let owner = owners.next().ok_or_else(|| {
+        manifest_error(
+            current_root,
+            None,
+            "当前模块的包根身份不属于已验证依赖图；拒绝解析锁定依赖",
+        )
+    })?;
+    if owners.next().is_some() {
+        return Err(manifest_error(
+            current_root,
+            None,
+            "当前模块的包根身份对应多个锁定包；拒绝解析锁定依赖",
+        ));
+    }
+    Ok(Some(owner))
+}
+
+fn dependency_edges_for_current_base<'a>(
+    resolved: &'a ResolvedGraphBundle,
+    manifest: &Manifest,
+    current_base: &Path,
+) -> &'a BTreeMap<String, String> {
+    let canonical_base =
+        fs::canonicalize(current_base).unwrap_or_else(|_| current_base.to_path_buf());
+    let canonical_manifest_root =
+        fs::canonicalize(&manifest.root).unwrap_or_else(|_| manifest.root.clone());
+    let current_is_application_source = canonical_base.starts_with(&canonical_manifest_root);
+    resolved
+        .graph
+        .packages
+        .values()
+        .filter(|dependency| {
+            let source_root = resolved
+                .inputs
+                .iter()
+                .find(|input| input.package_id == dependency.locked.id)
+                .map_or(dependency.root.as_path(), |input| {
+                    input.source_root.as_path()
+                });
+            (canonical_base.starts_with(&dependency.root)
+                || canonical_base.starts_with(source_root))
+                && (!current_is_application_source
+                    || (source_root != canonical_manifest_root
+                        && source_root.starts_with(&canonical_manifest_root)))
+        })
+        .max_by_key(|dependency| {
+            resolved
+                .inputs
+                .iter()
+                .find(|input| input.package_id == dependency.locked.id)
+                .map_or_else(
+                    || dependency.root.components().count(),
+                    |input| input.source_root.components().count(),
+                )
+        })
+        .map_or(&resolved.graph.root_dependencies, |dependency| {
+            &dependency.locked.dependencies
+        })
+}
+
 fn resolve_dependency_scoped_with_capabilities_inner(
     opened_roots: Option<&TrustedPackageRoots>,
     bound_manifest: Option<Manifest>,
@@ -998,44 +1177,22 @@ fn resolve_dependency_scoped_with_capabilities_inner(
         cache_graph(&manifest, resolved.clone());
     }
     let graph = &resolved.graph;
-    let canonical_base =
-        fs::canonicalize(current_base).unwrap_or_else(|_| current_base.to_path_buf());
-    let canonical_manifest_root =
-        fs::canonicalize(&manifest.root).unwrap_or_else(|_| manifest.root.clone());
-    let current_is_application_source = canonical_base.starts_with(&canonical_manifest_root);
     let (alias, export) = name
         .split_once('/')
         .map_or((name, None), |(alias, export)| (alias, Some(export)));
-    let dependency_edges = graph
-        .packages
-        .values()
-        .filter(|dependency| {
-            let source_root = resolved
-                .inputs
-                .iter()
-                .find(|input| input.package_id == dependency.locked.id)
-                .map_or(dependency.root.as_path(), |input| {
-                    input.source_root.as_path()
-                });
-            (canonical_base.starts_with(&dependency.root)
-                || canonical_base.starts_with(source_root))
-                && (!current_is_application_source
-                    || (source_root != canonical_manifest_root
-                        && source_root.starts_with(&canonical_manifest_root)))
-        })
-        .max_by_key(|dependency| {
-            resolved
-                .inputs
-                .iter()
-                .find(|input| input.package_id == dependency.locked.id)
-                .map_or_else(
-                    || dependency.root.components().count(),
-                    |input| input.source_root.components().count(),
-                )
-        })
-        .map_or(&graph.root_dependencies, |dependency| {
-            &dependency.locked.dependencies
-        });
+    let dependency_edges = if let Some(opened_roots) = opened_roots {
+        let current_root = opened_roots
+            .matching_root_identity(current_base)
+            .ok_or_else(|| {
+                manifest_error(current_base, None, "当前模块不属于发现阶段的包根能力")
+            })?;
+        dependency_for_bound_current_root(&resolved, &manifest, current_root)?
+            .map_or(&graph.root_dependencies, |dependency| {
+                &dependency.locked.dependencies
+            })
+    } else {
+        dependency_edges_for_current_base(&resolved, &manifest, current_base)
+    };
     let id = dependency_edges.get(alias).ok_or_else(|| {
         manifest_error(
             &manifest.path,
@@ -10341,6 +10498,139 @@ mod tests {
             error.message.contains("工具包根在目录发现后被替换"),
             "{error}"
         );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn native_dependency_resolution_uses_real_name_direct_edge_without_lock_side_effects() {
+        let root = temp("native-resolution-direct-edge");
+        let application = root.join("application");
+        let original = root.join("application-original");
+        let dependency = root.join("dependency");
+        let manifest_text = "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n别名={包='真实工具',路径='../dependency',版='^1'}\n";
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='真实工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&dependency.join("主.yx"), "公 定 值：数 为 1；\n");
+        write(&application.join(MANIFEST_NAME), manifest_text);
+        write(&application.join("主.yx"), "言 1；\n");
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        let lock_path = application.join(LOCK_NAME);
+        let lock_before = fs::read(&lock_path).unwrap();
+        graph_cache()
+            .lock()
+            .expect("graph cache poisoned")
+            .remove(&graph_cache_key(&application));
+        let mut opened_roots = TrustedPackageRoots::default();
+        opened_roots.insert(&application).unwrap();
+
+        let (resolved, capabilities) = resolve_native_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &application,
+            "真实工具",
+        )
+        .unwrap();
+        assert_eq!(resolved.locked.name, "真实工具");
+        assert!(capabilities.roots().matching_root(&resolved.root).is_some());
+        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+        let error = resolve_native_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &application,
+            "别名",
+        )
+        .unwrap_err();
+        assert!(error.message.contains("没有直接声明名为“别名”"), "{error}");
+
+        fs::rename(&application, &original).unwrap();
+        write(&application.join(MANIFEST_NAME), manifest_text);
+        write(&application.join("主.yx"), "言 2；\n");
+        graph_cache()
+            .lock()
+            .expect("graph cache poisoned")
+            .remove(&graph_cache_key(&application));
+        let error = resolve_native_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &application,
+            "真实工具",
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("应用包根在执行开始后被替换"),
+            "{error}"
+        );
+        assert!(!application.join(LOCK_NAME).exists());
+        assert_eq!(fs::read(original.join(LOCK_NAME)).unwrap(), lock_before);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn native_dependency_resolution_binds_edges_to_the_calling_package_root() {
+        let root = temp("native-resolution-calling-package");
+        let application = root.join("application");
+        let middle = root.join("middle");
+        let native = root.join("native");
+        write(
+            &application.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='src/主.yx'\n[依赖]\n中间={包='中间包',路径='../middle',版='^1'}\n",
+        );
+        write(&application.join("src/主.yx"), "言 1；\n");
+        write(
+            &middle.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='中间包'\n版本='1.0.0'\n入口='src/主.yx'\n[依赖]\n原生别名={包='真实原生',路径='../native',版='^1'}\n",
+        );
+        write(&middle.join("src/主.yx"), "公 定 值：数 为 1；\n");
+        write(
+            &native.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='真实原生'\n版本='1.0.0'\n入口='src/主.yx'\n",
+        );
+        write(&native.join("src/主.yx"), "公 定 ABI：数 为 2；\n");
+        let manifest = load(application.join(MANIFEST_NAME)).unwrap();
+        ensure_lock(&manifest, false).unwrap();
+        let lock_path = application.join(LOCK_NAME);
+        let lock_before = fs::read(&lock_path).unwrap();
+        let mut opened_roots = TrustedPackageRoots::default();
+        opened_roots.insert(&application).unwrap();
+        let (middle_dependency, capabilities) = resolve_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &application,
+            "中间",
+        )
+        .unwrap();
+        capabilities.extend(&mut opened_roots).unwrap();
+
+        let (native_dependency, _) = resolve_native_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &middle_dependency.root.join("src"),
+            "真实原生",
+        )
+        .unwrap();
+        assert_eq!(native_dependency.locked.name, "真实原生");
+        let error = resolve_native_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &application.join("src"),
+            "真实原生",
+        )
+        .unwrap_err();
+        assert!(error.message.contains("没有直接声明"), "{error}");
+        let error = resolve_native_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &middle_dependency.root.join("src"),
+            "原生别名",
+        )
+        .unwrap_err();
+        assert!(error.message.contains("没有直接声明"), "{error}");
+        assert_eq!(fs::read(lock_path).unwrap(), lock_before);
 
         fs::remove_dir_all(root).ok();
     }

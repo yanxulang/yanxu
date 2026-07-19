@@ -308,10 +308,10 @@ fn validate_bare_dependency_name(name: &str, format: &str) -> Result<(), NativeE
         || name.len() > NATIVE_V2_MAX_DYNAMIC_DEPENDENCY_BYTES
         || !name.is_ascii()
         || name.starts_with('.')
-        || name.contains(['/', '\\', ':'])
-        || name
+        || name.ends_with('.')
+        || !name
             .bytes()
-            .any(|byte| byte.is_ascii_control() || byte == b' ')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
     {
         return Err(native_dependency_error(format!(
             "{format} 动态依赖“{name}”不是受约束的系统库基名"
@@ -351,6 +351,9 @@ fn validate_mach_dependencies(libraries: &[&str], rpaths: &[&str]) -> Result<(),
         if !trusted
             || !library.is_ascii()
             || library.len() > NATIVE_V2_MAX_DYNAMIC_DEPENDENCY_BYTES
+            || !library.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+')
+            })
             || library.contains("//")
             || library.contains("/./")
             || library.contains("/../")
@@ -426,8 +429,10 @@ fn expected_pe_machine() -> Result<u16, NativeError> {
 
 #[cfg(all(not(target_family = "wasm"), any(test, target_os = "linux")))]
 fn validate_elf_library(elf: &goblin::elf::Elf<'_>) -> Result<(), NativeError> {
-    if !elf.is_lib || elf.interpreter.is_some() {
-        return Err(native_format_error("ABI v2 ELF 制品必须是无解释器的共享库"));
+    if !elf.is_lib || elf.interpreter.is_some() || !elf.is_64 || !elf.little_endian {
+        return Err(native_format_error(
+            "ABI v2 ELF 制品必须是当前平台的 64 位小端、无解释器共享库",
+        ));
     }
     let expected = expected_elf_machine()?;
     if elf.header.e_machine != expected {
@@ -436,36 +441,38 @@ fn validate_elf_library(elf: &goblin::elf::Elf<'_>) -> Result<(), NativeError> {
             elf.header.e_machine
         )));
     }
-    if let Some(dynamic) = &elf.dynamic {
-        const DT_AUXILIARY: u64 = 0x7fff_fffd;
-        const DT_FILTER: u64 = 0x7fff_ffff;
-        let forbidden = dynamic.dyns.iter().find(|entry| {
-            matches!(
-                entry.d_tag,
-                goblin::elf::dynamic::DT_RPATH
-                    | goblin::elf::dynamic::DT_RUNPATH
-                    | goblin::elf::dynamic::DT_AUDIT
-                    | goblin::elf::dynamic::DT_DEPAUDIT
-                    | DT_AUXILIARY
-                    | DT_FILTER
-            )
-        });
-        if let Some(entry) = forbidden {
-            return Err(native_dependency_error(format!(
-                "ELF 原生制品含禁止的动态装载标签 0x{:x}",
-                entry.d_tag
-            )));
-        }
-        let needed_count = dynamic
-            .dyns
-            .iter()
-            .filter(|entry| entry.d_tag == goblin::elf::dynamic::DT_NEEDED)
-            .count();
-        if needed_count != elf.libraries.len() {
-            return Err(native_format_error(
-                "ELF DT_NEEDED 表含不能完整解析的依赖名称",
-            ));
-        }
+    let dynamic = elf
+        .dynamic
+        .as_ref()
+        .ok_or_else(|| native_format_error("ABI v2 ELF 共享库缺少 PT_DYNAMIC 元数据"))?;
+    const DT_AUXILIARY: u64 = 0x7fff_fffd;
+    const DT_FILTER: u64 = 0x7fff_ffff;
+    let forbidden = dynamic.dyns.iter().find(|entry| {
+        matches!(
+            entry.d_tag,
+            goblin::elf::dynamic::DT_RPATH
+                | goblin::elf::dynamic::DT_RUNPATH
+                | goblin::elf::dynamic::DT_AUDIT
+                | goblin::elf::dynamic::DT_DEPAUDIT
+                | DT_AUXILIARY
+                | DT_FILTER
+        )
+    });
+    if let Some(entry) = forbidden {
+        return Err(native_dependency_error(format!(
+            "ELF 原生制品含禁止的动态装载标签 0x{:x}",
+            entry.d_tag
+        )));
+    }
+    let needed_count = dynamic
+        .dyns
+        .iter()
+        .filter(|entry| entry.d_tag == goblin::elf::dynamic::DT_NEEDED)
+        .count();
+    if needed_count != elf.libraries.len() {
+        return Err(native_format_error(
+            "ELF DT_NEEDED 表含不能完整解析的依赖名称",
+        ));
     }
     validate_elf_dependencies(&elf.libraries, &elf.rpaths, &elf.runpaths)
 }
@@ -480,6 +487,11 @@ fn validate_mach_library(mach: &MachO<'_>) -> Result<(), NativeError> {
             "ABI v2 Mach-O 制品必须是动态库或 bundle",
         ));
     }
+    if !mach.is_64 || !mach.little_endian {
+        return Err(native_format_error(
+            "ABI v2 Mach-O 制品必须是当前平台的 64 位小端映像",
+        ));
+    }
     let expected = expected_mach_cpu()?;
     if mach.header.cputype != expected {
         return Err(native_format_error(format!(
@@ -491,15 +503,61 @@ fn validate_mach_library(mach: &MachO<'_>) -> Result<(), NativeError> {
         matches!(
             command.command,
             goblin::mach::load_command::CommandVariant::DyldEnvironment(_)
+                | goblin::mach::load_command::CommandVariant::LoadDylinker(_)
+                | goblin::mach::load_command::CommandVariant::IdDylinker(_)
+                | goblin::mach::load_command::CommandVariant::LoadFvmlib(_)
+                | goblin::mach::load_command::CommandVariant::IdFvmlib(_)
+                | goblin::mach::load_command::CommandVariant::Fvmfile(_)
+                | goblin::mach::load_command::CommandVariant::PreboundDylib(_)
+                | goblin::mach::load_command::CommandVariant::SubFramework(_)
+                | goblin::mach::load_command::CommandVariant::SubUmbrella(_)
+                | goblin::mach::load_command::CommandVariant::SubClient(_)
+                | goblin::mach::load_command::CommandVariant::SubLibrary(_)
+                | goblin::mach::load_command::CommandVariant::FilesetEntry(_)
+                | goblin::mach::load_command::CommandVariant::Unimplemented(_)
         )
     }) {
         return Err(native_dependency_error(
-            "Mach-O 原生制品不得通过 LC_DYLD_ENVIRONMENT 改写装载环境",
+            "Mach-O 原生制品含未纳入固定依赖闭包的动态装载命令",
         ));
     }
     // goblin reserves index zero for the image's own LC_ID_DYLIB (or the synthetic
     // "self" entry). Only subsequent entries are dependencies consulted by dyld.
     let libraries = mach.libs.get(1..).unwrap_or_default();
+    let dependency_commands = mach
+        .load_commands
+        .iter()
+        .filter(|command| {
+            matches!(
+                command.command,
+                goblin::mach::load_command::CommandVariant::LoadDylib(_)
+                    | goblin::mach::load_command::CommandVariant::LoadUpwardDylib(_)
+                    | goblin::mach::load_command::CommandVariant::ReexportDylib(_)
+                    | goblin::mach::load_command::CommandVariant::LoadWeakDylib(_)
+                    | goblin::mach::load_command::CommandVariant::LazyLoadDylib(_)
+            )
+        })
+        .count();
+    if dependency_commands != libraries.len() {
+        return Err(native_format_error(
+            "Mach-O 动态依赖命令含不能完整解析的库名称",
+        ));
+    }
+    let identifier_commands = mach
+        .load_commands
+        .iter()
+        .filter(|command| {
+            matches!(
+                command.command,
+                goblin::mach::load_command::CommandVariant::IdDylib(_)
+            )
+        })
+        .count();
+    if (mach.header.filetype == goblin::mach::header::MH_DYLIB && identifier_commands != 1)
+        || (mach.header.filetype == goblin::mach::header::MH_BUNDLE && identifier_commands != 0)
+    {
+        return Err(native_format_error("Mach-O 动态库标识命令与映像类型不一致"));
+    }
     validate_mach_dependencies(libraries, &mach.rpaths)
 }
 
@@ -541,8 +599,8 @@ fn validate_mach_container(mach: Mach<'_>) -> Result<(), NativeError> {
 
 #[cfg(all(not(target_family = "wasm"), any(test, target_os = "windows")))]
 fn validate_pe_library(pe: &goblin::pe::PE<'_>) -> Result<(), NativeError> {
-    if !pe.is_lib {
-        return Err(native_format_error("ABI v2 PE 制品必须标记为 DLL"));
+    if !pe.is_lib || !pe.is_64 {
+        return Err(native_format_error("ABI v2 PE 制品必须标记为 64 位 DLL"));
     }
     let expected = expected_pe_machine()?;
     if pe.header.coff_header.machine != expected {
@@ -556,6 +614,9 @@ fn validate_pe_library(pe: &goblin::pe::PE<'_>) -> Result<(), NativeError> {
         .optional_header
         .as_ref()
         .ok_or_else(|| native_format_error("ABI v2 PE 制品缺少可选头"))?;
+    if let Some(imports) = &pe.import_data {
+        validate_dependency_count(imports.import_data.len())?;
+    }
     validate_pe_dependencies(
         &pe.libraries,
         optional
@@ -1607,6 +1668,12 @@ mod tests {
             "NATIVE_DEPENDENCY"
         );
         assert_eq!(
+            validate_elf_dependencies(&["$ORIGIN"], &[], &[])
+                .unwrap_err()
+                .code,
+            "NATIVE_DEPENDENCY"
+        );
+        assert_eq!(
             validate_elf_dependencies(&["libc.so.6"], &["$ORIGIN"], &[])
                 .unwrap_err()
                 .code,
@@ -1628,6 +1695,12 @@ mod tests {
             "NATIVE_DEPENDENCY"
         );
         assert_eq!(
+            validate_mach_dependencies(&["/usr/lib/lib\nescape.dylib"], &[])
+                .unwrap_err()
+                .code,
+            "NATIVE_DEPENDENCY"
+        );
+        assert_eq!(
             validate_mach_dependencies(&["/usr/lib/libSystem.B.dylib"], &["@loader_path"])
                 .unwrap_err()
                 .code,
@@ -1638,6 +1711,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             validate_pe_dependencies(&["..\\escape.dll"], false)
+                .unwrap_err()
+                .code,
+            "NATIVE_DEPENDENCY"
+        );
+        assert_eq!(
+            validate_pe_dependencies(&["KERNEL32.dll."], false)
                 .unwrap_err()
                 .code,
             "NATIVE_DEPENDENCY"

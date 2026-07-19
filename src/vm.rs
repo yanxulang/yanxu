@@ -3881,57 +3881,17 @@ impl Vm {
                 .insert(cache_key, extension.clone());
             return Ok(extension);
         }
-        let root = self.package_root.as_deref().unwrap_or(directory);
-        let manifest = crate::package::discover(root)
-            .map_err(|runtime_error| error(span, runtime_error.to_string()))?
-            .ok_or_else(|| error(span, "当前程序不属于包，不能装载锁定原生扩展"))?;
-        let offline = std::env::var_os("YANXU_OFFLINE").is_some();
-        let (graph, capabilities) =
-            crate::package::resolve_graph_with_capabilities(&manifest, offline)
-                .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
-        if !self
-            .package_module_roots
-            .revalidate_exact_root(root)
-            .map_err(|runtime_error| package_path_error(span, runtime_error))?
-        {
-            return Err(error(
-                span,
-                "应用包根在执行开始后被替换；拒绝重新解析原生扩展",
-            ));
-        }
-        let mut opened_roots = self.package_module_roots.clone();
+        let (dependency, capabilities) =
+            crate::package::resolve_native_dependency_scoped_with_opened_capabilities(
+                &self.package_module_roots,
+                self.package_root.as_deref(),
+                directory,
+                package_name,
+            )
+            .map_err(|runtime_error| package_error(span, runtime_error))?;
         capabilities
-            .extend(&mut opened_roots)
+            .extend(&mut self.package_module_roots)
             .map_err(|runtime_error| package_path_error(span, runtime_error))?;
-
-        let direct_edges = graph
-            .packages
-            .values()
-            .filter(|dependency| directory.starts_with(&dependency.root))
-            .max_by_key(|dependency| dependency.root.components().count())
-            .map_or(&graph.root_dependencies, |dependency| {
-                &dependency.locked.dependencies
-            });
-        let mut direct_ids = direct_edges.values().collect::<Vec<_>>();
-        direct_ids.sort();
-        direct_ids.dedup();
-        let mut matches = direct_ids
-            .into_iter()
-            .filter_map(|id| graph.packages.get(id))
-            .filter(|dependency| dependency.locked.name == package_name)
-            .cloned()
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(error(
-                span,
-                if matches.is_empty() {
-                    format!("当前包没有直接声明名为“{package_name}”的锁定依赖")
-                } else {
-                    format!("当前包直接依赖多个名为“{package_name}”的包，不能消歧")
-                },
-            ));
-        }
-        let dependency = matches.pop().expect("one native dependency");
         let artifact = dependency.locked.native.as_ref().ok_or_else(|| {
             error(
                 span,
@@ -3939,7 +3899,7 @@ impl Vm {
             )
         })?;
         let artifact_path = dependency.root.join(&artifact.path);
-        let cache_key = format!("disk:{}", dependency.locked.id);
+        let cache_key = format!("disk:{}:{}", dependency.locked.id, artifact.checksum);
         if let Some(extension) = self.native_extensions_v2.get(&cache_key) {
             self.permissions
                 .check_native_extension(&artifact_path)
