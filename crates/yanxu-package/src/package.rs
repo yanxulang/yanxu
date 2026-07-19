@@ -6,6 +6,14 @@
 
 mod archive;
 
+use crate::path_policy::{
+    PACKAGE_PATH_NON_PORTABLE_CODE, PackagePathDecision, PackagePathError, PackagePathPurpose,
+    PackagePathReason, PortablePackagePaths, ResolvedPackageFile, TrustedPackageRoots,
+    package_path_decision, portable_case_fold, portable_package_path,
+    resolve_existing_package_path,
+};
+#[cfg(target_os = "wasi")]
+use crate::path_policy::{WasiPackageDirectory, WasiPackageDirectoryEntry, WasiPackageEntry};
 use archive::{
     ARCHIVE_LIMITS, ArchiveLimits, extract_archive_bytes_safely, find_manifest_root,
     validate_archive_relative_path, validate_existing_package_archive,
@@ -26,6 +34,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use unicode_normalization::UnicodeNormalization;
 
+#[cfg(not(target_os = "wasi"))]
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+
 pub const MANIFEST_NAME: &str = "言序.toml";
 pub const LOCK_NAME: &str = "言序.lock";
 pub const MANIFEST_FORMAT_VERSION: u32 = 2;
@@ -41,6 +52,10 @@ pub const ARCHIVE_MAX_PATH_BYTES: usize = 512;
 pub const NATIVE_ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 pub const NATIVE_ARTIFACT_MAX_COUNT: usize = 32;
 pub const NATIVE_ARTIFACT_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const PACKAGE_TREE_MAX_FILE_BYTES: u64 = NATIVE_ARTIFACT_MAX_BYTES;
+const PACKAGE_TREE_MAX_BYTES: u64 = NATIVE_ARTIFACT_MAX_TOTAL_BYTES + ARCHIVE_MAX_EXPANDED_BYTES;
+const PACKAGE_TREE_MAX_ENTRIES: usize = 100_000;
+const PACKAGE_TREE_MAX_DEPTH: usize = 128;
 const REGISTRY_INDEX_MAX_VERSIONS: usize = 10_000;
 const REGISTRY_RELEASE_URL_MAX_BYTES: usize = 4_096;
 const REGISTRY_VULNERABILITY_MAX_COUNT: usize = 1_024;
@@ -374,6 +389,36 @@ impl fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
+impl ManifestError {
+    #[doc(hidden)]
+    pub fn code(&self) -> &'static str {
+        match self.message.split_once(']').map(|(code, _)| code) {
+            Some("[PACKAGE_MODULE_RESERVED_PATH") => {
+                crate::path_policy::PACKAGE_MODULE_RESERVED_PATH_CODE
+            }
+            Some("[PACKAGE_PATH_NON_PORTABLE") => {
+                crate::path_policy::PACKAGE_PATH_NON_PORTABLE_CODE
+            }
+            Some("[PACKAGE_PATH_INVALID") => crate::path_policy::PACKAGE_PATH_INVALID_CODE,
+            Some("[PACKAGE_ROOT_INVALID") => crate::path_policy::PACKAGE_ROOT_INVALID_CODE,
+            Some("[PACKAGE_MODULE_OUTSIDE_ROOT") => {
+                crate::path_policy::PACKAGE_MODULE_OUTSIDE_ROOT_CODE
+            }
+            Some("[PACKAGE_PATH_RESERVED") => crate::path_policy::PACKAGE_PATH_RESERVED_CODE,
+            Some("[PACKAGE_PATH_COLLISION") => crate::path_policy::PACKAGE_PATH_COLLISION_CODE,
+            _ => "PACKAGE000",
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn diagnostic_message(&self) -> &str {
+        self.message
+            .strip_prefix('[')
+            .and_then(|message| message.split_once("] ").map(|(_, message)| message))
+            .unwrap_or(&self.message)
+    }
+}
+
 fn atomic_write(path: &Path, bytes: &[u8], kind: &str) -> Result<(), ManifestError> {
     crate::storage::atomic_write(path, bytes)
         .map_err(|error| manifest_error(path, None, format!("不能原子写入{kind}：{error}")))
@@ -517,7 +562,32 @@ pub fn resolve_dependency_scoped(
             ),
         )
     })?;
-    dependency.entry = dependency.root.join(exported);
+    package_path_decision(Path::new(exported), PackagePathPurpose::ModuleSource)
+        .map_err(|error| package_path_manifest_error(&dependency.root, error))?;
+    let entry = resolve_existing_package_path(
+        &dependency.root,
+        Path::new(exported),
+        PackagePathPurpose::ModuleSource,
+    )
+    .map_err(|error| package_path_manifest_error(&dependency.root, error))?;
+    let metadata = fs::symlink_metadata(&entry).map_err(|error| {
+        manifest_error(&entry, None, format!("不能检查锁定包导出模块：{error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(manifest_error(
+            &entry,
+            None,
+            "锁定包导出模块必须是普通文件，不得为目录、符号链接或特殊文件",
+        ));
+    }
+    let mut roots = TrustedPackageRoots::default();
+    roots
+        .insert(&dependency.root)
+        .map_err(|error| package_path_manifest_error(&entry, error))?;
+    roots
+        .authorize_module(&entry, &entry)
+        .map_err(|error| package_path_manifest_error(&entry, error))?;
+    dependency.entry = entry;
     Ok(dependency)
 }
 
@@ -1059,10 +1129,12 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         .ok_or_else(|| manifest_error(&path, None, "【包】缺少字符串“版”"))?;
     let version = Version::parse(raw_version)
         .map_err(|error| manifest_error(&path, None, format!("包版本须为语义化版本：{error}")))?;
-    let entry = PathBuf::from(
+    let entry = manifest_relative_path(
         string_alias(package, &["入口", "entry"])
             .ok_or_else(|| manifest_error(&path, None, "【包】缺少字符串“入口”"))?,
-    );
+        &path,
+        "入口",
+    )?;
     validate_entry(&entry).map_err(|message| manifest_error(&path, None, message))?;
     let description = string_alias(package, &["说明", "description"]).map(str::to_owned);
     let license = string_alias(package, &["许可", "license"]).map(str::to_owned);
@@ -1116,7 +1188,7 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
             let export = value.as_str().ok_or_else(|| {
                 manifest_error(&path, None, format!("导出“{name}”须为相对 .yx 文卷"))
             })?;
-            let export = PathBuf::from(export);
+            let export = manifest_relative_path(export, &path, &format!("导出“{name}”"))?;
             validate_entry(&export).map_err(|message| manifest_error(&path, None, message))?;
             exports.insert(name.clone(), export);
         }
@@ -1129,8 +1201,8 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         .and_then(|table| array_alias(table, &["目录", "directories"]))
         .unwrap_or_default()
         .into_iter()
-        .map(PathBuf::from)
         .map(|resource| {
+            let resource = manifest_relative_path(resource, &path, "资源")?;
             validate_relative_path(&resource, "资源")?;
             Ok(resource)
         })
@@ -1158,8 +1230,8 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
         .and_then(|table| array_alias(table, &["成员", "members"]))
         .unwrap_or_default()
         .into_iter()
-        .map(PathBuf::from)
         .map(|member| {
+            let member = manifest_relative_path(member, &path, "工作区成员")?;
             validate_relative_path(&member, "工作区成员")?;
             Ok(member)
         })
@@ -1170,6 +1242,7 @@ fn parse(text: &str, path: PathBuf, root: PathBuf) -> Result<Manifest, ManifestE
     let mut permissions = crate::permissions::PermissionSet::sandboxed();
     if let Some(table) = table_alias(&document, &["权限", "permissions"]) {
         for permission_path in array_alias(table, &["文件", "file"]).unwrap_or_default() {
+            let permission_path = manifest_relative_path(permission_path, &path, "权限文件")?;
             permissions = permissions.allow_file(root.join(permission_path));
         }
         for host in array_alias(table, &["网络", "network"]).unwrap_or_default() {
@@ -1330,8 +1403,10 @@ fn parse_dependency(
     name: &str,
 ) -> Result<Dependency, ManifestError> {
     if let Some(path) = value.as_str() {
+        validate_local_source_path_text(path)
+            .map_err(|message| manifest_error(manifest_path, None, message))?;
         let dependency = Dependency::Path {
-            path: PathBuf::from(path),
+            path: manifest_relative_path(path, manifest_path, &format!("依赖“{name}”路径"))?,
             requirement: None,
         };
         validate_dependency_source_security(&dependency)
@@ -1356,8 +1431,10 @@ fn parse_dependency(
             )
         })?;
     if let Some(path) = string_alias(table, &["路径", "path"]) {
+        validate_local_source_path_text(path)
+            .map_err(|message| manifest_error(manifest_path, None, message))?;
         let dependency = Dependency::Path {
-            path: PathBuf::from(path),
+            path: manifest_relative_path(path, manifest_path, &format!("依赖“{name}”路径"))?,
             requirement,
         };
         validate_dependency_source_security(&dependency)
@@ -1449,7 +1526,11 @@ fn parse_native_package(
                     format!("原生制品 {os}.{architecture} 缺少 SHA-256 校验和"),
                 )
             })?;
-            let relative = PathBuf::from(path);
+            let relative = manifest_relative_path(
+                path,
+                manifest_path,
+                &format!("原生制品 {os}.{architecture}"),
+            )?;
             validate_relative_path(&relative, "原生制品")?;
             if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err(manifest_error(
@@ -1458,10 +1539,13 @@ fn parse_native_package(
                     format!("原生制品 {os}.{architecture} 的校验和须为 64 位十六进制 SHA-256"),
                 ));
             }
-            let full_path = manifest_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(&relative);
+            let package_root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+            let full_path = resolve_existing_package_path(
+                package_root,
+                &relative,
+                PackagePathPurpose::ManifestReference,
+            )
+            .map_err(|error| package_path_manifest_error(manifest_path, error))?;
             let metadata = fs::symlink_metadata(&full_path).map_err(|error| {
                 manifest_error(&full_path, None, format!("不能检查原生制品：{error}"))
             })?;
@@ -1573,10 +1657,12 @@ fn parse_application_config(
         )
     })?;
     let icon = string_alias(table, &["图标", "icon"])
-        .map(PathBuf::from)
-        .map(|icon| {
+        .map(|raw| {
+            let icon = manifest_relative_path(raw, manifest_path, "应用图标")?;
             validate_relative_path(&icon, "应用图标")?;
-            let full_path = root.join(&icon);
+            let full_path =
+                resolve_existing_package_path(root, &icon, PackagePathPurpose::ManifestReference)
+                    .map_err(|error| package_path_manifest_error(manifest_path, error))?;
             let metadata = fs::symlink_metadata(&full_path).map_err(|error| {
                 manifest_error(&full_path, None, format!("不能检查应用图标：{error}"))
             })?;
@@ -1586,15 +1672,6 @@ fn parse_application_config(
                     None,
                     "应用图标必须是包内普通文件，不得为符号链接或特殊文件",
                 ));
-            }
-            let canonical_root = fs::canonicalize(root).map_err(|error| {
-                manifest_error(root, None, format!("不能定位包根目录：{error}"))
-            })?;
-            let canonical_icon = fs::canonicalize(&full_path).map_err(|error| {
-                manifest_error(&full_path, None, format!("不能定位应用图标：{error}"))
-            })?;
-            if !canonical_icon.starts_with(canonical_root) {
-                return Err(manifest_error(&full_path, None, "应用图标越出包根目录"));
             }
             Ok(icon)
         })
@@ -1761,6 +1838,26 @@ fn native_target(os: &str, architecture: &str) -> String {
     }
 }
 
+fn manifest_relative_path(
+    raw: &str,
+    manifest_path: &Path,
+    kind: &str,
+) -> Result<PathBuf, ManifestError> {
+    if raw.contains('\\') {
+        return Err(package_path_manifest_error(
+            manifest_path,
+            PackagePathError {
+                code: PACKAGE_PATH_NON_PORTABLE_CODE,
+                message: format!("{kind}路径“{raw}”包含反斜杠目录分隔符。"),
+                path: PathBuf::from(raw),
+                component: None,
+                suggestion: "请在包清单路径中统一使用正斜杠。".into(),
+            },
+        ));
+    }
+    Ok(PathBuf::from(raw))
+}
+
 fn validate_relative_path(path: &Path, kind: &str) -> Result<(), ManifestError> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
@@ -1892,13 +1989,17 @@ impl GraphBuilder<'_> {
                 .minimum_yanxu
                 .as_ref()
                 .map(ToString::to_string);
-            resolved.entry = resolved.root.join(
-                resolved
-                    .locked
-                    .exports
-                    .get("默认")
-                    .expect("manifest always has default export"),
-            );
+            let default_export = resolved
+                .locked
+                .exports
+                .get("默认")
+                .expect("manifest always has default export");
+            resolved.entry = resolve_existing_package_path(
+                &resolved.root,
+                Path::new(default_export),
+                PackagePathPurpose::ModuleSource,
+            )
+            .map_err(|error| package_path_manifest_error(&dependency_manifest.path, error))?;
             self.visiting.pop();
             self.packages.insert(id, resolved);
         }
@@ -1991,7 +2092,12 @@ fn selected_native_artifact(
             ),
         )
     })?;
-    let path = manifest.root.join(&artifact.path);
+    let path = resolve_existing_package_path(
+        &manifest.root,
+        Path::new(&artifact.path),
+        PackagePathPurpose::ManifestReference,
+    )
+    .map_err(|error| package_path_manifest_error(&manifest.path, error))?;
     let metadata = fs::symlink_metadata(&path)
         .map_err(|error| manifest_error(&path, None, format!("不能检查原生制品：{error}")))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -2040,27 +2146,27 @@ fn resolve_one(
         && let Some(root) = find_vendored_package(&manifest.root, locked)?
     {
         let requirement = dependency_requirement(dependency);
-        let resolved = lock_local(
+        let mut resolved = lock_local(
             package_name,
             &root,
             &locked.source,
             locked.revision.clone(),
             requirement,
         )?;
-        verify_locked(alias, &root, &resolved, Some(locked))?;
+        verify_locked(alias, &root, &mut resolved, Some(locked))?;
         return Ok(resolved);
     }
     match dependency {
         Dependency::Path { path, requirement } => {
             let root = canonical_dependency_root(&manifest.root.join(path))?;
-            let resolved = lock_local(
+            let mut resolved = lock_local(
                 package_name,
                 &root,
                 &format!("path:{}", path.display()),
                 None,
                 requirement.as_ref(),
             )?;
-            verify_locked(alias, &root, &resolved, locked)?;
+            verify_locked(alias, &root, &mut resolved, locked)?;
             Ok(resolved)
         }
         Dependency::Git {
@@ -2070,14 +2176,14 @@ fn resolve_one(
         } => {
             let exact_revision = locked.and_then(|locked| locked.revision.as_deref());
             let (root, revision) = resolve_git(url, exact_revision.unwrap_or(revision), offline)?;
-            let resolved = lock_local(
+            let mut resolved = lock_local(
                 package_name,
                 &root,
                 &format!("git:{url}"),
                 Some(revision),
                 requirement.as_ref(),
             )?;
-            verify_locked(alias, &root, &resolved, locked)?;
+            verify_locked(alias, &root, &mut resolved, locked)?;
             Ok(resolved)
         }
         Dependency::Registry {
@@ -2090,7 +2196,7 @@ fn resolve_one(
                 .map_err(|error| {
                     manifest_error(&manifest.path, None, format!("锁定版本无效：{error}"))
                 })?;
-            let resolved = resolve_registry(
+            let mut resolved = resolve_registry(
                 package_name,
                 requirement,
                 registry,
@@ -2098,7 +2204,8 @@ fn resolve_one(
                 locked.map(|locked| locked.checksum.as_str()),
                 offline,
             )?;
-            verify_locked(alias, &resolved.root, &resolved, locked)?;
+            let resolved_root = resolved.root.clone();
+            verify_locked(alias, &resolved_root, &mut resolved, locked)?;
             Ok(resolved)
         }
     }
@@ -2107,24 +2214,31 @@ fn resolve_one(
 fn verify_locked(
     name: &str,
     root: &Path,
-    resolved: &ResolvedDependency,
+    resolved: &mut ResolvedDependency,
     locked: Option<&LockedPackage>,
 ) -> Result<(), ManifestError> {
-    if let Some(locked) = locked
-        && (locked.name != resolved.locked.name
+    if let Some(locked) = locked {
+        let checksum_matches = if locked.checksum == resolved.locked.checksum {
+            true
+        } else {
+            tree_checksum_matches(root, &locked.checksum)?
+        };
+        if locked.name != resolved.locked.name
             || locked.version != resolved.locked.version
             || locked.source != resolved.locked.source
             || locked.revision != resolved.locked.revision
-            || locked.checksum != resolved.locked.checksum
-            || locked.entry != resolved.locked.entry)
-    {
-        return Err(manifest_error(
-            root,
-            None,
-            format!(
-                "依赖“{name}”与 {LOCK_NAME} 不符（版本、修订或内容校验已改变）；请显式更新锁文件"
-            ),
-        ));
+            || !checksum_matches
+            || locked.entry != resolved.locked.entry
+        {
+            return Err(manifest_error(
+                root,
+                None,
+                format!(
+                    "依赖“{name}”与 {LOCK_NAME} 不符（版本、修订或内容校验已改变）；请显式更新锁文件"
+                ),
+            ));
+        }
+        resolved.locked.checksum.clone_from(&locked.checksum);
     }
     Ok(())
 }
@@ -2166,6 +2280,12 @@ fn lock_local(
         ));
     }
     let checksum = tree_checksum(&root)?;
+    let entry = resolve_existing_package_path(
+        &root,
+        &dependency_manifest.entry,
+        PackagePathPurpose::ModuleSource,
+    )
+    .map_err(|error| package_path_manifest_error(&dependency_manifest.path, error))?;
     Ok(ResolvedDependency {
         locked: LockedPackage {
             id: String::new(),
@@ -2181,7 +2301,7 @@ fn lock_local(
             native: None,
             minimum_yanxu: None,
         },
-        entry: root.join(dependency_manifest.entry),
+        entry,
         root,
     })
 }
@@ -2833,14 +2953,19 @@ fn resolve_registry(
         }
         if offline {
             if let Some(error) = lookup.invalid {
-                return Err(manifest_error(
-                    error.path,
-                    None,
+                let message = if error.code() == "PACKAGE000" {
                     format!(
                         "离线索引缓存损坏或与锁文件校验和不一致：{}；请联网重新安装",
                         error.message
-                    ),
-                ));
+                    )
+                } else {
+                    format!(
+                        "[{}] 离线索引缓存损坏或与锁文件校验和不一致：{}；请联网重新安装",
+                        error.code(),
+                        error.diagnostic_message()
+                    )
+                };
+                return Err(manifest_error(error.path, None, message));
             }
             return Err(manifest_error(
                 &registry_cache,
@@ -3358,8 +3483,9 @@ fn validate_registry_root(
     {
         return Err(manifest_error(root, None, "索引包内容 SHA-256 无效"));
     }
+    validate_published_package_tree(root)?;
     let source = format!("registry:{}", key.registry);
-    let resolved = lock_local(key.name, root, &source, None, Some(key.requirement))?;
+    let mut resolved = lock_local(key.name, root, &source, None, Some(key.requirement))?;
     if resolved.locked.version != key.version.to_string() {
         return Err(manifest_error(
             &resolved.root,
@@ -3370,17 +3496,19 @@ fn validate_registry_root(
             ),
         ));
     }
-    if let Some(expected) = expected_tree_checksum
-        && resolved.locked.checksum != expected
-    {
-        return Err(manifest_error(
-            &resolved.root,
-            None,
-            format!(
-                "索引包内容校验不符：应为 {expected}，实为 {}",
-                resolved.locked.checksum
-            ),
-        ));
+    if let Some(expected) = expected_tree_checksum {
+        if resolved.locked.checksum != expected && !tree_checksum_matches(&resolved.root, expected)?
+        {
+            return Err(manifest_error(
+                &resolved.root,
+                None,
+                format!(
+                    "索引包内容校验不符：应为 {expected}，实为 {}",
+                    resolved.locked.checksum
+                ),
+            ));
+        }
+        resolved.locked.checksum = expected.to_owned();
     }
     let canonical_cache = fs::canonicalize(key.registry_cache).map_err(|error| {
         manifest_error(
@@ -3397,6 +3525,57 @@ fn validate_registry_root(
         ));
     }
     Ok(resolved)
+}
+
+fn validate_published_package_tree(root: &Path) -> Result<(), ManifestError> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut paths = PortablePackagePaths::default();
+    while let Some(directory) = directories.pop() {
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            manifest_error(&directory, None, format!("不能遍历发布包内容：{error}"))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                manifest_error(&directory, None, format!("不能读取发布包目录项：{error}"))
+            })?;
+            let path = entry.path();
+            let relative = path.strip_prefix(root).expect("walk under published root");
+            match package_path_decision(relative, PackagePathPurpose::YxpEntry)
+                .map_err(|error| package_path_manifest_error(&path, error))?
+            {
+                PackagePathDecision::Include => {}
+                PackagePathDecision::Exclude(_) => {
+                    let error =
+                        package_path_decision(relative, PackagePathPurpose::ManifestReference)
+                            .expect_err(
+                                "excluded package path must be rejected as a manifest reference",
+                            );
+                    return Err(package_path_manifest_error(&path, error));
+                }
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                manifest_error(&path, None, format!("不能检查发布包内容：{error}"))
+            })?;
+            if metadata.is_dir() {
+                paths
+                    .insert_directory(relative)
+                    .map_err(|error| package_path_manifest_error(&path, error))?;
+            } else {
+                paths
+                    .insert(relative)
+                    .map_err(|error| package_path_manifest_error(&path, error))?;
+            }
+            if metadata.file_type().is_symlink() {
+                return Err(manifest_error(&path, None, "发布包不得包含符号链接"));
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if !metadata.is_file() {
+                return Err(manifest_error(&path, None, "发布包不得包含特殊文件"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn find_cached_registry_package_locked(
@@ -3953,14 +4132,15 @@ fn pack_package_with_limits_and_hook(
     before_archive: impl FnOnce(&Manifest) -> Result<(), ManifestError>,
 ) -> Result<PackageArtifact, ManifestError> {
     let _project_lock = acquire_project_lock(&manifest.root)?;
-    let expected_root = fs::canonicalize(&manifest.root).map_err(|error| {
-        manifest_error(
-            &manifest.root,
-            None,
-            format!("不能定位调用方包根目录：{error}"),
-        )
-    })?;
-    let declared_manifest = manifest.root.join(MANIFEST_NAME);
+    let mut trusted_root = TrustedPackageRoots::default();
+    trusted_root
+        .insert(&manifest.root)
+        .map_err(|error| package_path_manifest_error(&manifest.root, error))?;
+    let expected_root = trusted_root
+        .exact_root_identity(&manifest.root)
+        .ok_or_else(|| manifest_error(&manifest.root, None, "不能绑定调用方包根目录"))?
+        .to_path_buf();
+    let declared_manifest = expected_root.join(MANIFEST_NAME);
     let caller_manifest = fs::canonicalize(&manifest.path).map_err(|error| {
         manifest_error(
             &manifest.path,
@@ -3982,12 +4162,12 @@ fn pack_package_with_limits_and_hook(
             format!("打包只能使用包根目录中的规范清单 {MANIFEST_NAME}"),
         ));
     }
-    let manifest_bytes = read_package_file_snapshot(
-        &expected_root,
-        &declared_manifest,
-        limits.file_bytes,
-        "规范包清单",
-    )?;
+    let manifest_file = trusted_root
+        .resolve_existing_file(&declared_manifest, PackagePathPurpose::ManifestReference)
+        .map_err(|error| package_path_manifest_error(&declared_manifest, error))?
+        .ok_or_else(|| manifest_error(&declared_manifest, None, "规范包清单不属于可信包根"))?;
+    let manifest_bytes =
+        read_resolved_regular_file_snapshot(manifest_file, limits.file_bytes, "规范包清单")?;
     let manifest_text = std::str::from_utf8(&manifest_bytes).map_err(|error| {
         manifest_error(
             &declared_manifest,
@@ -3998,15 +4178,12 @@ fn pack_package_with_limits_and_hook(
     let current_manifest = parse(
         manifest_text,
         declared_manifest.clone(),
-        manifest.root.clone(),
+        expected_root.clone(),
     )?;
-    let current_root = fs::canonicalize(&current_manifest.root).map_err(|error| {
-        manifest_error(
-            &current_manifest.root,
-            None,
-            format!("不能定位锁内包根目录：{error}"),
-        )
-    })?;
+    let current_root = trusted_root
+        .exact_root_identity(&current_manifest.root)
+        .ok_or_else(|| manifest_error(&current_manifest.root, None, "锁内包根目录身份改变"))?
+        .to_path_buf();
     if current_root != expected_root {
         return Err(manifest_error(
             &current_manifest.path,
@@ -4037,14 +4214,15 @@ fn pack_package_with_limits_and_hook(
         ));
     }
     cache_graph(manifest, graph);
-    let mut files = Vec::new();
-    collect_pack_files(
+    before_archive(manifest)?;
+    let snapshot = capture_package_tree_in(
+        &trusted_root,
         &manifest.root,
-        &mut files,
-        limits,
+        PackagePathPurpose::YxpEntry,
+        PackageTreeCaptureLimits::archive(limits),
         in_tree_output.as_deref(),
     )?;
-    files.sort();
+    let files = snapshot.paths();
     if files.len() > limits.entries {
         return Err(manifest_error(
             output,
@@ -4071,8 +4249,14 @@ fn pack_package_with_limits_and_hook(
             format!("打包内容应恰含根目录一个 {MANIFEST_NAME}，实有 {manifest_count} 个"),
         ));
     }
+    if snapshot.get(Path::new(MANIFEST_NAME)) != Some(manifest_bytes.as_slice()) {
+        return Err(manifest_error(
+            &declared_manifest,
+            None,
+            "规范包清单在锁内读取后发生变化",
+        ));
+    }
     validate_package_manifest_contents_structure(manifest, &files)?;
-    before_archive(manifest)?;
     let mut pending = crate::storage::AtomicFile::create(output)
         .map_err(|error| manifest_error(output, None, format!("不能创建归档：{error}")))?;
     let limited = LimitedHashWriter::new(pending.file_mut(), limits.compressed_bytes);
@@ -4084,13 +4268,12 @@ fn pack_package_with_limits_and_hook(
     let mut expanded_bytes = 0_u64;
     for relative in &files {
         let path = manifest.root.join(relative);
-        let archive_path = Path::new("package").join(relative);
-        validate_archive_relative_path(&archive_path, limits.path_bytes)
-            .map_err(|message| manifest_error(&path, None, message))?;
-        let bytes =
-            read_package_file_snapshot(&expected_root, &path, limits.file_bytes, "打包内容")?;
+        let archive_path = validated_yxp_archive_path(relative, &path, limits.path_bytes)?;
+        let bytes = snapshot
+            .get(relative)
+            .expect("captured package path has bytes");
         let length = bytes.len() as u64;
-        validate_packaged_bytes(manifest, relative, &bytes)?;
+        validate_packaged_bytes(manifest, relative, bytes)?;
         expanded_bytes = expanded_bytes
             .checked_add(length)
             .filter(|total| *total <= limits.expanded_bytes)
@@ -4109,7 +4292,7 @@ fn pack_package_with_limits_and_hook(
         header.set_mtime(0);
         header.set_cksum();
         archive
-            .append_data(&mut header, archive_path, bytes.as_slice())
+            .append_data(&mut header, archive_path, bytes)
             .map_err(|error| manifest_error(&path, None, format!("不能写入归档：{error}")))?;
     }
     let encoder = archive
@@ -4136,7 +4319,9 @@ fn validate_package_manifest_paths(manifest: &Manifest) -> Result<(), ManifestEr
         validate_package_manifest_path(manifest, &format!("导出“{name}”"), path)?;
     }
     for path in &manifest.resources {
-        validate_package_manifest_path(manifest, "资源", path)?;
+        if path != Path::new(".") {
+            validate_package_manifest_path(manifest, "资源", path)?;
+        }
     }
     for path in &manifest.workspace_members {
         validate_package_manifest_path(manifest, "工作区成员", path)?;
@@ -4164,7 +4349,7 @@ fn validate_package_root(manifest: &Manifest) -> Result<(), ManifestError> {
     validate_package_manifest_paths(manifest)?;
     let mut files = Vec::new();
     collect_files(&manifest.root, &manifest.root, &mut files)?;
-    files.sort();
+    sort_portable_paths(&mut files)?;
     validate_package_manifest_contents(manifest, &files)
 }
 
@@ -4209,14 +4394,41 @@ fn validate_package_manifest_contents_structure(
                 format!("资源“{}”不是规范的包内路径", resource.display()),
             )
         })?;
-        let full_path = manifest.root.join(&normalized);
+        let full_path = if normalized.as_os_str().is_empty() {
+            fs::canonicalize(&manifest.root).map_err(|error| {
+                manifest_error(
+                    &manifest.root,
+                    None,
+                    format!("不能定位包资源根目录：{error}"),
+                )
+            })?
+        } else {
+            resolve_existing_package_path(
+                &manifest.root,
+                &normalized,
+                PackagePathPurpose::ManifestReference,
+            )
+            .map_err(|error| package_path_manifest_error(&manifest.path, error))?
+        };
         let metadata = fs::symlink_metadata(&full_path).map_err(|error| {
             manifest_error(&full_path, None, format!("不能检查包资源目录：{error}"))
         })?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(manifest_error(&full_path, None, "包资源必须是包内普通目录"));
         }
-        if !files.iter().any(|file| file.starts_with(&normalized)) {
+        let contains_resource = if normalized.as_os_str().is_empty() {
+            !files.is_empty()
+        } else {
+            let prefix = format!(
+                "{}/",
+                portable_package_path(&normalized)
+                    .map_err(|error| package_path_manifest_error(&manifest.path, error))?
+            );
+            files
+                .iter()
+                .any(|file| portable_package_path(file).is_ok_and(|file| file.starts_with(&prefix)))
+        };
+        if !contains_resource {
             return Err(manifest_error(
                 &full_path,
                 None,
@@ -4232,7 +4444,12 @@ fn validate_native_artifacts_on_disk(manifest: &Manifest) -> Result<(), Manifest
         return Ok(());
     };
     for (target, artifact) in &native.artifacts {
-        let path = manifest.root.join(&artifact.path);
+        let path = resolve_existing_package_path(
+            &manifest.root,
+            Path::new(&artifact.path),
+            PackagePathPurpose::ManifestReference,
+        )
+        .map_err(|error| package_path_manifest_error(&manifest.path, error))?;
         let (actual_size, actual_checksum) =
             hash_regular_file_limited(&path, NATIVE_ARTIFACT_MAX_BYTES, "原生制品")?;
         if actual_size != artifact.size || actual_checksum != artifact.checksum {
@@ -4270,7 +4487,7 @@ fn hash_regular_file_limited(
     max_bytes: u64,
     kind: &str,
 ) -> Result<(u64, String), ManifestError> {
-    let file = fs::File::open(path)
+    let file = open_regular_file_for_snapshot(path)
         .map_err(|error| manifest_error(path, None, format!("不能打开{kind}：{error}")))?;
     let metadata = file
         .metadata()
@@ -4302,20 +4519,28 @@ fn hash_regular_file_limited(
     Ok((size, format!("{:x}", digest.finalize())))
 }
 
-fn read_package_file_snapshot(
-    canonical_root: &Path,
+/// 从解析阶段持有的普通文件句柄读取有界快照。
+#[doc(hidden)]
+pub fn read_resolved_regular_file_snapshot(
+    resolved: ResolvedPackageFile,
+    max_bytes: u64,
+    kind: &str,
+) -> Result<Vec<u8>, ManifestError> {
+    let path = resolved.path().to_path_buf();
+    read_opened_regular_file_snapshot(resolved.into_file(), &path, max_bytes, kind)
+}
+
+fn read_opened_regular_file_snapshot(
+    mut file: fs::File,
     path: &Path,
     max_bytes: u64,
     kind: &str,
 ) -> Result<Vec<u8>, ManifestError> {
-    let before = fs::symlink_metadata(path)
-        .map_err(|error| manifest_error(path, None, format!("不能检查{kind}：{error}")))?;
-    if before.file_type().is_symlink() || !before.is_file() {
-        return Err(manifest_error(
-            path,
-            None,
-            format!("{kind}必须是普通文件，不得为符号链接或特殊文件"),
-        ));
+    let before = file
+        .metadata()
+        .map_err(|error| manifest_error(path, None, format!("不能检查已打开的{kind}：{error}")))?;
+    if !before.is_file() {
+        return Err(manifest_error(path, None, format!("{kind}必须是普通文件")));
     }
     if before.len() > max_bytes {
         return Err(manifest_error(
@@ -4324,32 +4549,12 @@ fn read_package_file_snapshot(
             format!("{kind}不得超过 {max_bytes} 字节"),
         ));
     }
-
-    let mut file = fs::File::open(path)
-        .map_err(|error| manifest_error(path, None, format!("不能打开{kind}：{error}")))?;
-    #[cfg(windows)]
-    let opened_identity = windows_file_identity(&file)
-        .map_err(|error| manifest_error(path, None, format!("不能识别已打开的{kind}：{error}")))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| manifest_error(path, None, format!("不能检查已打开的{kind}：{error}")))?;
-    let canonical = fs::canonicalize(path)
-        .map_err(|error| manifest_error(path, None, format!("不能定位{kind}：{error}")))?;
-    let canonical_metadata = fs::metadata(&canonical).map_err(|error| {
-        manifest_error(&canonical, None, format!("不能检查已定位的{kind}：{error}"))
-    })?;
-    if !canonical.starts_with(canonical_root)
-        || !same_file_identity(&before, &opened)
-        || !same_file_identity(&opened, &canonical_metadata)
-    {
-        return Err(manifest_error(
-            path,
-            None,
-            format!("{kind}在读取前被替换、经链接越出包根目录或身份不稳定"),
-        ));
-    }
-
+    let capacity = usize::try_from(before.len())
+        .map_err(|_| manifest_error(path, None, format!("{kind}大小无法由当前平台安全分配")))?;
     let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        manifest_error(path, None, format!("不能为{kind}快照分配内存：{error}"))
+    })?;
     (&mut file)
         .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
@@ -4361,78 +4566,123 @@ fn read_package_file_snapshot(
             format!("{kind}不得超过 {max_bytes} 字节"),
         ));
     }
-
-    let after = fs::symlink_metadata(path)
-        .map_err(|error| manifest_error(path, None, format!("不能复验{kind}：{error}")))?;
-    #[cfg(windows)]
-    let path_identity_changed = {
-        let verification = fs::File::open(path).map_err(|error| {
-            manifest_error(path, None, format!("不能重新打开{kind}以复验身份：{error}"))
-        })?;
-        windows_file_identity(&verification).map_err(|error| {
-            manifest_error(path, None, format!("不能复验{kind}文件身份：{error}"))
-        })? != opened_identity
-    };
-    #[cfg(not(windows))]
-    let path_identity_changed = false;
-    if after.file_type().is_symlink()
-        || !after.is_file()
-        || path_identity_changed
-        || !same_file_identity(&opened, &after)
-        || opened.len() != bytes.len() as u64
+    let after = file
+        .metadata()
+        .map_err(|error| manifest_error(path, None, format!("不能复验已打开的{kind}：{error}")))?;
+    if !after.is_file()
+        || before.len() != bytes.len() as u64
         || after.len() != bytes.len() as u64
-        || metadata_modified_changed(&opened, &after)
+        || metadata_modified_changed(&before, &after)
     {
         return Err(manifest_error(
             path,
             None,
-            format!("{kind}在打包读取期间发生变化"),
+            format!("{kind}在读取期间发生变化"),
         ));
     }
     Ok(bytes)
 }
 
-#[cfg(windows)]
-fn windows_file_identity(file: &fs::File) -> io::Result<(u32, u64)> {
-    use std::mem::MaybeUninit;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
+#[cfg(not(target_os = "wasi"))]
+fn open_regular_file_for_snapshot(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
 
-    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
-        return Err(io::Error::last_os_error());
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let information = unsafe { information.assume_init() };
-    let index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    Ok((information.dwVolumeSerialNumber, index))
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !is_regular_file_metadata(&file.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "文件必须是普通文件，不得为符号链接、重解析点或特殊文件",
+        ));
+    }
+    Ok(file)
 }
 
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "wasi")]
+fn open_regular_file_for_snapshot(path: &Path) -> io::Result<fs::File> {
+    use rustix::fs::{AtFlags, Mode, OFlags, fstat, openat, readlinkat, statat};
 
-    left.dev() == right.dev() && left.ino() == right.ino()
+    let before =
+        statat(rustix::fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    let before_identity = wasi_regular_file_identity(&before)?;
+    match readlinkat(rustix::fs::CWD, path, Vec::new()) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "文件不得为符号链接",
+            ));
+        }
+        Err(error) if error == rustix::io::Errno::INVAL => {}
+        Err(error) => return Err(io::Error::from(error)),
+    }
+    let descriptor = openat(
+        rustix::fs::CWD,
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let opened = fstat(&descriptor).map_err(io::Error::from)?;
+    let opened_identity = wasi_regular_file_identity(&opened)?;
+    let after =
+        statat(rustix::fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    let after_identity = wasi_regular_file_identity(&after)?;
+    if before_identity != opened_identity || opened_identity != after_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "文件在打开期间被替换或 WASI 宿主没有保持描述符绑定",
+        ));
+    }
+    Ok(descriptor.into())
+}
+
+#[cfg(target_os = "wasi")]
+fn wasi_regular_file_identity(metadata: &rustix::fs::Stat) -> io::Result<(u64, u64)> {
+    if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::RegularFile {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "文件必须是普通文件，不得为符号链接或特殊文件",
+        ));
+    }
+    if metadata.st_dev == 0 || metadata.st_ino == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "WASI 宿主未提供非零文件设备号与索引号",
+        ));
+    }
+    Ok((metadata.st_dev, metadata.st_ino))
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn is_regular_file_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && !standard_metadata_is_reparse(metadata)
 }
 
 #[cfg(windows)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+fn standard_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-    left.file_attributes() == right.file_attributes()
-        && left.creation_time() == right.creation_time()
-        && left.last_write_time() == right.last_write_time()
-        && left.file_size() == right.file_size()
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.is_file()
-        && right.is_file()
-        && left.len() == right.len()
-        && left.created().ok() == right.created().ok()
+#[cfg(all(not(windows), not(target_os = "wasi")))]
+fn standard_metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn metadata_modified_changed(left: &fs::Metadata, right: &fs::Metadata) -> bool {
@@ -4463,7 +4713,11 @@ fn validate_packaged_bytes(
     }
     if let Some((target, artifact)) = manifest.native.as_ref().and_then(|native| {
         native.artifacts.iter().find(|(_, artifact)| {
-            normalize_pack_relative_path(Path::new(&artifact.path)).as_deref() == Some(relative)
+            normalize_pack_relative_path(Path::new(&artifact.path)).is_some_and(|artifact_path| {
+                portable_package_path(&artifact_path).is_ok_and(|artifact_path| {
+                    portable_package_path(relative).is_ok_and(|relative| artifact_path == relative)
+                })
+            })
         })
     }) {
         let actual_size = bytes.len() as u64;
@@ -4481,6 +4735,19 @@ fn validate_packaged_bytes(
     Ok(())
 }
 
+fn validated_yxp_archive_path(
+    relative: &Path,
+    source: &Path,
+    max_bytes: usize,
+) -> Result<PathBuf, ManifestError> {
+    let portable_relative = portable_package_path(relative)
+        .map_err(|error| package_path_manifest_error(source, error))?;
+    let archive_path = Path::new("package").join(portable_relative);
+    validate_archive_relative_path(&archive_path, max_bytes)
+        .map_err(|message| manifest_error(source, None, message))?;
+    Ok(archive_path)
+}
+
 fn validate_package_file(
     manifest: &Manifest,
     files: &[PathBuf],
@@ -4494,7 +4761,12 @@ fn validate_package_file(
             format!("{kind}“{}”不是规范的包内路径", path.display()),
         )
     })?;
-    if files.binary_search(&normalized).is_err() {
+    let expected = portable_package_path(&normalized)
+        .map_err(|error| package_path_manifest_error(&manifest.path, error))?;
+    let found = files
+        .iter()
+        .any(|file| portable_package_path(file).is_ok_and(|candidate| candidate == expected));
+    if !found {
         return Err(manifest_error(
             &manifest.path,
             None,
@@ -4524,21 +4796,16 @@ fn validate_package_manifest_path(
     kind: &str,
     path: &Path,
 ) -> Result<(), ManifestError> {
-    let Some(component) = path.components().find_map(|component| match component {
-        Component::Normal(component) if is_excluded_package_name(component) => Some(component),
-        _ => None,
-    }) else {
-        return Ok(());
-    };
-    Err(manifest_error(
-        &manifest.path,
-        None,
-        format!(
-            "{kind}“{}”含保留路径组件 {}；该路径不属于可发布包内容",
-            path.display(),
-            component.to_string_lossy()
-        ),
-    ))
+    match package_path_decision(path, PackagePathPurpose::ManifestReference) {
+        Ok(PackagePathDecision::Include) => Ok(()),
+        Ok(PackagePathDecision::Exclude(_)) => {
+            unreachable!("manifest references reject reserved paths")
+        }
+        Err(mut error) => {
+            error.message = format!("{kind}无效：{}", error.message);
+            Err(package_path_manifest_error(&manifest.path, error))
+        }
+    }
 }
 
 fn validate_pack_output(
@@ -4611,16 +4878,25 @@ fn validate_pack_output_location(
     if relative.as_os_str().is_empty() {
         return Err(manifest_error(display, None, "打包输出不能覆盖包根目录"));
     }
-    let generated_output = relative.components().next().is_some_and(
-        |component| matches!(component, Component::Normal(name) if is_generated_package_name(name)),
+    let output_decision = package_path_decision(relative, PackagePathPurpose::YxpEntry)
+        .map_err(|error| package_path_manifest_error(display, error))?;
+    let generated_output = matches!(
+        output_decision,
+        PackagePathDecision::Exclude(PackagePathReason::ReservedComponent { ref component })
+            if matches!(component.as_str(), ".yanxu" | "target" | "build" | "vendor")
     );
     if output_exists && !generated_output {
         validate_existing_package_archive(output, limits).map_err(|error| {
-            manifest_error(
-                display,
-                error.line,
-                format!("源树内既有输出不是可安全替换的 YXP：{}", error.message),
-            )
+            let message = if error.code() == "PACKAGE000" {
+                format!("源树内既有输出不是可安全替换的 YXP：{}", error.message)
+            } else {
+                format!(
+                    "[{}] 源树内既有输出不是可安全替换的 YXP：{}",
+                    error.code(),
+                    error.diagnostic_message()
+                )
+            };
+            manifest_error(display, error.line, message)
         })?;
     }
     Ok(Some(relative.to_path_buf()))
@@ -4633,15 +4909,11 @@ fn validate_pack_output_conflicts(
     let Some(relative) = relative else {
         return Ok(());
     };
-    let canonical_root = fs::canonicalize(&manifest.root).map_err(|error| {
-        manifest_error(
-            &manifest.root,
-            None,
-            format!("不能定位包根目录以检查输出冲突：{error}"),
-        )
-    })?;
+    let output_identity = portable_pack_path_identity(relative)
+        .map_err(|error| package_path_manifest_error(relative, error))?;
     let mut protected = vec![
         ("包清单".to_owned(), PathBuf::from(MANIFEST_NAME)),
+        ("锁文件".to_owned(), PathBuf::from(LOCK_NAME)),
         ("入口".to_owned(), manifest.entry.clone()),
     ];
     protected.extend(
@@ -4663,9 +4935,9 @@ fn validate_pack_output_conflicts(
         }));
     }
     for (kind, path) in protected {
-        if package_path_identity(&manifest.root, &canonical_root, &path).as_deref()
-            == Some(relative)
-        {
+        let protected_identity = portable_pack_path_identity(&path)
+            .map_err(|error| package_path_manifest_error(&manifest.path, error))?;
+        if protected_identity == output_identity {
             return Err(manifest_error(
                 &manifest.path,
                 None,
@@ -4678,9 +4950,9 @@ fn validate_pack_output_conflicts(
         ("工作区成员", &manifest.workspace_members),
     ] {
         for path in paths {
-            if package_path_identity(&manifest.root, &canonical_root, path)
-                .is_some_and(|path| relative.starts_with(path))
-            {
+            let protected_identity = portable_pack_path_identity(path)
+                .map_err(|error| package_path_manifest_error(&manifest.path, error))?;
+            if output_identity.starts_with(&protected_identity) {
                 return Err(manifest_error(
                     &manifest.path,
                     None,
@@ -4692,16 +4964,14 @@ fn validate_pack_output_conflicts(
     Ok(())
 }
 
-fn package_path_identity(root: &Path, canonical_root: &Path, path: &Path) -> Option<PathBuf> {
-    fs::canonicalize(root.join(path))
-        .ok()
-        .and_then(|canonical| {
-            canonical
-                .strip_prefix(canonical_root)
-                .ok()
-                .map(Path::to_path_buf)
-        })
-        .or_else(|| normalize_pack_relative_path(path))
+fn portable_pack_path_identity(path: &Path) -> Result<Vec<String>, PackagePathError> {
+    if path
+        .components()
+        .all(|component| component == Component::CurDir)
+    {
+        return Ok(Vec::new());
+    }
+    portable_package_path(path).map(|path| path.split('/').map(portable_case_fold).collect())
 }
 
 fn absolute_normalized(path: &Path) -> Result<PathBuf, ManifestError> {
@@ -4770,6 +5040,596 @@ fn resolve_output_parent(absolute: &Path, display: &Path) -> Result<PathBuf, Man
     }
     resolved.push(file_name);
     Ok(resolved)
+}
+
+#[derive(Debug, Clone)]
+struct PackageTreeEntry {
+    relative: PathBuf,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct PackageTreeSnapshot {
+    root: PathBuf,
+    files: Vec<PackageTreeEntry>,
+}
+
+impl PackageTreeSnapshot {
+    fn paths(&self) -> Vec<PathBuf> {
+        self.files
+            .iter()
+            .map(|entry| entry.relative.clone())
+            .collect()
+    }
+
+    fn get(&self, relative: &Path) -> Option<&[u8]> {
+        self.files
+            .iter()
+            .find(|entry| entry.relative == relative)
+            .map(|entry| entry.bytes.as_slice())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PackageTreeCaptureLimits {
+    file_bytes: u64,
+    total_bytes: u64,
+    files: usize,
+    directories: usize,
+    scanned_entries: usize,
+    depth: usize,
+    path_bytes: Option<usize>,
+}
+
+impl PackageTreeCaptureLimits {
+    fn dependency() -> Self {
+        Self {
+            file_bytes: PACKAGE_TREE_MAX_FILE_BYTES,
+            total_bytes: PACKAGE_TREE_MAX_BYTES,
+            files: PACKAGE_TREE_MAX_ENTRIES,
+            directories: PACKAGE_TREE_MAX_ENTRIES.saturating_add(1),
+            scanned_entries: PACKAGE_TREE_MAX_ENTRIES.saturating_mul(2),
+            depth: PACKAGE_TREE_MAX_DEPTH,
+            path_bytes: None,
+        }
+    }
+
+    fn archive(limits: ArchiveLimits) -> Self {
+        Self {
+            file_bytes: limits.file_bytes,
+            total_bytes: limits.expanded_bytes,
+            files: limits.entries,
+            directories: limits.entries.saturating_add(1),
+            scanned_entries: limits.entries.saturating_mul(4).saturating_add(1_024),
+            depth: PACKAGE_TREE_MAX_DEPTH,
+            path_bytes: Some(limits.path_bytes),
+        }
+    }
+}
+
+fn capture_package_tree(
+    root: &Path,
+    purpose: PackagePathPurpose,
+    limits: PackageTreeCaptureLimits,
+    excluded: Option<&Path>,
+) -> Result<PackageTreeSnapshot, ManifestError> {
+    let mut roots = TrustedPackageRoots::default();
+    roots
+        .insert(root)
+        .map_err(|error| package_path_manifest_error(root, error))?;
+    capture_package_tree_in(&roots, root, purpose, limits, excluded)
+}
+
+fn capture_package_tree_in(
+    roots: &TrustedPackageRoots,
+    root: &Path,
+    purpose: PackagePathPurpose,
+    limits: PackageTreeCaptureLimits,
+    excluded: Option<&Path>,
+) -> Result<PackageTreeSnapshot, ManifestError> {
+    let canonical_root = roots
+        .exact_root_identity(root)
+        .ok_or_else(|| manifest_error(root, None, "包根不属于已打开的可信根集合"))?
+        .to_path_buf();
+    let mut snapshot = PackageTreeSnapshot {
+        root: canonical_root.clone(),
+        files: Vec::new(),
+    };
+    let mut portable_paths = PortablePackagePaths::default();
+    let mut total_bytes = 0_u64;
+    let mut directory_count = 1_usize;
+    let mut scanned_entries = 0_usize;
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let directory = roots
+            .clone_exact_root_directory(root)
+            .map_err(|error| manifest_error(root, None, format!("不能复制包根句柄：{error}")))?
+            .ok_or_else(|| manifest_error(root, None, "包根目录句柄不存在"))?;
+        capture_package_directory_capability(
+            &directory,
+            &canonical_root,
+            Path::new(""),
+            0,
+            purpose,
+            limits,
+            excluded,
+            &mut portable_paths,
+            &mut total_bytes,
+            &mut directory_count,
+            &mut scanned_entries,
+            &mut snapshot.files,
+        )?;
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let directory = roots
+            .clone_exact_root_directory(root)
+            .map_err(|error| manifest_error(root, None, format!("不能复制包根句柄：{error}")))?
+            .ok_or_else(|| manifest_error(root, None, "包根目录句柄不存在"))?;
+        capture_package_directory_wasi(
+            &directory,
+            &canonical_root,
+            Path::new(""),
+            0,
+            purpose,
+            limits,
+            excluded,
+            &mut portable_paths,
+            &mut total_bytes,
+            &mut directory_count,
+            &mut scanned_entries,
+            &mut snapshot.files,
+        )?;
+    }
+
+    snapshot.files.sort_by(|left, right| {
+        let left = portable_package_path(&left.relative).unwrap_or_default();
+        let right = portable_package_path(&right.relative).unwrap_or_default();
+        left.cmp(&right)
+    });
+    Ok(snapshot)
+}
+
+#[cfg(not(target_os = "wasi"))]
+struct CapabilityDirectoryFrame {
+    directory: cap_std::fs::Dir,
+    relative: PathBuf,
+    depth: usize,
+    entries: std::vec::IntoIter<PathBuf>,
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn capability_directory_frame(
+    directory: cap_std::fs::Dir,
+    canonical_root: &Path,
+    relative: PathBuf,
+    depth: usize,
+    scan_limit: usize,
+    scanned_entries: &mut usize,
+) -> Result<CapabilityDirectoryFrame, ManifestError> {
+    let display_directory = canonical_root.join(&relative);
+    let read_dir = directory.entries().map_err(|error| {
+        manifest_error(
+            &display_directory,
+            None,
+            format!("不能从稳定目录句柄遍历包：{error}"),
+        )
+    })?;
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        *scanned_entries = scanned_entries.saturating_add(1);
+        if *scanned_entries > scan_limit {
+            return Err(manifest_error(
+                &display_directory,
+                None,
+                format!("包目录项不得超过 {scan_limit} 个"),
+            ));
+        }
+        let entry = entry.map_err(|error| {
+            manifest_error(
+                &display_directory,
+                None,
+                format!("不能读取包目录项：{error}"),
+            )
+        })?;
+        entries.push(PathBuf::from(entry.file_name()));
+    }
+    entries.sort();
+    Ok(CapabilityDirectoryFrame {
+        directory,
+        relative,
+        depth,
+        entries: entries.into_iter(),
+    })
+}
+
+#[cfg(not(target_os = "wasi"))]
+#[allow(clippy::too_many_arguments)]
+fn capture_package_directory_capability(
+    directory: &cap_std::fs::Dir,
+    canonical_root: &Path,
+    relative_directory: &Path,
+    depth: usize,
+    purpose: PackagePathPurpose,
+    limits: PackageTreeCaptureLimits,
+    excluded: Option<&Path>,
+    portable_paths: &mut PortablePackagePaths,
+    total_bytes: &mut u64,
+    directory_count: &mut usize,
+    scanned_entries: &mut usize,
+    files: &mut Vec<PackageTreeEntry>,
+) -> Result<(), ManifestError> {
+    let scan_limit = limits.scanned_entries;
+    let root = directory.try_clone().map_err(|error| {
+        manifest_error(canonical_root, None, format!("不能复制包目录句柄：{error}"))
+    })?;
+    let mut pending = vec![capability_directory_frame(
+        root,
+        canonical_root,
+        relative_directory.to_path_buf(),
+        depth,
+        scan_limit,
+        scanned_entries,
+    )?];
+
+    loop {
+        let (name, relative_directory, depth) = loop {
+            let Some(frame) = pending.last_mut() else {
+                return Ok(());
+            };
+            if let Some(name) = frame.entries.next() {
+                break (name, frame.relative.clone(), frame.depth);
+            }
+            pending.pop();
+        };
+        let directory = &pending
+            .last()
+            .expect("an entry always belongs to the current directory frame")
+            .directory;
+        let relative = relative_directory.join(&name);
+        let display = canonical_root.join(&relative);
+        match package_path_decision(&relative, purpose)
+            .map_err(|error| package_path_manifest_error(&display, error))?
+        {
+            PackagePathDecision::Include => {}
+            PackagePathDecision::Exclude(_) => continue,
+        }
+        let metadata = directory.symlink_metadata(&name).map_err(|error| {
+            manifest_error(&display, None, format!("不能检查包目录项：{error}"))
+        })?;
+        let file_type = metadata.file_type();
+        if metadata.is_dir() {
+            portable_paths
+                .insert_directory(&relative)
+                .map_err(|error| package_path_manifest_error(&display, error))?;
+        } else {
+            portable_paths
+                .insert(&relative)
+                .map_err(|error| package_path_manifest_error(&display, error))?;
+        }
+        if excluded.is_some_and(|excluded| excluded == relative) {
+            continue;
+        }
+        if file_type.is_symlink() {
+            return Err(manifest_error(&display, None, "包不得包含符号链接"));
+        }
+        if file_type.is_dir() {
+            *directory_count = directory_count.saturating_add(1);
+            if *directory_count > limits.directories {
+                let kind = if purpose == PackagePathPurpose::YxpEntry {
+                    "打包目录"
+                } else {
+                    "包目录"
+                };
+                return Err(manifest_error(
+                    &display,
+                    None,
+                    format!("{kind}不得超过 {} 个", limits.directories),
+                ));
+            }
+            let child_depth = depth.saturating_add(1);
+            if child_depth > limits.depth {
+                let kind = if purpose == PackagePathPurpose::YxpEntry {
+                    "打包目录深度"
+                } else {
+                    "包目录深度"
+                };
+                return Err(manifest_error(
+                    &display,
+                    None,
+                    format!("{kind}不得超过 {} 层", limits.depth),
+                ));
+            }
+            let child = directory.open_dir_nofollow(&name).map_err(|error| {
+                manifest_error(&display, None, format!("不能安全打开包目录：{error}"))
+            })?;
+            let metadata = child.dir_metadata().map_err(|error| {
+                manifest_error(&display, None, format!("不能检查已打开的包目录：{error}"))
+            })?;
+            if !metadata.is_dir() || cap_metadata_is_reparse(&metadata) {
+                return Err(manifest_error(
+                    &display,
+                    None,
+                    "包目录必须是真实目录，不得为重解析点或特殊文件",
+                ));
+            }
+            let child = capability_directory_frame(
+                child,
+                canonical_root,
+                relative,
+                child_depth,
+                scan_limit,
+                scanned_entries,
+            )?;
+            pending.push(child);
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(manifest_error(&display, None, "包不得包含特殊文件"));
+        }
+        if files.len() >= limits.files {
+            let kind = if purpose == PackagePathPurpose::YxpEntry {
+                "打包条目"
+            } else {
+                "包文件"
+            };
+            return Err(manifest_error(
+                &display,
+                None,
+                format!("{kind}不得超过 {} 个", limits.files),
+            ));
+        }
+        if let Some(path_bytes) = limits.path_bytes {
+            validated_yxp_archive_path(&relative, &display, path_bytes)?;
+        }
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No).nonblock(true);
+        let file = directory.open_with(&name, &options).map_err(|error| {
+            manifest_error(&display, None, format!("不能安全打开包文件：{error}"))
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            manifest_error(&display, None, format!("不能检查已打开的包文件：{error}"))
+        })?;
+        if !metadata.is_file() || cap_metadata_is_reparse(&metadata) {
+            return Err(manifest_error(
+                &display,
+                None,
+                "包文件必须是普通文件，不得为重解析点或特殊文件",
+            ));
+        }
+        let bytes = read_opened_regular_file_snapshot(
+            file.into_std(),
+            &display,
+            limits.file_bytes,
+            "包内容",
+        )?;
+        *total_bytes = total_bytes
+            .checked_add(bytes.len() as u64)
+            .filter(|total| *total <= limits.total_bytes)
+            .ok_or_else(|| {
+                let kind = if purpose == PackagePathPurpose::YxpEntry {
+                    "打包内容"
+                } else {
+                    "包内容"
+                };
+                manifest_error(
+                    &display,
+                    None,
+                    format!("{kind}不得超过 {} 字节", limits.total_bytes),
+                )
+            })?;
+        files.push(PackageTreeEntry { relative, bytes });
+    }
+}
+
+#[cfg(windows)]
+fn cap_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(all(not(windows), not(target_os = "wasi")))]
+fn cap_metadata_is_reparse(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(target_os = "wasi")]
+struct WasiDirectoryFrame {
+    directory: WasiPackageDirectory,
+    relative: PathBuf,
+    depth: usize,
+    entries: std::vec::IntoIter<WasiPackageDirectoryEntry>,
+}
+
+#[cfg(target_os = "wasi")]
+fn wasi_directory_frame(
+    directory: WasiPackageDirectory,
+    canonical_root: &Path,
+    relative: PathBuf,
+    depth: usize,
+    scan_limit: usize,
+    scanned_entries: &mut usize,
+) -> Result<WasiDirectoryFrame, ManifestError> {
+    let display_directory = canonical_root.join(&relative);
+    let entries = directory
+        .entries(scan_limit.saturating_add(1))
+        .map_err(|error| {
+            if error.to_string().starts_with("包目录项不得超过 ") {
+                manifest_error(
+                    &display_directory,
+                    None,
+                    format!("包目录项不得超过 {scan_limit} 个"),
+                )
+            } else {
+                manifest_error(
+                    &display_directory,
+                    None,
+                    format!("不能从稳定目录句柄遍历包：{error}"),
+                )
+            }
+        })?;
+    *scanned_entries = scanned_entries.saturating_add(entries.len());
+    if *scanned_entries > scan_limit {
+        return Err(manifest_error(
+            &display_directory,
+            None,
+            format!("包目录项不得超过 {scan_limit} 个"),
+        ));
+    }
+    Ok(WasiDirectoryFrame {
+        directory,
+        relative,
+        depth,
+        entries: entries.into_iter(),
+    })
+}
+
+#[cfg(target_os = "wasi")]
+#[allow(clippy::too_many_arguments)]
+fn capture_package_directory_wasi(
+    directory: &WasiPackageDirectory,
+    canonical_root: &Path,
+    relative_directory: &Path,
+    depth: usize,
+    purpose: PackagePathPurpose,
+    limits: PackageTreeCaptureLimits,
+    excluded: Option<&Path>,
+    portable_paths: &mut PortablePackagePaths,
+    total_bytes: &mut u64,
+    directory_count: &mut usize,
+    scanned_entries: &mut usize,
+    files: &mut Vec<PackageTreeEntry>,
+) -> Result<(), ManifestError> {
+    let scan_limit = limits.scanned_entries;
+    let root = directory.try_clone().map_err(|error| {
+        manifest_error(canonical_root, None, format!("不能复制包目录句柄：{error}"))
+    })?;
+    let mut pending = vec![wasi_directory_frame(
+        root,
+        canonical_root,
+        relative_directory.to_path_buf(),
+        depth,
+        scan_limit,
+        scanned_entries,
+    )?];
+
+    loop {
+        let (entry, relative_directory, depth) = loop {
+            let Some(frame) = pending.last_mut() else {
+                return Ok(());
+            };
+            if let Some(entry) = frame.entries.next() {
+                break (entry, frame.relative.clone(), frame.depth);
+            }
+            pending.pop();
+        };
+        let directory = &pending
+            .last()
+            .expect("an entry always belongs to the current directory frame")
+            .directory;
+        let relative = relative_directory.join(entry.name());
+        let display = canonical_root.join(&relative);
+        match package_path_decision(&relative, purpose)
+            .map_err(|error| package_path_manifest_error(&display, error))?
+        {
+            PackagePathDecision::Include => {}
+            PackagePathDecision::Exclude(_) => continue,
+        }
+        match directory.open_entry_nofollow(&entry).map_err(|error| {
+            manifest_error(
+                &display,
+                None,
+                format!("不能从稳定目录句柄安全打开包目录项：{error}"),
+            )
+        })? {
+            WasiPackageEntry::Directory(child) => {
+                portable_paths
+                    .insert_directory(&relative)
+                    .map_err(|error| package_path_manifest_error(&display, error))?;
+                if excluded.is_some_and(|excluded| excluded == relative) {
+                    continue;
+                }
+                *directory_count = directory_count.saturating_add(1);
+                if *directory_count > limits.directories {
+                    let kind = if purpose == PackagePathPurpose::YxpEntry {
+                        "打包目录"
+                    } else {
+                        "包目录"
+                    };
+                    return Err(manifest_error(
+                        &display,
+                        None,
+                        format!("{kind}不得超过 {} 个", limits.directories),
+                    ));
+                }
+                let child_depth = depth.saturating_add(1);
+                if child_depth > limits.depth {
+                    let kind = if purpose == PackagePathPurpose::YxpEntry {
+                        "打包目录深度"
+                    } else {
+                        "包目录深度"
+                    };
+                    return Err(manifest_error(
+                        &display,
+                        None,
+                        format!("{kind}不得超过 {} 层", limits.depth),
+                    ));
+                }
+                pending.push(wasi_directory_frame(
+                    child,
+                    canonical_root,
+                    relative,
+                    child_depth,
+                    scan_limit,
+                    scanned_entries,
+                )?);
+            }
+            WasiPackageEntry::File(file) => {
+                portable_paths
+                    .insert(&relative)
+                    .map_err(|error| package_path_manifest_error(&display, error))?;
+                if excluded.is_some_and(|excluded| excluded == relative) {
+                    continue;
+                }
+                if files.len() >= limits.files {
+                    let kind = if purpose == PackagePathPurpose::YxpEntry {
+                        "打包条目"
+                    } else {
+                        "包文件"
+                    };
+                    return Err(manifest_error(
+                        &display,
+                        None,
+                        format!("{kind}不得超过 {} 个", limits.files),
+                    ));
+                }
+                if let Some(path_bytes) = limits.path_bytes {
+                    validated_yxp_archive_path(&relative, &display, path_bytes)?;
+                }
+                let bytes =
+                    read_opened_regular_file_snapshot(file, &display, limits.file_bytes, "包内容")?;
+                *total_bytes = total_bytes
+                    .checked_add(bytes.len() as u64)
+                    .filter(|total| *total <= limits.total_bytes)
+                    .ok_or_else(|| {
+                        let kind = if purpose == PackagePathPurpose::YxpEntry {
+                            "打包内容"
+                        } else {
+                            "包内容"
+                        };
+                        manifest_error(
+                            &display,
+                            None,
+                            format!("{kind}不得超过 {} 字节", limits.total_bytes),
+                        )
+                    })?;
+                files.push(PackageTreeEntry { relative, bytes });
+            }
+        }
+    }
 }
 
 /// 把完整锁定图复制到项目内目录；解析器会自动优先使用祖先目录中的辖制清单。
@@ -4867,7 +5727,7 @@ fn find_vendored_package(
             let canonical = fs::canonicalize(&root)
                 .map_err(|error| manifest_error(&root, None, format!("不能定位辖制包：{error}")))?;
             if !canonical.starts_with(&canonical_vendor)
-                || tree_checksum(&canonical)? != locked.checksum
+                || !tree_checksum_matches(&canonical, &locked.checksum)?
             {
                 return Err(manifest_error(&root, None, "辖制包越界或内容校验不符"));
             }
@@ -4875,123 +5735,6 @@ fn find_vendored_package(
         }
     }
     Ok(None)
-}
-
-fn collect_pack_files(
-    root: &Path,
-    files: &mut Vec<PathBuf>,
-    limits: ArchiveLimits,
-    excluded: Option<&Path>,
-) -> Result<(), ManifestError> {
-    let mut directories = vec![root.to_path_buf()];
-    let mut directory_count = 1_usize;
-    let mut preflight_expanded = 0_u64;
-    while let Some(directory) = directories.pop() {
-        let entries = fs::read_dir(&directory)
-            .map_err(|error| manifest_error(&directory, None, format!("不能遍历包：{error}")))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                manifest_error(&directory, None, format!("不能读取目录项：{error}"))
-            })?;
-            let path = entry.path();
-            let name = entry.file_name();
-            if is_excluded_package_name(&name) || (directory != root && name == LOCK_NAME) {
-                continue;
-            }
-            let relative = path
-                .strip_prefix(root)
-                .expect("walk under root")
-                .to_path_buf();
-            if excluded.is_some_and(|excluded| relative == excluded) {
-                continue;
-            }
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| manifest_error(&path, None, error.to_string()))?;
-            if metadata.file_type().is_symlink() {
-                return Err(manifest_error(&path, None, "包不得包含符号链接"));
-            }
-            if metadata.is_dir() {
-                directory_count = directory_count.saturating_add(1);
-                if directory_count > limits.entries.saturating_add(1) {
-                    return Err(manifest_error(
-                        &path,
-                        None,
-                        format!("打包目录不得超过 {} 个", limits.entries),
-                    ));
-                }
-                directories.push(path);
-            } else if metadata.is_file() {
-                if is_existing_yxp_artifact(&path, limits) {
-                    continue;
-                }
-                if files.len() >= limits.entries {
-                    return Err(manifest_error(
-                        &path,
-                        None,
-                        format!("打包条目不得超过 {}", limits.entries),
-                    ));
-                }
-                let archive_path = Path::new("package").join(&relative);
-                validate_archive_relative_path(&archive_path, limits.path_bytes)
-                    .map_err(|message| manifest_error(&path, None, message))?;
-                if metadata.len() > limits.file_bytes {
-                    return Err(manifest_error(
-                        &path,
-                        None,
-                        format!("单文件不得超过 {} 字节", limits.file_bytes),
-                    ));
-                }
-                preflight_expanded = preflight_expanded
-                    .checked_add(metadata.len())
-                    .filter(|total| *total <= limits.expanded_bytes)
-                    .ok_or_else(|| {
-                        manifest_error(
-                            &path,
-                            None,
-                            format!("打包内容不得超过 {} 字节", limits.expanded_bytes),
-                        )
-                    })?;
-                files.push(relative);
-            } else {
-                return Err(manifest_error(&path, None, "包不得包含特殊文件"));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_existing_yxp_artifact(path: &Path, limits: ArchiveLimits) -> bool {
-    let mut magic = [0_u8; 2];
-    fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .is_ok()
-        && magic == [0x1f, 0x8b]
-        && validate_existing_package_archive(path, limits).is_ok()
-}
-
-fn is_excluded_package_name(name: &std::ffi::OsStr) -> bool {
-    is_generated_package_name(name)
-        || [".git", ".DS_Store"]
-            .iter()
-            .any(|reserved| package_name_eq(name, reserved))
-}
-
-fn is_generated_package_name(name: &std::ffi::OsStr) -> bool {
-    [".yanxu", "target", "build", "vendor"]
-        .iter()
-        .any(|reserved| package_name_eq(name, reserved))
-}
-
-fn package_name_eq(name: &std::ffi::OsStr, expected: &str) -> bool {
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        name.to_str()
-            .is_some_and(|name| name.eq_ignore_ascii_case(expected))
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        name == expected
-    }
 }
 
 fn copy_package_tree(source: &Path, destination: &Path) -> Result<(), ManifestError> {
@@ -5012,6 +5755,12 @@ fn copy_package_tree(source: &Path, destination: &Path) -> Result<(), ManifestEr
 }
 
 pub fn validate_package_name(name: &str) -> Result<(), String> {
+    let normalized = name.nfc().collect::<String>();
+    if normalized != name {
+        return Err(format!(
+            "[{PACKAGE_PATH_NON_PORTABLE_CODE}] 包名“{name}”必须使用 Unicode NFC 规范拼写；请改用“{normalized}”。"
+        ));
+    }
     if name.is_empty()
         || name.starts_with(['.', '-'])
         || name
@@ -5020,6 +5769,9 @@ pub fn validate_package_name(name: &str) -> Result<(), String> {
     {
         Err(format!("包名“{name}”不规范；仅可用文字、数字、_、-、."))
     } else {
+        crate::path_policy::validate_portable_component(Path::new(name), name)
+            .map_err(|error| error.to_string())?;
+        let _ = portable_package_path(Path::new(name)).map_err(|error| error.to_string())?;
         Ok(())
     }
 }
@@ -5038,26 +5790,151 @@ pub fn validate_entry(entry: &Path) -> Result<(), String> {
 }
 
 fn tree_checksum(root: &Path) -> Result<String, ManifestError> {
-    let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
-    files.sort();
+    let snapshot = capture_package_tree(
+        root,
+        PackagePathPurpose::TreeChecksum,
+        PackageTreeCaptureLimits::dependency(),
+        None,
+    )?;
+    portable_tree_snapshot_checksum(&snapshot)
+}
+
+fn portable_tree_snapshot_checksum(
+    snapshot: &PackageTreeSnapshot,
+) -> Result<String, ManifestError> {
     let mut digest = Sha256::new();
-    for relative in files {
-        digest.update(relative.to_string_lossy().as_bytes());
-        digest.update([0]);
-        let bytes = fs::read(root.join(&relative)).map_err(|error| {
-            manifest_error(root.join(&relative), None, format!("不能校验文件：{error}"))
+    for entry in &snapshot.files {
+        let portable = portable_package_path(&entry.relative).map_err(|error| {
+            package_path_manifest_error(snapshot.root.join(&entry.relative), error)
         })?;
-        digest.update((bytes.len() as u64).to_le_bytes());
-        digest.update(bytes);
+        digest.update(portable.as_bytes());
+        digest.update([0]);
+        digest.update((entry.bytes.len() as u64).to_le_bytes());
+        digest.update(&entry.bytes);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn tree_checksum_matches(root: &Path, expected: &str) -> Result<bool, ManifestError> {
+    let snapshot = capture_package_tree(
+        root,
+        PackagePathPurpose::TreeChecksum,
+        PackageTreeCaptureLimits::dependency(),
+        None,
+    )?;
+    tree_snapshot_checksum_matches(&snapshot, expected)
+}
+
+fn tree_snapshot_checksum_matches(
+    snapshot: &PackageTreeSnapshot,
+    expected: &str,
+) -> Result<bool, ManifestError> {
+    if portable_tree_snapshot_checksum(snapshot)? == expected {
+        return Ok(true);
+    }
+    for separator in ["/", "\\"] {
+        if legacy_tree_snapshot_checksum(snapshot, separator) == expected {
+            return Ok(true);
+        }
+        if legacy_normalized_tree_snapshot_checksum(snapshot, separator, false) == expected
+            || legacy_normalized_tree_snapshot_checksum(snapshot, separator, true) == expected
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn legacy_tree_snapshot_checksum(snapshot: &PackageTreeSnapshot, separator: &str) -> String {
+    let mut files = snapshot.files.iter().collect::<Vec<_>>();
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    let mut digest = Sha256::new();
+    for entry in files {
+        let legacy = entry
+            .relative
+            .iter()
+            .map(|component| component.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(separator);
+        digest.update(legacy.as_bytes());
+        digest.update([0]);
+        digest.update((entry.bytes.len() as u64).to_le_bytes());
+        digest.update(&entry.bytes);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+#[cfg(test)]
+fn legacy_tree_checksum(root: &Path, separator: &str) -> Result<String, ManifestError> {
+    let snapshot = capture_package_tree(
+        root,
+        PackagePathPurpose::TreeChecksum,
+        PackageTreeCaptureLimits::dependency(),
+        None,
+    )?;
+    Ok(legacy_tree_snapshot_checksum(&snapshot, separator))
+}
+
+fn legacy_normalized_tree_snapshot_checksum(
+    snapshot: &PackageTreeSnapshot,
+    separator: &str,
+    decomposed: bool,
+) -> String {
+    let mut keyed = snapshot
+        .files
+        .iter()
+        .map(|entry| {
+            let path = entry
+                .relative
+                .iter()
+                .map(|component| component.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(separator);
+            let key = if decomposed {
+                path.nfd().collect::<String>()
+            } else {
+                path.nfc().collect::<String>()
+            };
+            (key, entry)
+        })
+        .collect::<Vec<_>>();
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = Sha256::new();
+    for (key, entry) in keyed {
+        digest.update(key.as_bytes());
+        digest.update([0]);
+        digest.update((entry.bytes.len() as u64).to_le_bytes());
+        digest.update(&entry.bytes);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn sort_portable_paths(paths: &mut Vec<PathBuf>) -> Result<(), ManifestError> {
+    let mut keyed = Vec::with_capacity(paths.len());
+    for path in std::mem::take(paths) {
+        let key = portable_package_path(&path)
+            .map_err(|error| package_path_manifest_error(&path, error))?;
+        keyed.push((key, path));
+    }
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    paths.extend(keyed.into_iter().map(|(_, path)| path));
+    Ok(())
 }
 
 fn collect_files(
     root: &Path,
     directory: &Path,
     files: &mut Vec<PathBuf>,
+) -> Result<(), ManifestError> {
+    let mut portable_paths = PortablePackagePaths::default();
+    collect_files_with_paths(root, directory, files, &mut portable_paths)
+}
+
+fn collect_files_with_paths(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<PathBuf>,
+    portable_paths: &mut PortablePackagePaths,
 ) -> Result<(), ManifestError> {
     let mut entries = fs::read_dir(directory)
         .map_err(|error| manifest_error(directory, None, format!("不能遍历依赖：{error}")))?
@@ -5066,23 +5943,31 @@ fn collect_files(
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
-        let name = entry.file_name();
-        if is_excluded_package_name(&name) || name == LOCK_NAME {
-            continue;
+        let relative = path.strip_prefix(root).expect("walk remains under root");
+        match package_path_decision(relative, PackagePathPurpose::TreeChecksum)
+            .map_err(|error| package_path_manifest_error(&path, error))?
+        {
+            PackagePathDecision::Include => {}
+            PackagePathDecision::Exclude(_) => continue,
         }
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| manifest_error(&path, None, error.to_string()))?;
+        if metadata.is_dir() {
+            portable_paths
+                .insert_directory(relative)
+                .map_err(|error| package_path_manifest_error(&path, error))?;
+        } else {
+            portable_paths
+                .insert(relative)
+                .map_err(|error| package_path_manifest_error(&path, error))?;
+        }
         if metadata.file_type().is_symlink() {
             return Err(manifest_error(&path, None, "依赖包不得包含符号链接"));
         }
         if metadata.is_dir() {
-            collect_files(root, &path, files)?;
+            collect_files_with_paths(root, &path, files, portable_paths)?;
         } else if metadata.is_file() {
-            files.push(
-                path.strip_prefix(root)
-                    .expect("walk remains under root")
-                    .into(),
-            );
+            files.push(relative.into());
         } else {
             return Err(manifest_error(&path, None, "依赖包不得包含特殊文件"));
         }
@@ -5289,6 +6174,17 @@ fn manifest_error(
     }
 }
 
+fn package_path_manifest_error(
+    path: impl AsRef<Path>,
+    error: crate::path_policy::PackagePathError,
+) -> ManifestError {
+    ManifestError {
+        message: format!("[{}] {}", error.code, error.diagnostic_message()),
+        path: path.as_ref().to_path_buf(),
+        line: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5299,7 +6195,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("yanxu-{name}-{unique}"))
+        #[cfg(not(target_os = "wasi"))]
+        let base = std::env::temp_dir();
+        #[cfg(target_os = "wasi")]
+        let base = PathBuf::from("/tmp");
+        base.join(format!("yanxu-{name}-{unique}"))
     }
 
     fn write(path: &Path, text: &str) {
@@ -6492,6 +7392,203 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn wide_package_tree_keeps_open_directory_handles_bounded() {
+        #[cfg(unix)]
+        const CHILD_ENV: &str = "YANXU_WIDE_TREE_CHILD";
+        #[cfg(unix)]
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("wide_package_tree_keeps_open_directory_handles_bounded")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "低句柄上限子进程遍历宽目录失败");
+            return;
+        }
+
+        let root = temp("wide-package-tree");
+        for index in 0..128 {
+            write(
+                &root.join(format!("directory-{index:03}/module.yx")),
+                "言 1；\n",
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            limit.rlim_cur = limit.rlim_max.min(64 as libc::rlim_t);
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        }
+
+        let snapshot = capture_package_tree(
+            &root,
+            PackagePathPurpose::TreeChecksum,
+            PackageTreeCaptureLimits::dependency(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(snapshot.files.len(), 128);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn package_tree_rejects_excessive_directory_depth() {
+        let root = temp("deep-package-tree");
+        let excessive = root.join("one/two/three/four");
+        write(&excessive.join("module.yx"), "言 1；\n");
+        let mut limits = PackageTreeCaptureLimits::dependency();
+        limits.depth = 3;
+
+        let error = capture_package_tree(&root, PackagePathPurpose::TreeChecksum, limits, None)
+            .unwrap_err();
+        assert_eq!(error.path, fs::canonicalize(&excessive).unwrap());
+        assert_eq!(error.message, "包目录深度不得超过 3 层");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn package_tree_rejects_entries_beyond_the_global_scan_limit() {
+        let root = temp("package-tree-scan-limit");
+        for name in ["one.yx", "two.yx", "three.yx"] {
+            write(&root.join(name), "言 1；\n");
+        }
+        let mut limits = PackageTreeCaptureLimits::dependency();
+        limits.scanned_entries = 2;
+
+        let error = capture_package_tree(&root, PackagePathPurpose::TreeChecksum, limits, None)
+            .unwrap_err();
+        assert_eq!(error.path, fs::canonicalize(&root).unwrap());
+        assert_eq!(error.message, "包目录项不得超过 2 个");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn package_tree_snapshot_survives_bound_root_replacement() {
+        let root = temp("tree-bound-root-replacement");
+        let backup = root.with_extension("original");
+        write(&root.join("old.yx"), "言「可信根」；\n");
+        let mut roots = TrustedPackageRoots::default();
+        roots.insert(&root).unwrap();
+
+        fs::rename(&root, &backup).unwrap();
+        write(&root.join("new.yx"), "言「替换根」；\n");
+
+        let captured = capture_package_tree_in(
+            &roots,
+            &root,
+            PackagePathPurpose::TreeChecksum,
+            PackageTreeCaptureLimits::dependency(),
+            None,
+        );
+        #[cfg(target_os = "wasi")]
+        if std::env::var_os("YANXU_EXPECT_WASI_BINDING_DRIFT").is_some() {
+            let error = captured.unwrap_err();
+            assert!(error.message.contains("WASI 宿主目录描述符绑定发生漂移"));
+            fs::remove_dir_all(root).ok();
+            fs::remove_dir_all(backup).ok();
+            return;
+        }
+        let snapshot = captured.unwrap();
+        assert_eq!(
+            snapshot.get(Path::new("old.yx")),
+            Some("言「可信根」；\n".as_bytes())
+        );
+        assert!(snapshot.get(Path::new("new.yx")).is_none());
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
+    }
+
+    #[test]
+    fn portable_tree_checksum_accepts_legacy_paths_and_normalizes_nfc() {
+        let root = temp("portable-checksum-compatibility");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='摘要兼容'\n版本='1.0.0'\n入口='src/主.yx'\n",
+        );
+        write(&root.join("src/主.yx"), "言 1；\n");
+        write(&root.join("assets/e\u{301}.txt"), "accent\n");
+
+        let portable = tree_checksum(&root).unwrap();
+        let legacy_unix = legacy_tree_checksum(&root, "/").unwrap();
+        let legacy_windows = legacy_tree_checksum(&root, "\\").unwrap();
+        assert_ne!(portable, legacy_unix);
+        assert_ne!(portable, legacy_windows);
+        assert!(tree_checksum_matches(&root, &legacy_unix).unwrap());
+        assert!(tree_checksum_matches(&root, &legacy_windows).unwrap());
+
+        fs::rename(root.join("assets/e\u{301}.txt"), root.join("assets/é.txt")).unwrap();
+        assert_eq!(portable, tree_checksum(&root).unwrap());
+        assert!(tree_checksum_matches(&root, &legacy_unix).unwrap());
+        assert!(tree_checksum_matches(&root, &legacy_windows).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_paths_reject_backslashes_and_package_names_require_nfc() {
+        let manifest_path = Path::new("言序.toml");
+        for kind in ["入口", "导出", "资源", "工作区成员", "原生制品", "权限文件"]
+        {
+            let error = manifest_relative_path(r"dir\file.yx", manifest_path, kind).unwrap_err();
+            assert_eq!(error.code(), PACKAGE_PATH_NON_PORTABLE_CODE, "{kind}");
+        }
+        let error = validate_package_name("e\u{301}").unwrap_err();
+        assert!(error.contains(PACKAGE_PATH_NON_PORTABLE_CODE), "{error}");
+        assert!(validate_package_name("é").is_ok());
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn pack_reads_from_the_open_root_after_root_replacement() {
+        let root = temp("pack-root-handle");
+        let backup = root.with_extension("original");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='根快照'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言「可信根」；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let output_root = temp("pack-root-handle-output");
+        fs::create_dir_all(&output_root).unwrap();
+        let output = output_root.join("package.yxp");
+
+        pack_package_with_limits_and_hook(&manifest, &output, ARCHIVE_LIMITS, |_| {
+            fs::rename(&root, &backup).map_err(|error| {
+                manifest_error(&root, None, format!("不能模拟包根替换：{error}"))
+            })?;
+            write(
+                &root.join(MANIFEST_NAME),
+                "[包]\n格式=2\n名称='根快照'\n版本='1.0.0'\n入口='主.yx'\n",
+            );
+            write(&root.join("主.yx"), "言「替换根」；\n");
+            Ok(())
+        })
+        .unwrap();
+
+        let unpacked = output_root.join("unpacked");
+        extract_archive_safely(&output, &unpacked).unwrap();
+        assert_eq!(
+            fs::read_to_string(unpacked.join("package/主.yx")).unwrap(),
+            "言「可信根」；\n"
+        );
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
+        fs::remove_dir_all(output_root).ok();
+    }
+
     #[test]
     fn pack_rejects_missing_declared_content_without_replacing_output() {
         let root = temp("pack-missing-content");
@@ -6627,8 +7724,8 @@ mod tests {
         );
         write(&root.join("主.yx"), "言 1；\n");
         let mut deep = root.clone();
-        for _ in 0..260 {
-            deep.push("a");
+        for _ in 0..64 {
+            deep.push("abcdefgh");
         }
         write(&deep.join("file.txt"), "x");
         let manifest = load(root.join(MANIFEST_NAME)).unwrap();
@@ -6639,9 +7736,8 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
     #[test]
-    fn reserved_directory_aliases_follow_case_insensitive_filesystems() {
+    fn reserved_directory_aliases_are_rejected_on_every_filesystem() {
         let root = temp("reserved-case-aliases");
         write(
             &root.join(MANIFEST_NAME),
@@ -6652,19 +7748,22 @@ mod tests {
             write(&root.join("src").join(name).join("noise.txt"), "before\n");
         }
         let manifest = load(root.join(MANIFEST_NAME)).unwrap();
-        let first_root = temp("reserved-case-first");
-        let second_root = temp("reserved-case-second");
-        let first = pack_package(&manifest, first_root.join("package.yxp")).unwrap();
-        for name in ["Build", "TARGET", "Vendor", ".YANXU"] {
-            write(&root.join("src").join(name).join("noise.txt"), "after\n");
-        }
-        let second = pack_package(&manifest, second_root.join("package.yxp")).unwrap();
-        assert_eq!(first.checksum, second.checksum);
+        let output_root = temp("reserved-case-output");
+        let error = pack_package(&manifest, output_root.join("package.yxp")).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains(crate::path_policy::PACKAGE_PATH_NON_PORTABLE_CODE)
+        );
         let mut manifest_path = manifest.clone();
         manifest_path.entry = PathBuf::from("src/Build/入口.yx");
-        assert!(validate_package_manifest_paths(&manifest_path).is_err());
-        fs::remove_dir_all(first_root).ok();
-        fs::remove_dir_all(second_root).ok();
+        let error = validate_package_manifest_paths(&manifest_path).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains(crate::path_policy::PACKAGE_PATH_NON_PORTABLE_CODE)
+        );
+        fs::remove_dir_all(output_root).ok();
         fs::remove_dir_all(root).ok();
     }
 

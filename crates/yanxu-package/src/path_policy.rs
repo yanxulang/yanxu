@@ -1348,6 +1348,44 @@ impl TrustedPackageRoots {
         self.roots.iter().map(|root| root.canonical.as_path())
     }
 
+    pub(crate) fn exact_root_identity(&self, root: &Path) -> Option<&Path> {
+        let (_, root) = ambient_root_paths(root).ok()?;
+        self.roots
+            .iter()
+            .find(|candidate| {
+                candidate.canonical == root || candidate.aliases.iter().any(|alias| alias == &root)
+            })
+            .map(|root| root.canonical.as_path())
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    pub(crate) fn clone_exact_root_directory(
+        &self,
+        root: &Path,
+    ) -> io::Result<Option<cap_std::fs::Dir>> {
+        let (_, root) = ambient_root_paths(root).map_err(io::Error::other)?;
+        let Some(root) = self.roots.iter().find(|candidate| {
+            candidate.canonical == root || candidate.aliases.iter().any(|alias| alias == &root)
+        }) else {
+            return Ok(None);
+        };
+        root.directory.try_clone().map(Some)
+    }
+
+    #[cfg(target_os = "wasi")]
+    pub(crate) fn clone_exact_root_directory(
+        &self,
+        root: &Path,
+    ) -> io::Result<Option<WasiPackageDirectory>> {
+        let (_, root) = ambient_root_paths(root).map_err(io::Error::other)?;
+        let Some(root) = self.roots.iter().find(|candidate| {
+            candidate.canonical == root || candidate.aliases.iter().any(|alias| alias == &root)
+        }) else {
+            return Ok(None);
+        };
+        root.directory.try_clone().map(Some)
+    }
+
     /// 返回包含路径的最深可信包根。
     pub fn matching_root(&self, path: &Path) -> Option<&Path> {
         self.matching(path).map(|matched| matched.prefix)
