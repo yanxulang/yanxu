@@ -243,22 +243,15 @@ mod tests {
             .unwrap();
         assert!(!package_case.tree.succeeded, "{package_case:#?}");
         assert!(!package_case.bytecode.succeeded, "{package_case:#?}");
-        assert!(
-            package_case
-                .tree
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("工具包根在目录发现后被替换")),
-            "{package_case:#?}"
-        );
-        assert!(
-            package_case
-                .bytecode
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("工具包根在目录发现后被替换")),
-            "{package_case:#?}"
-        );
+        for outcome in [&package_case.tree, &package_case.bytecode] {
+            let error = outcome.error.as_deref().unwrap_or_default();
+            assert!(
+                error.contains("工具包根在目录发现后被替换") || error.contains("未找到 言序.toml"),
+                "{package_case:#?}"
+            );
+            assert!(!error.contains("当前包未声明依赖"), "{package_case:#?}");
+            assert!(!error.contains("替换包"), "{package_case:#?}");
+        }
         fs::remove_dir_all(root).ok();
         fs::remove_dir_all(backup).ok();
     }

@@ -911,7 +911,7 @@ pub fn resolve_dependency_scoped_with_capabilities(
     current_base: &Path,
     name: &str,
 ) -> Result<(ResolvedDependency, ResolutionCapabilities), ManifestError> {
-    resolve_dependency_scoped_with_capabilities_inner(None, package_root, current_base, name)
+    resolve_dependency_scoped_with_capabilities_inner(None, None, package_root, current_base, name)
 }
 
 /// 解析目录工具中的包依赖，并证明解析实际使用的应用根就是发现阶段的根能力。
@@ -935,8 +935,20 @@ pub fn resolve_dependency_scoped_with_opened_capabilities(
             "工具包根在目录发现后被替换；拒绝重新解析包依赖",
         ));
     }
+    let manifest = load_manifest_from_roots(opened_roots, expected_root).map_err(|error| {
+        if error.message == "规范包清单不属于已打开的包根" {
+            manifest_error(
+                current_base,
+                None,
+                format!("引用包“{name}”时未找到 {MANIFEST_NAME}"),
+            )
+        } else {
+            error
+        }
+    })?;
     resolve_dependency_scoped_with_capabilities_inner(
         Some(opened_roots),
+        Some(manifest),
         package_root,
         current_base,
         name,
@@ -945,23 +957,31 @@ pub fn resolve_dependency_scoped_with_opened_capabilities(
 
 fn resolve_dependency_scoped_with_capabilities_inner(
     opened_roots: Option<&TrustedPackageRoots>,
+    bound_manifest: Option<Manifest>,
     package_root: Option<&Path>,
     current_base: &Path,
     name: &str,
 ) -> Result<(ResolvedDependency, ResolutionCapabilities), ManifestError> {
-    let manifest = match package_root {
-        Some(root) => discover(root)?,
-        None => discover(current_base)?,
-    }
-    .ok_or_else(|| {
-        manifest_error(
-            current_base,
-            None,
-            format!("引用包“{name}”时未找到 {MANIFEST_NAME}"),
-        )
-    })?;
+    let manifest = match bound_manifest {
+        Some(manifest) => manifest,
+        None => match package_root {
+            Some(root) => discover(root)?,
+            None => discover(current_base)?,
+        }
+        .ok_or_else(|| {
+            manifest_error(
+                current_base,
+                None,
+                format!("引用包“{name}”时未找到 {MANIFEST_NAME}"),
+            )
+        })?,
+    };
     let offline = std::env::var_os("YANXU_OFFLINE").is_some();
-    let resolved = cached_or_resolve_graph(&manifest, offline)?;
+    let resolved = if opened_roots.is_some() {
+        cached_or_resolve_graph_read_only(&manifest, offline)?
+    } else {
+        cached_or_resolve_graph(&manifest, offline)?
+    };
     if let Some(opened_roots) = opened_roots {
         let expected_root = opened_roots
             .exact_root_identity(&resolved.application_root)
@@ -975,6 +995,7 @@ fn resolve_dependency_scoped_with_capabilities_inner(
                 "工具包根在目录发现后被替换；拒绝重新解析包依赖",
             ));
         }
+        cache_graph(&manifest, resolved.clone());
     }
     let graph = &resolved.graph;
     let canonical_base =
@@ -1153,18 +1174,18 @@ fn resolve_graph_mode_locked_with_checksum(
     application_roots: TrustedPackageRoots,
 ) -> Result<ResolvedGraphBundle, ManifestError> {
     let lock_path = manifest.root.join(LOCK_NAME);
-    let existing = use_existing
+    let observed_lock = use_existing
         .then(|| read_optional_lock(&lock_path))
         .transpose()?
-        .flatten()
-        .filter(|lock| {
-            lock.lock_version == LOCK_FORMAT_VERSION
-                && lock.manifest_checksum == manifest_checksum
-                && lock.target == current_target()
-        });
+        .flatten();
+    let existing = observed_lock.as_ref().filter(|lock| {
+        lock.lock_version == LOCK_FORMAT_VERSION
+            && lock.manifest_checksum == manifest_checksum
+            && lock.target == current_target()
+    });
     let mut builder = GraphBuilder {
         offline,
-        existing: existing.as_ref(),
+        existing,
         packages: BTreeMap::new(),
         visiting: Vec::new(),
         target: current_target(),
@@ -1201,16 +1222,21 @@ fn resolve_graph_mode_locked_with_checksum(
         root_dev_dependencies: graph.root_dev_dependencies.clone(),
         packages,
     };
-    if write && existing.as_ref() != Some(&lock) {
+    if write && existing != Some(&lock) {
         write_lock(&lock_path, &lock)?;
     }
+    let expected_lock = if write {
+        Some(&lock)
+    } else {
+        observed_lock.as_ref()
+    };
     freeze_resolution_graph(
         manifest,
         graph,
         manifest_checksum,
         application_root,
         application_roots,
-        write.then_some(&lock),
+        expected_lock,
     )
 }
 
@@ -1623,6 +1649,21 @@ fn cached_or_resolve_graph(
     manifest: &Manifest,
     offline: bool,
 ) -> Result<ResolvedGraphBundle, ManifestError> {
+    cached_or_resolve_graph_mode(manifest, offline, true)
+}
+
+fn cached_or_resolve_graph_read_only(
+    manifest: &Manifest,
+    offline: bool,
+) -> Result<ResolvedGraphBundle, ManifestError> {
+    cached_or_resolve_graph_mode(manifest, offline, false)
+}
+
+fn cached_or_resolve_graph_mode(
+    manifest: &Manifest,
+    offline: bool,
+    write: bool,
+) -> Result<ResolvedGraphBundle, ManifestError> {
     let key = graph_cache_key(&manifest.root);
     let cached = graph_cache()
         .lock()
@@ -1639,9 +1680,15 @@ fn cached_or_resolve_graph(
             "依赖图缓存的应用根、清单、锁文件、目标、来源树或不可变 generation 已改变；请显式运行 yanbao install 或 yanbao update",
         ));
     }
-    let current = load(&manifest.path)?;
-    let resolved = resolve_graph_mode(&current, offline, true, true)?;
-    cache_graph(&current, resolved.clone());
+    let current = if write {
+        load(&manifest.path)?
+    } else {
+        manifest.clone()
+    };
+    let resolved = resolve_graph_mode(&current, offline, true, write)?;
+    if write {
+        cache_graph(&current, resolved.clone());
+    }
     Ok(resolved)
 }
 
@@ -10323,6 +10370,11 @@ mod tests {
         write(&application.join("主.yx"), "引「包:工具」为 工具；\n");
         let manifest = load(application.join(MANIFEST_NAME)).unwrap();
         ensure_lock(&manifest, false).unwrap();
+        let lock_before = fs::read(application.join(LOCK_NAME)).unwrap();
+        graph_cache()
+            .lock()
+            .expect("graph cache poisoned")
+            .remove(&graph_cache_key(&application));
         let mut opened_roots = TrustedPackageRoots::default();
         opened_roots.insert(&application).unwrap();
 
@@ -10337,6 +10389,42 @@ mod tests {
             read_dependency_entry(&resolved, &capabilities),
             "公 定 值：数 为 1；\n"
         );
+        assert_eq!(fs::read(application.join(LOCK_NAME)).unwrap(), lock_before);
+        let (reused, reused_capabilities) = resolve_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            Some(&application),
+            &application,
+            "工具",
+        )
+        .unwrap();
+        assert_eq!(
+            read_dependency_entry(&reused, &reused_capabilities),
+            "公 定 值：数 为 1；\n"
+        );
+
+        let lock_path = application.join(LOCK_NAME);
+        let mut stale_lock = read_optional_lock(&lock_path).unwrap().unwrap();
+        stale_lock.manifest_checksum = "0".repeat(64);
+        write(&lock_path, &toml::to_string(&stale_lock).unwrap());
+        let stale_lock_before = fs::read(&lock_path).unwrap();
+        graph_cache()
+            .lock()
+            .expect("graph cache poisoned")
+            .remove(&graph_cache_key(&application));
+        for _ in 0..2 {
+            let (resolved, capabilities) = resolve_dependency_scoped_with_opened_capabilities(
+                &opened_roots,
+                Some(&application),
+                &application,
+                "工具",
+            )
+            .unwrap();
+            assert_eq!(
+                read_dependency_entry(&resolved, &capabilities),
+                "公 定 值：数 为 1；\n"
+            );
+            assert_eq!(fs::read(&lock_path).unwrap(), stale_lock_before);
+        }
 
         fs::rename(&application, &original).unwrap();
         write(&application.join(MANIFEST_NAME), manifest_text);
@@ -10357,6 +10445,58 @@ mod tests {
             "{error}"
         );
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tooling_dependency_resolution_ignores_a_new_nested_manifest() {
+        let root = temp("tooling-resolution-nested-manifest");
+        let application = root.join("application");
+        let nested = application.join("文档");
+        let dependency = root.join("dependency");
+        write(
+            &application.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n工具='../dependency'\n",
+        );
+        write(&application.join("主.yx"), "言「应用」；\n");
+        write(&nested.join("用例.yx"), "引「包:工具」为 工具；\n");
+        write(
+            &dependency.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工具'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&dependency.join("主.yx"), "公 定 值：数 为 1；\n");
+        let mut opened_roots = TrustedPackageRoots::default();
+        opened_roots.insert(&application).unwrap();
+
+        write(
+            &nested.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='替换包'\n版本='1.0.0'\n入口='用例.yx'\n[依赖]\n",
+        );
+        let (resolved, capabilities) = resolve_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            None,
+            &nested,
+            "工具",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_dependency_entry(&resolved, &capabilities),
+            "公 定 值：数 为 1；\n"
+        );
+        let (reused, reused_capabilities) = resolve_dependency_scoped_with_opened_capabilities(
+            &opened_roots,
+            None,
+            &nested,
+            "工具",
+        )
+        .unwrap();
+        assert_eq!(
+            read_dependency_entry(&reused, &reused_capabilities),
+            "公 定 值：数 为 1；\n"
+        );
+        assert!(!application.join(LOCK_NAME).exists());
+        assert!(!nested.join(LOCK_NAME).exists());
         fs::remove_dir_all(root).ok();
     }
 
