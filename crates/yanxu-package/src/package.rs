@@ -4609,7 +4609,7 @@ impl RegistryTemporaryDirectory {
     }
 
     fn publish(mut self, destination: &Path) -> Result<(), ManifestError> {
-        rename_registry_directory(&self.path, destination).map_err(|error| {
+        rename_directory(&self.path, destination).map_err(|error| {
             manifest_error(destination, None, format!("不能原子发布索引缓存：{error}"))
         })?;
         self.retained = true;
@@ -4626,12 +4626,12 @@ impl Drop for RegistryTemporaryDirectory {
 }
 
 #[cfg(not(windows))]
-fn rename_registry_directory(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_directory(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
 #[cfg(windows)]
-fn rename_registry_directory(source: &Path, destination: &Path) -> io::Result<()> {
+fn rename_directory(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
@@ -8175,15 +8175,6 @@ pub fn vendor_dependencies(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VendorInstallState {
-    Prepared,
-    BackupReady,
-    Published,
-    Committed,
-    RolledBack,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VendorInstallCheckpoint {
     Backup,
     BackupSync,
@@ -8256,8 +8247,8 @@ fn vendor_dependencies_with_checkpoint(
     fs::create_dir(&staging).map_err(|error| {
         manifest_error(&staging, None, format!("不能创建辖制暂存目录：{error}"))
     })?;
-    let build = build_staged_vendor(graph, &staging);
-    let vendor = match build {
+
+    let vendor = match build_staged_vendor(graph, &staging) {
         Ok(vendor) => vendor,
         Err(error) => return Err(vendor_build_failure(&staging, error)),
     };
@@ -8345,10 +8336,7 @@ fn vendor_build_failure(staging: &Path, primary: ManifestError) -> ManifestError
         Err(error) => vendor_combined_error(
             staging,
             primary,
-            &[
-                format!("不能清理失败的辖制暂存目录：{error}"),
-                format!("已保留辖制恢复现场：{}", staging.display()),
-            ],
+            &[format!("不能清理失败的辖制暂存目录：{error}")],
         ),
     }
 }
@@ -8464,8 +8452,7 @@ fn validate_owned_vendor_directory(destination: &Path) -> Result<VendorManifest,
                 format!("不能读取既有辖制目录项：{error}"),
             )
         })?;
-        let name = PathBuf::from(entry.file_name());
-        if !allowed.contains(&name) {
+        if !allowed.contains(&PathBuf::from(entry.file_name())) {
             return Err(manifest_error(
                 entry.path(),
                 None,
@@ -8482,6 +8469,8 @@ fn sync_vendor_parent(path: &Path) -> Result<(), ManifestError> {
         .and_then(|directory| directory.sync_all())
         .map_err(|error| manifest_error(path, None, format!("不能同步辖制目录父目录：{error}")))?;
     #[cfg(not(unix))]
+    // Windows 目录改名统一经过带 MOVEFILE_WRITE_THROUGH 的 rename_directory；
+    // 其他非 Unix 目标没有可移植的父目录同步接口。
     let _ = path;
     Ok(())
 }
@@ -8534,6 +8523,15 @@ fn sync_vendor_tree(root: &Path) -> Result<(), ManifestError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VendorInstallState {
+    Prepared,
+    BackupReady,
+    Published,
+    Committed,
+    RolledBack,
+}
+
 struct VendorInstallTransaction<'a, F> {
     staging: &'a Path,
     destination: &'a Path,
@@ -8581,6 +8579,11 @@ where
             {
                 return Err(self.rollback(error));
             }
+            if let Err(error) =
+                self.validate_backup("旧辖制目录备份在最终清理前与事务开始时的清单不一致")
+            {
+                return Err(self.rollback(error));
+            }
             if let Err(error) = fs::remove_dir_all(self.backup) {
                 let error = manifest_error(
                     self.backup,
@@ -8596,7 +8599,7 @@ where
 
     fn backup_existing(&mut self) -> Result<(), ManifestError> {
         (self.checkpoint)(VendorInstallCheckpoint::Backup, self.destination)?;
-        fs::rename(self.destination, self.backup).map_err(|error| {
+        rename_directory(self.destination, self.backup).map_err(|error| {
             manifest_error(
                 self.destination,
                 None,
@@ -8604,12 +8607,24 @@ where
             )
         })?;
         self.state = VendorInstallState::BackupReady;
+        self.validate_backup("旧辖制目录备份在发布前与事务开始时的清单不一致")?;
         self.sync_parent(VendorInstallCheckpoint::BackupSync)
+    }
+
+    fn validate_backup(&self, mismatch: &str) -> Result<(), ManifestError> {
+        let Some(previous) = self.previous else {
+            return Ok(());
+        };
+        match validate_owned_vendor_directory(self.backup) {
+            Ok(found) if found == *previous => Ok(()),
+            Ok(_) => Err(manifest_error(self.backup, None, mismatch)),
+            Err(error) => Err(error),
+        }
     }
 
     fn publish(&mut self) -> Result<(), ManifestError> {
         (self.checkpoint)(VendorInstallCheckpoint::Publish, self.destination)?;
-        fs::rename(self.staging, self.destination).map_err(|error| {
+        rename_directory(self.staging, self.destination).map_err(|error| {
             manifest_error(
                 self.destination,
                 None,
@@ -8637,11 +8652,14 @@ where
                 {
                     Ok(found) if found == *previous => true,
                     Ok(_) => {
-                        failures.push("旧辖制目录备份与事务开始时的清单不一致".into());
+                        failures.push(format!(
+                            "{}：旧辖制目录备份与事务开始时的清单不一致",
+                            self.backup.display()
+                        ));
                         false
                     }
                     Err(error) => {
-                        failures.push(format!("不能验证旧辖制目录备份：{}", error.message));
+                        failures.push(vendor_transaction_failure_text(error));
                         false
                     }
                 }
@@ -8656,7 +8674,7 @@ where
         if self.state == VendorInstallState::Published && restored {
             match (self.checkpoint)(VendorInstallCheckpoint::RollbackPublished, self.destination)
                 .and_then(|()| {
-                    fs::rename(self.destination, self.staging).map_err(|error| {
+                    rename_directory(self.destination, self.staging).map_err(|error| {
                         manifest_error(
                             self.destination,
                             None,
@@ -8666,7 +8684,7 @@ where
                 }) {
                 Ok(()) => self.state = VendorInstallState::BackupReady,
                 Err(error) => {
-                    failures.push(error.message);
+                    failures.push(vendor_transaction_failure_text(error));
                     restored = false;
                 }
             }
@@ -8674,7 +8692,7 @@ where
         if self.previous.is_some() && self.state == VendorInstallState::BackupReady && restored {
             match (self.checkpoint)(VendorInstallCheckpoint::Restore, self.destination).and_then(
                 |()| {
-                    fs::rename(self.backup, self.destination).map_err(|error| {
+                    rename_directory(self.backup, self.destination).map_err(|error| {
                         manifest_error(
                             self.destination,
                             None,
@@ -8685,7 +8703,7 @@ where
             ) {
                 Ok(()) => self.state = VendorInstallState::Prepared,
                 Err(error) => {
-                    failures.push(error.message);
+                    failures.push(vendor_transaction_failure_text(error));
                     restored = false;
                 }
             }
@@ -8724,12 +8742,12 @@ where
                 },
             });
             if let Err(error) = validation {
-                failures.push(error.message);
+                failures.push(vendor_transaction_failure_text(error));
                 restored = false;
             }
         }
         if let Err(error) = self.sync_parent(VendorInstallCheckpoint::RollbackSync) {
-            failures.push(format!("不能同步辖制目录回滚：{}", error.message));
+            failures.push(vendor_transaction_failure_text(error));
             restored = false;
         }
         if restored && fs::symlink_metadata(self.staging).is_ok() {
@@ -8744,19 +8762,16 @@ where
                     })
                 }) {
                 Ok(()) => {}
-                Err(error) => failures.push(error.message),
+                Err(error) => failures.push(vendor_transaction_failure_text(error)),
             }
         }
         if restored {
             self.state = VendorInstallState::RolledBack;
         }
-        let retained = [self.staging, self.backup]
-            .into_iter()
-            .filter(|path| fs::symlink_metadata(path).is_ok())
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>();
-        if !retained.is_empty() {
-            failures.push(format!("已保留辖制恢复现场：{}", retained.join("、")));
+        for recovery in [self.staging, self.backup] {
+            if fs::symlink_metadata(recovery).is_ok() {
+                failures.push(format!("保留辖制事务恢复路径：{}", recovery.display()));
+            }
         }
         vendor_combined_error(self.destination, primary, &failures)
     }
@@ -8782,6 +8797,10 @@ fn install_staged_vendor_directory(
         checkpoint,
     }
     .run()
+}
+
+fn vendor_transaction_failure_text(error: ManifestError) -> String {
+    format!("{}：{}", error.path.display(), error.message)
 }
 
 fn vendor_combined_error(
@@ -9404,7 +9423,6 @@ mod tests {
                 }
             }
         }
-
         let mut files = BTreeMap::new();
         visit(root, root, &mut files);
         files
@@ -11110,7 +11128,105 @@ mod tests {
     }
 
     #[test]
-    fn vendor_precommit_failures_restore_the_previous_directory_byte_for_byte() {
+    fn vendor_build_failure_preserves_the_old_tree_and_cleans_staging() {
+        let root = temp("vendor-build-failure");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("vendor");
+        let old_graph = vendor_fixture_graph(&root, "old");
+        let old = vendor_dependencies(&old_graph, &destination).unwrap();
+        let old_bytes = vendor_tree_bytes(&destination);
+        let mut broken_graph = vendor_fixture_graph(&root, "broken");
+        broken_graph
+            .packages
+            .values_mut()
+            .next()
+            .unwrap()
+            .locked
+            .checksum = "0".repeat(64);
+
+        let error = vendor_dependencies(&broken_graph, &destination).unwrap_err();
+
+        assert!(error.message.contains("辖制包校验不符"), "{error}");
+        assert_eq!(validate_owned_vendor_directory(&destination).unwrap(), old);
+        assert_eq!(vendor_tree_bytes(&destination), old_bytes);
+        assert!(vendor_transaction_artifacts(&root, "vendor").is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vendor_refuses_damaged_or_extended_owned_directories() {
+        for damage in ["extra", "changed"] {
+            let root = temp(&format!("vendor-owned-{damage}"));
+            fs::create_dir_all(&root).unwrap();
+            let destination = root.join("vendor");
+            let old_graph = vendor_fixture_graph(&root, "old");
+            let old = vendor_dependencies(&old_graph, &destination).unwrap();
+            let package = old.packages.values().next().unwrap();
+            if damage == "extra" {
+                write(&destination.join("unexpected.txt"), "must survive\n");
+            } else {
+                write(
+                    &destination.join(&package.path).join("主.yx"),
+                    "公 定 标记 为「changed」；\n",
+                );
+            }
+            let damaged_bytes = vendor_tree_bytes(&destination);
+            let new_graph = vendor_fixture_graph(&root, "new");
+
+            let error = vendor_dependencies(&new_graph, &destination).unwrap_err();
+
+            assert!(error.message.contains("拒绝覆盖"), "{error}");
+            assert_eq!(vendor_tree_bytes(&destination), damaged_bytes);
+            assert!(vendor_transaction_artifacts(&root, "vendor").is_empty());
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn vendor_refuses_a_non_directory_target() {
+        let root = temp("vendor-file-target");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("vendor");
+        write(&destination, "must survive\n");
+        let graph = vendor_fixture_graph(&root, "new");
+
+        let error = vendor_dependencies(&graph, &destination).unwrap_err();
+
+        assert!(error.message.contains("必须是真实目录"), "{error}");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "must survive\n");
+        assert!(vendor_transaction_artifacts(&root, "vendor").is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vendor_refuses_a_link_target_without_touching_its_referent() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("vendor-link-target");
+        let referent = root.join("referent");
+        let sentinel = referent.join("keep.txt");
+        write(&sentinel, "must survive\n");
+        let destination = root.join("vendor");
+        symlink(&referent, &destination).unwrap();
+        let graph = vendor_fixture_graph(&root, "new");
+
+        let error = vendor_dependencies(&graph, &destination).unwrap_err();
+
+        assert!(error.message.contains("必须是真实目录"), "{error}");
+        assert!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "must survive\n");
+        assert!(vendor_transaction_artifacts(&root, "vendor").is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vendor_primary_failures_restore_exact_bytes() {
         for failure in [
             VendorInstallCheckpoint::Backup,
             VendorInstallCheckpoint::BackupSync,
@@ -11119,7 +11235,7 @@ mod tests {
             VendorInstallCheckpoint::PublishSync,
             VendorInstallCheckpoint::BackupCleanup,
         ] {
-            let root = temp(&format!("vendor-precommit-{failure:?}"));
+            let root = temp(&format!("vendor-rollback-{failure:?}"));
             fs::create_dir_all(&root).unwrap();
             let destination = root.join("vendor");
             let old_graph = vendor_fixture_graph(&root, "old");
@@ -11130,14 +11246,14 @@ mod tests {
             let error =
                 vendor_dependencies_with_checkpoint(&new_graph, &destination, |point, path| {
                     if point == failure {
-                        Err(manifest_error(path, None, "模拟辖制提交前失败"))
+                        Err(manifest_error(path, None, "模拟辖制事务失败"))
                     } else {
                         Ok(())
                     }
                 })
                 .unwrap_err();
 
-            assert!(error.message.contains("模拟辖制提交前失败"), "{error}");
+            assert!(error.message.contains("模拟辖制事务失败"), "{error}");
             assert_eq!(vendor_tree_bytes(&destination), old_bytes);
             assert_eq!(validate_owned_vendor_directory(&destination).unwrap(), old);
             assert!(vendor_transaction_artifacts(&root, "vendor").is_empty());
@@ -11146,7 +11262,7 @@ mod tests {
     }
 
     #[test]
-    fn vendor_restore_failure_reports_both_failures_and_preserves_recovery_trees() {
+    fn vendor_restore_failure_reports_both_errors_and_preserves_recovery_trees() {
         let root = temp("vendor-restore-failure");
         fs::create_dir_all(&root).unwrap();
         let destination = root.join("vendor");
@@ -11177,21 +11293,11 @@ mod tests {
         assert_eq!(artifacts.len(), 2);
         let backup = artifacts
             .iter()
-            .find(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains(".backup-")
-            })
+            .find(|path| path.to_string_lossy().contains(".backup-"))
             .unwrap();
         let staging = artifacts
             .iter()
-            .find(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains(".staging-")
-            })
+            .find(|path| path.to_string_lossy().contains(".staging-"))
             .unwrap();
         assert_eq!(validate_owned_vendor_directory(backup).unwrap(), old);
         assert_ne!(validate_owned_vendor_directory(staging).unwrap(), old);
@@ -11205,12 +11311,22 @@ mod tests {
     }
 
     #[test]
-    fn vendor_rollback_sync_and_cleanup_failures_preserve_recovery_state() {
-        for secondary in [
-            VendorInstallCheckpoint::RollbackSync,
-            VendorInstallCheckpoint::RollbackCleanup,
+    fn vendor_failures_after_restore_keep_recovery_staging() {
+        for (secondary, message) in [
+            (
+                VendorInstallCheckpoint::RollbackValidation,
+                "模拟辖制回滚复验失败",
+            ),
+            (
+                VendorInstallCheckpoint::RollbackSync,
+                "模拟辖制回滚同步失败",
+            ),
+            (
+                VendorInstallCheckpoint::RollbackCleanup,
+                "模拟辖制回滚清理失败",
+            ),
         ] {
-            let root = temp(&format!("vendor-rollback-{secondary:?}"));
+            let root = temp(&format!("vendor-secondary-{secondary:?}"));
             fs::create_dir_all(&root).unwrap();
             let destination = root.join("vendor");
             let old_graph = vendor_fixture_graph(&root, "old");
@@ -11224,34 +11340,74 @@ mod tests {
                         VendorInstallCheckpoint::PublishSync => {
                             Err(manifest_error(path, None, "模拟辖制发布同步失败"))
                         }
-                        point if point == secondary => {
-                            Err(manifest_error(path, None, "模拟辖制回滚失败"))
-                        }
+                        point if point == secondary => Err(manifest_error(path, None, message)),
                         _ => Ok(()),
                     }
                 })
                 .unwrap_err();
 
-            assert!(error.message.contains("模拟辖制回滚失败"), "{error}");
+            assert!(error.message.contains(message), "{error}");
             assert_eq!(vendor_tree_bytes(&destination), old_bytes);
             assert_eq!(validate_owned_vendor_directory(&destination).unwrap(), old);
             let artifacts = vendor_transaction_artifacts(&root, "vendor");
             assert_eq!(artifacts.len(), 1);
+            assert!(artifacts[0].to_string_lossy().contains(".staging-"));
             assert!(
-                artifacts[0]
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains(".staging-")
+                error.message.contains(&artifacts[0].display().to_string()),
+                "{error}"
             );
-            assert!(error.message.contains(&artifacts[0].display().to_string()));
             fs::remove_dir_all(root).ok();
         }
     }
 
     #[test]
-    fn vendor_partial_backup_cleanup_preserves_the_valid_new_directory_and_evidence() {
-        let root = temp("vendor-partial-backup-cleanup");
+    fn vendor_failures_before_restore_preserve_both_valid_trees() {
+        for (secondary, message) in [
+            (
+                VendorInstallCheckpoint::RestoreValidation,
+                "模拟旧辖制目录备份复验失败",
+            ),
+            (
+                VendorInstallCheckpoint::RollbackPublished,
+                "模拟新辖制目录撤回失败",
+            ),
+        ] {
+            let root = temp(&format!("vendor-preserve-{secondary:?}"));
+            fs::create_dir_all(&root).unwrap();
+            let destination = root.join("vendor");
+            let old_graph = vendor_fixture_graph(&root, "old");
+            let old = vendor_dependencies(&old_graph, &destination).unwrap();
+            let new_graph = vendor_fixture_graph(&root, "new");
+
+            let error =
+                vendor_dependencies_with_checkpoint(&new_graph, &destination, |point, path| {
+                    match point {
+                        VendorInstallCheckpoint::PublishSync => {
+                            Err(manifest_error(path, None, "模拟辖制发布同步失败"))
+                        }
+                        point if point == secondary => Err(manifest_error(path, None, message)),
+                        _ => Ok(()),
+                    }
+                })
+                .unwrap_err();
+
+            assert!(error.message.contains(message), "{error}");
+            assert_ne!(validate_owned_vendor_directory(&destination).unwrap(), old);
+            let artifacts = vendor_transaction_artifacts(&root, "vendor");
+            assert_eq!(artifacts.len(), 1);
+            assert!(artifacts[0].to_string_lossy().contains(".backup-"));
+            assert_eq!(validate_owned_vendor_directory(&artifacts[0]).unwrap(), old);
+            assert!(
+                error.message.contains(&artifacts[0].display().to_string()),
+                "{error}"
+            );
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn vendor_refuses_to_delete_a_backup_changed_during_commit() {
+        let root = temp("vendor-backup-changed");
         fs::create_dir_all(&root).unwrap();
         let destination = root.join("vendor");
         let old_graph = vendor_fixture_graph(&root, "old");
@@ -11260,32 +11416,25 @@ mod tests {
 
         let error = vendor_dependencies_with_checkpoint(&new_graph, &destination, |point, path| {
             if point == VendorInstallCheckpoint::BackupCleanup {
-                fs::remove_file(path.join("言序-vendor.json")).unwrap();
-                Err(manifest_error(path, None, "模拟旧辖制备份部分清理失败"))
-            } else {
-                Ok(())
+                write(&path.join("unexpected.txt"), "must survive\n");
             }
+            Ok(())
         })
         .unwrap_err();
 
-        assert!(error.message.contains("模拟旧辖制备份部分清理失败"));
-        let installed = validate_owned_vendor_directory(&destination).unwrap();
-        assert_ne!(installed, old);
-        assert_eq!(
-            installed.packages["fixture@1.0.0"].checksum,
-            new_graph.packages["fixture@1.0.0"].locked.checksum
-        );
+        assert_ne!(validate_owned_vendor_directory(&destination).unwrap(), old);
         let artifacts = vendor_transaction_artifacts(&root, "vendor");
         assert_eq!(artifacts.len(), 1);
-        assert!(
-            artifacts[0]
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .contains(".backup-")
+        let backup = &artifacts[0];
+        assert!(backup.to_string_lossy().contains(".backup-"));
+        assert_eq!(
+            fs::read_to_string(backup.join("unexpected.txt")).unwrap(),
+            "must survive\n"
         );
-        assert!(!artifacts[0].join("言序-vendor.json").exists());
-        assert!(error.message.contains(&artifacts[0].display().to_string()));
+        assert!(
+            error.message.contains(&backup.display().to_string()),
+            "{error}"
+        );
         fs::remove_dir_all(root).ok();
     }
 
