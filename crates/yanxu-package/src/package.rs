@@ -14406,6 +14406,14 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
+    fn publish_test_process_id(root: &Path, name: &str) {
+        let process_id = std::process::id();
+        let pending = root.join(format!(".{name}.{process_id}.pending"));
+        fs::write(&pending, process_id.to_string()).unwrap();
+        fs::rename(pending, root.join(name)).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn subprocess_timeout_reaps_descendants() {
         const ROLE: &str = "YANXU_SUBPROCESS_TIMEOUT_TEST_ROLE";
@@ -14414,7 +14422,7 @@ mod tests {
         if let Some(role) = std::env::var_os(ROLE) {
             let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
             if role == "leaf" {
-                fs::write(root.join("leaf.pid"), std::process::id().to_string()).unwrap();
+                publish_test_process_id(&root, "leaf.pid");
                 std::thread::sleep(Duration::from_secs(30));
                 return;
             }
@@ -14485,7 +14493,7 @@ mod tests {
         if let Some(role) = std::env::var_os(ROLE) {
             let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
             if role == "leaf" {
-                fs::write(root.join("leaf.pid"), std::process::id().to_string()).unwrap();
+                publish_test_process_id(&root, "leaf.pid");
                 std::thread::sleep(Duration::from_secs(30));
                 return;
             }
@@ -14643,7 +14651,7 @@ mod tests {
         const TEST: &str = "package::tests::subprocess_cancellation_stops_and_reaps_the_process";
         if std::env::var_os(CHILD).is_some() {
             let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
-            fs::write(root.join("child.pid"), std::process::id().to_string()).unwrap();
+            publish_test_process_id(&root, "child.pid");
             std::thread::sleep(Duration::from_secs(30));
             return;
         }
