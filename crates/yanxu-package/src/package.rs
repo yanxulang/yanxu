@@ -8171,35 +8171,155 @@ pub fn vendor_dependencies(
     graph: &ResolutionGraph,
     destination: impl AsRef<Path>,
 ) -> Result<VendorManifest, ManifestError> {
-    let destination = destination.as_ref();
-    if destination.exists() {
-        fs::remove_dir_all(destination).map_err(|error| {
-            manifest_error(destination, None, format!("不能清理旧辖制目录：{error}"))
-        })?;
+    vendor_dependencies_with_checkpoint(graph, destination.as_ref(), |_, _| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VendorInstallState {
+    Prepared,
+    BackupReady,
+    Published,
+    Committed,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VendorInstallCheckpoint {
+    Backup,
+    BackupSync,
+    Publish,
+    PublishValidation,
+    PublishSync,
+    BackupCleanup,
+    RollbackPublished,
+    RestoreValidation,
+    Restore,
+    RollbackValidation,
+    RollbackSync,
+    RollbackCleanup,
+}
+
+fn vendor_dependencies_with_checkpoint(
+    graph: &ResolutionGraph,
+    destination: &Path,
+    mut checkpoint: impl FnMut(VendorInstallCheckpoint, &Path) -> Result<(), ManifestError>,
+) -> Result<VendorManifest, ManifestError> {
+    if graph.packages.values().any(|dependency| {
+        validate_locked_dependency_source(&dependency.locked.source).is_err()
+            || dependency
+                .locked
+                .revision
+                .as_deref()
+                .is_some_and(|revision| validate_git_revision_security(revision).is_err())
+    }) {
+        return Err(manifest_error(destination, None, SOURCE_SECURITY_ERROR));
     }
-    fs::create_dir_all(destination)
-        .map_err(|error| manifest_error(destination, None, format!("不能创建辖制目录：{error}")))?;
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        manifest_error(parent, None, format!("不能创建辖制目录父目录：{error}"))
+    })?;
+    let _project_lock = acquire_project_lock(parent)?;
+    let previous = match fs::symlink_metadata(destination) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && !standard_metadata_is_reparse(&metadata) =>
+        {
+            Some(validate_owned_vendor_directory(destination)?)
+        }
+        Ok(_) => {
+            return Err(manifest_error(
+                destination,
+                None,
+                "既有辖制目标必须是真实目录，不得为链接、重解析点或特殊文件",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(manifest_error(
+                destination,
+                None,
+                format!("不能检查既有辖制目标：{error}"),
+            ));
+        }
+    };
+    let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("vendor");
+    let staging = parent.join(format!(".{name}.staging-{}-{sequence}", std::process::id()));
+    let backup = parent.join(format!(".{name}.backup-{}-{sequence}", std::process::id()));
+    fs::create_dir(&staging).map_err(|error| {
+        manifest_error(&staging, None, format!("不能创建辖制暂存目录：{error}"))
+    })?;
+    let build = build_staged_vendor(graph, &staging);
+    let vendor = match build {
+        Ok(vendor) => vendor,
+        Err(error) => return Err(vendor_build_failure(&staging, error)),
+    };
+    let staged = match validate_owned_vendor_directory(&staging) {
+        Ok(staged) => staged,
+        Err(error) => return Err(vendor_build_failure(&staging, error)),
+    };
+    if staged != vendor {
+        return Err(vendor_build_failure(
+            &staging,
+            manifest_error(&staging, None, "辖制暂存目录在发布前发生变化"),
+        ));
+    }
+    install_staged_vendor_directory(
+        &staging,
+        destination,
+        &backup,
+        &vendor,
+        previous.as_ref(),
+        &mut checkpoint,
+    )?;
+    Ok(vendor)
+}
+
+fn build_staged_vendor(
+    graph: &ResolutionGraph,
+    staging: &Path,
+) -> Result<VendorManifest, ManifestError> {
     let mut packages = BTreeMap::new();
     for (id, dependency) in &graph.packages {
         let directory = format!("{}-{}", dependency.locked.name, &short_hash(id)[..12]);
-        let target = destination.join(&directory);
-        copy_package_tree(&dependency.root, &target)?;
-        let checksum = tree_checksum(&target)?;
-        if checksum != dependency.locked.checksum {
+        let target = staging.join(&directory);
+        let snapshot = capture_package_tree(
+            &dependency.root,
+            PackagePathPurpose::TreeChecksum,
+            PackageTreeCaptureLimits::dependency(),
+            None,
+        )?;
+        let checksum = portable_tree_snapshot_checksum(&snapshot)?;
+        if !tree_snapshot_checksum_matches(&snapshot, &dependency.locked.checksum)? {
             return Err(manifest_error(
                 &target,
                 None,
                 format!(
-                    "辖制包校验不符：锁定 {}，复制后 {checksum}",
+                    "辖制包校验不符：锁定 {}，快照为 {checksum}",
                     dependency.locked.checksum
                 ),
+            ));
+        }
+        write_package_tree_snapshot(&snapshot, &target)?;
+        if !tree_checksum_matches(&target, &dependency.locked.checksum)? {
+            return Err(manifest_error(
+                &target,
+                None,
+                "辖制包写入暂存目录后校验不符",
             ));
         }
         packages.insert(
             id.clone(),
             VendorPackage {
                 path: directory,
-                checksum,
+                checksum: dependency.locked.checksum.clone(),
                 source: dependency.locked.source.clone(),
                 revision: dependency.locked.revision.clone(),
             },
@@ -8210,12 +8330,478 @@ pub fn vendor_dependencies(
         target: graph.target.clone(),
         packages,
     };
-    let manifest_path = destination.join("言序-vendor.json");
+    let manifest_path = staging.join("言序-vendor.json");
     let document = serde_json::to_vec_pretty(&vendor).map_err(|error| {
         manifest_error(&manifest_path, None, format!("不能生成辖制清单：{error}"))
     })?;
     atomic_write(&manifest_path, &document, "辖制清单")?;
+    sync_vendor_tree(staging)?;
     Ok(vendor)
+}
+
+fn vendor_build_failure(staging: &Path, primary: ManifestError) -> ManifestError {
+    match fs::remove_dir_all(staging) {
+        Ok(()) => primary,
+        Err(error) => vendor_combined_error(
+            staging,
+            primary,
+            &[
+                format!("不能清理失败的辖制暂存目录：{error}"),
+                format!("已保留辖制恢复现场：{}", staging.display()),
+            ],
+        ),
+    }
+}
+
+fn validate_owned_vendor_directory(destination: &Path) -> Result<VendorManifest, ManifestError> {
+    if destination.join(MANIFEST_NAME).exists() {
+        return Err(manifest_error(
+            destination,
+            None,
+            "辖制目标不能覆盖言序项目根目录",
+        ));
+    }
+    let manifest_path = destination.join("言序-vendor.json");
+    let metadata = fs::symlink_metadata(&manifest_path).map_err(|error| {
+        manifest_error(
+            &manifest_path,
+            None,
+            format!("既有目录没有可验证的辖制清单，拒绝覆盖：{error}"),
+        )
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || standard_metadata_is_reparse(&metadata)
+    {
+        return Err(manifest_error(
+            &manifest_path,
+            None,
+            "既有目录没有普通、非重解析的辖制清单，拒绝覆盖",
+        ));
+    }
+    let mut roots = TrustedPackageRoots::default();
+    roots
+        .insert(destination)
+        .map_err(|error| package_path_manifest_error(destination, error))?;
+    let manifest = roots
+        .resolve_existing_file(&manifest_path, PackagePathPurpose::ManifestReference)
+        .map_err(|error| package_path_manifest_error(&manifest_path, error))?
+        .ok_or_else(|| {
+            manifest_error(destination, None, "既有目录没有可验证的辖制清单，拒绝覆盖")
+        })?;
+    let bytes = read_resolved_regular_file_snapshot(manifest, 8 * 1024 * 1024, "辖制清单")?;
+    let vendor: VendorManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        manifest_error(
+            &manifest_path,
+            None,
+            format!("既有辖制清单无效，拒绝覆盖：{error}"),
+        )
+    })?;
+    if vendor.format_version != 1 {
+        return Err(manifest_error(
+            &manifest_path,
+            None,
+            "既有辖制清单格式不受支持，拒绝覆盖",
+        ));
+    }
+    let mut allowed = BTreeSet::from([PathBuf::from("言序-vendor.json")]);
+    for package in vendor.packages.values() {
+        validate_locked_dependency_source(&package.source)
+            .map_err(|_| manifest_error(&manifest_path, None, "既有辖制清单含不安全的依赖来源"))?;
+        if let Some(revision) = &package.revision {
+            validate_git_revision_security(revision).map_err(|_| {
+                manifest_error(&manifest_path, None, "既有辖制清单含不安全的 Git 修订")
+            })?;
+        }
+        if !valid_sha256(&package.checksum) {
+            return Err(manifest_error(
+                &manifest_path,
+                None,
+                "既有辖制清单含无效的内容 SHA-256",
+            ));
+        }
+        crate::path_policy::validate_portable_path_text(&package.path)
+            .map_err(|error| package_path_manifest_error(destination, error))?;
+        let relative = Path::new(&package.path);
+        if relative.components().count() != 1 {
+            return Err(manifest_error(
+                &manifest_path,
+                None,
+                "既有辖制清单的包目录必须是单一相对组件",
+            ));
+        }
+        package_path_decision(relative, PackagePathPurpose::ManifestReference)
+            .map_err(|error| package_path_manifest_error(&manifest_path, error))?;
+        let root = destination.join(relative);
+        let metadata = fs::symlink_metadata(&root)
+            .map_err(|error| manifest_error(&root, None, format!("不能检查既有辖制包：{error}")))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || standard_metadata_is_reparse(&metadata)
+        {
+            return Err(manifest_error(
+                &root,
+                None,
+                "既有辖制包必须是真实、非重解析目录",
+            ));
+        }
+        if !tree_checksum_matches(&root, &package.checksum)? {
+            return Err(manifest_error(
+                &root,
+                None,
+                "既有辖制包内容与辖制清单不符，拒绝覆盖",
+            ));
+        }
+        allowed.insert(relative.to_path_buf());
+    }
+    for entry in fs::read_dir(destination).map_err(|error| {
+        manifest_error(destination, None, format!("不能枚举既有辖制目录：{error}"))
+    })? {
+        let entry = entry.map_err(|error| {
+            manifest_error(
+                destination,
+                None,
+                format!("不能读取既有辖制目录项：{error}"),
+            )
+        })?;
+        let name = PathBuf::from(entry.file_name());
+        if !allowed.contains(&name) {
+            return Err(manifest_error(
+                entry.path(),
+                None,
+                "既有目录含不属于辖制清单的内容，拒绝覆盖",
+            ));
+        }
+    }
+    Ok(vendor)
+}
+
+fn sync_vendor_parent(path: &Path) -> Result<(), ManifestError> {
+    #[cfg(unix)]
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| manifest_error(path, None, format!("不能同步辖制目录父目录：{error}")))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn sync_vendor_tree(root: &Path) -> Result<(), ManifestError> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut index = 0;
+    while index < directories.len() {
+        let directory = directories[index].clone();
+        for entry in fs::read_dir(&directory).map_err(|error| {
+            manifest_error(&directory, None, format!("不能枚举辖制暂存目录：{error}"))
+        })? {
+            let entry = entry.map_err(|error| {
+                manifest_error(&directory, None, format!("不能读取辖制暂存目录项：{error}"))
+            })?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                manifest_error(
+                    entry.path(),
+                    None,
+                    format!("不能检查辖制暂存目录项：{error}"),
+                )
+            })?;
+            if metadata.file_type().is_symlink() || standard_metadata_is_reparse(&metadata) {
+                return Err(manifest_error(
+                    entry.path(),
+                    None,
+                    "辖制暂存目录不得包含链接或重解析点",
+                ));
+            }
+            if metadata.is_dir() {
+                directories.push(entry.path());
+            } else if !metadata.is_file() {
+                return Err(manifest_error(
+                    entry.path(),
+                    None,
+                    "辖制暂存目录不得包含特殊文件",
+                ));
+            }
+        }
+        index += 1;
+    }
+    #[cfg(unix)]
+    for directory in directories.into_iter().rev() {
+        fs::File::open(&directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                manifest_error(&directory, None, format!("不能同步辖制暂存目录：{error}"))
+            })?;
+    }
+    Ok(())
+}
+
+struct VendorInstallTransaction<'a, F> {
+    staging: &'a Path,
+    destination: &'a Path,
+    backup: &'a Path,
+    parent: &'a Path,
+    previous: Option<&'a VendorManifest>,
+    expected: &'a VendorManifest,
+    state: VendorInstallState,
+    checkpoint: &'a mut F,
+}
+
+impl<F> VendorInstallTransaction<'_, F>
+where
+    F: FnMut(VendorInstallCheckpoint, &Path) -> Result<(), ManifestError>,
+{
+    fn run(mut self) -> Result<(), ManifestError> {
+        if self.previous.is_some()
+            && let Err(error) = self.backup_existing()
+        {
+            return Err(self.rollback(error));
+        }
+        if let Err(error) = self.publish() {
+            return Err(self.rollback(error));
+        }
+        if let Err(error) =
+            (self.checkpoint)(VendorInstallCheckpoint::PublishValidation, self.destination)
+        {
+            return Err(self.rollback(error));
+        }
+        match validate_owned_vendor_directory(self.destination) {
+            Ok(installed) if installed == *self.expected => {}
+            Ok(_) => {
+                let error =
+                    manifest_error(self.destination, None, "发布后的辖制目录与暂存清单不一致");
+                return Err(self.rollback(error));
+            }
+            Err(error) => return Err(self.rollback(error)),
+        }
+        if let Err(error) = self.sync_parent(VendorInstallCheckpoint::PublishSync) {
+            return Err(self.rollback(error));
+        }
+        if self.previous.is_some() {
+            if let Err(error) =
+                (self.checkpoint)(VendorInstallCheckpoint::BackupCleanup, self.backup)
+            {
+                return Err(self.rollback(error));
+            }
+            if let Err(error) = fs::remove_dir_all(self.backup) {
+                let error = manifest_error(
+                    self.backup,
+                    None,
+                    format!("不能清理旧辖制目录备份：{error}"),
+                );
+                return Err(self.rollback(error));
+            }
+        }
+        self.state = VendorInstallState::Committed;
+        Ok(())
+    }
+
+    fn backup_existing(&mut self) -> Result<(), ManifestError> {
+        (self.checkpoint)(VendorInstallCheckpoint::Backup, self.destination)?;
+        fs::rename(self.destination, self.backup).map_err(|error| {
+            manifest_error(
+                self.destination,
+                None,
+                format!("不能暂存旧辖制目录：{error}"),
+            )
+        })?;
+        self.state = VendorInstallState::BackupReady;
+        self.sync_parent(VendorInstallCheckpoint::BackupSync)
+    }
+
+    fn publish(&mut self) -> Result<(), ManifestError> {
+        (self.checkpoint)(VendorInstallCheckpoint::Publish, self.destination)?;
+        fs::rename(self.staging, self.destination).map_err(|error| {
+            manifest_error(
+                self.destination,
+                None,
+                format!("不能安装完整辖制目录：{error}"),
+            )
+        })?;
+        self.state = VendorInstallState::Published;
+        Ok(())
+    }
+
+    fn sync_parent(&mut self, point: VendorInstallCheckpoint) -> Result<(), ManifestError> {
+        (self.checkpoint)(point, self.parent)?;
+        sync_vendor_parent(self.parent)
+    }
+
+    fn rollback(&mut self, primary: ManifestError) -> ManifestError {
+        let mut failures = Vec::new();
+        let backup_valid = if let Some(previous) = self.previous {
+            if matches!(
+                self.state,
+                VendorInstallState::BackupReady | VendorInstallState::Published
+            ) {
+                match (self.checkpoint)(VendorInstallCheckpoint::RestoreValidation, self.backup)
+                    .and_then(|()| validate_owned_vendor_directory(self.backup))
+                {
+                    Ok(found) if found == *previous => true,
+                    Ok(_) => {
+                        failures.push("旧辖制目录备份与事务开始时的清单不一致".into());
+                        false
+                    }
+                    Err(error) => {
+                        failures.push(format!("不能验证旧辖制目录备份：{}", error.message));
+                        false
+                    }
+                }
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+
+        let mut restored = backup_valid;
+        if self.state == VendorInstallState::Published && restored {
+            match (self.checkpoint)(VendorInstallCheckpoint::RollbackPublished, self.destination)
+                .and_then(|()| {
+                    fs::rename(self.destination, self.staging).map_err(|error| {
+                        manifest_error(
+                            self.destination,
+                            None,
+                            format!("不能撤回新辖制目录：{error}"),
+                        )
+                    })
+                }) {
+                Ok(()) => self.state = VendorInstallState::BackupReady,
+                Err(error) => {
+                    failures.push(error.message);
+                    restored = false;
+                }
+            }
+        }
+        if self.previous.is_some() && self.state == VendorInstallState::BackupReady && restored {
+            match (self.checkpoint)(VendorInstallCheckpoint::Restore, self.destination).and_then(
+                |()| {
+                    fs::rename(self.backup, self.destination).map_err(|error| {
+                        manifest_error(
+                            self.destination,
+                            None,
+                            format!("不能恢复旧辖制目录：{error}"),
+                        )
+                    })
+                },
+            ) {
+                Ok(()) => self.state = VendorInstallState::Prepared,
+                Err(error) => {
+                    failures.push(error.message);
+                    restored = false;
+                }
+            }
+        }
+        if restored {
+            let validation = (self.checkpoint)(
+                VendorInstallCheckpoint::RollbackValidation,
+                self.destination,
+            )
+            .and_then(|()| match self.previous {
+                Some(previous) => {
+                    validate_owned_vendor_directory(self.destination).and_then(|found| {
+                        if found == *previous {
+                            Ok(())
+                        } else {
+                            Err(manifest_error(
+                                self.destination,
+                                None,
+                                "恢复后的辖制目录与原清单不一致",
+                            ))
+                        }
+                    })
+                }
+                None => match fs::symlink_metadata(self.destination) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Ok(_) => Err(manifest_error(
+                        self.destination,
+                        None,
+                        "回滚后仍存在原先不存在的辖制目录",
+                    )),
+                    Err(error) => Err(manifest_error(
+                        self.destination,
+                        None,
+                        format!("不能验证辖制目录回滚结果：{error}"),
+                    )),
+                },
+            });
+            if let Err(error) = validation {
+                failures.push(error.message);
+                restored = false;
+            }
+        }
+        if let Err(error) = self.sync_parent(VendorInstallCheckpoint::RollbackSync) {
+            failures.push(format!("不能同步辖制目录回滚：{}", error.message));
+            restored = false;
+        }
+        if restored && fs::symlink_metadata(self.staging).is_ok() {
+            match (self.checkpoint)(VendorInstallCheckpoint::RollbackCleanup, self.staging)
+                .and_then(|()| {
+                    fs::remove_dir_all(self.staging).map_err(|error| {
+                        manifest_error(
+                            self.staging,
+                            None,
+                            format!("不能清理已撤回的辖制暂存目录：{error}"),
+                        )
+                    })
+                }) {
+                Ok(()) => {}
+                Err(error) => failures.push(error.message),
+            }
+        }
+        if restored {
+            self.state = VendorInstallState::RolledBack;
+        }
+        let retained = [self.staging, self.backup]
+            .into_iter()
+            .filter(|path| fs::symlink_metadata(path).is_ok())
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        if !retained.is_empty() {
+            failures.push(format!("已保留辖制恢复现场：{}", retained.join("、")));
+        }
+        vendor_combined_error(self.destination, primary, &failures)
+    }
+}
+
+fn install_staged_vendor_directory(
+    staging: &Path,
+    destination: &Path,
+    backup: &Path,
+    expected: &VendorManifest,
+    previous: Option<&VendorManifest>,
+    checkpoint: &mut impl FnMut(VendorInstallCheckpoint, &Path) -> Result<(), ManifestError>,
+) -> Result<(), ManifestError> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    VendorInstallTransaction {
+        staging,
+        destination,
+        backup,
+        parent,
+        previous,
+        expected,
+        state: VendorInstallState::Prepared,
+        checkpoint,
+    }
+    .run()
+}
+
+fn vendor_combined_error(
+    path: &Path,
+    primary: ManifestError,
+    failures: &[String],
+) -> ManifestError {
+    if failures.is_empty() {
+        primary
+    } else {
+        manifest_error(
+            path,
+            None,
+            format!(
+                "{}；辖制事务回滚不完整：{}",
+                primary.message,
+                failures.join("；")
+            ),
+        )
+    }
 }
 
 fn find_vendored_package(
@@ -8271,19 +8857,33 @@ fn find_vendored_package(
     Ok(None)
 }
 
-fn copy_package_tree(source: &Path, destination: &Path) -> Result<(), ManifestError> {
-    let mut files = Vec::new();
-    collect_files(source, source, &mut files)?;
-    files.sort();
-    for relative in files {
-        let target = destination.join(&relative);
+fn write_package_tree_snapshot(
+    snapshot: &PackageTreeSnapshot,
+    destination: &Path,
+) -> Result<(), ManifestError> {
+    fs::create_dir(destination).map_err(|error| {
+        manifest_error(destination, None, format!("不能创建辖制包目录：{error}"))
+    })?;
+    for entry in &snapshot.files {
+        let target = destination.join(&entry.relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 manifest_error(parent, None, format!("不能创建辖制目录：{error}"))
             })?;
         }
-        fs::copy(source.join(&relative), &target)
-            .map_err(|error| manifest_error(&target, None, format!("不能复制辖制包：{error}")))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|error| {
+                manifest_error(&target, None, format!("不能创建辖制包文件：{error}"))
+            })?;
+        output.write_all(&entry.bytes).map_err(|error| {
+            manifest_error(&target, None, format!("不能写入辖制包文件：{error}"))
+        })?;
+        output.sync_all().map_err(|error| {
+            manifest_error(&target, None, format!("不能同步辖制包文件：{error}"))
+        })?;
     }
     Ok(())
 }
@@ -8739,6 +9339,90 @@ mod tests {
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    fn vendor_fixture_graph(root: &Path, marker: &str) -> ResolutionGraph {
+        let dependency_root = root.join(format!("dependency-{marker}"));
+        write(
+            &dependency_root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='fixture'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(
+            &dependency_root.join("主.yx"),
+            &format!("公 定 标记 为「{marker}」；\n"),
+        );
+        let checksum = tree_checksum(&dependency_root).unwrap();
+        let id = "fixture@1.0.0".to_owned();
+        let locked = LockedPackage {
+            id: id.clone(),
+            name: "fixture".into(),
+            version: "1.0.0".into(),
+            source: "registry:https://packages.example.invalid/v1".into(),
+            revision: None,
+            checksum,
+            entry: "主.yx".into(),
+            dependencies: BTreeMap::new(),
+            exports: BTreeMap::new(),
+            target: current_target(),
+            native: None,
+            minimum_yanxu: None,
+        };
+        ResolutionGraph {
+            root_dependencies: BTreeMap::from([("fixture".into(), id.clone())]),
+            root_dev_dependencies: BTreeMap::new(),
+            packages: BTreeMap::from([(
+                id,
+                ResolvedDependency {
+                    locked,
+                    entry: dependency_root.join("主.yx"),
+                    root: dependency_root,
+                },
+            )]),
+            target: current_target(),
+        }
+    }
+
+    fn vendor_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(base: &Path, directory: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                assert!(!metadata.file_type().is_symlink());
+                if metadata.is_dir() {
+                    visit(base, &path, files);
+                } else {
+                    assert!(metadata.is_file());
+                    files.insert(
+                        path.strip_prefix(base).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    fn vendor_transaction_artifacts(parent: &Path, destination_name: &str) -> Vec<PathBuf> {
+        let staging_prefix = format!(".{destination_name}.staging-");
+        let backup_prefix = format!(".{destination_name}.backup-");
+        let mut artifacts = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with(&staging_prefix) || name.starts_with(&backup_prefix)
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort();
+        artifacts
     }
 
     fn run_git_fixture(root: &Path, arguments: &[&str]) {
@@ -10379,6 +11063,254 @@ mod tests {
             fs::read_to_string(&dependencies["工具"].entry).unwrap(),
             "公 定 值 为 1；\n"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vendor_replaces_an_owned_directory_without_leaving_transaction_artifacts() {
+        let root = temp("vendor-replace");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("vendor");
+        let old_graph = vendor_fixture_graph(&root, "old");
+        let old = vendor_dependencies(&old_graph, &destination).unwrap();
+        let old_bytes = vendor_tree_bytes(&destination);
+        let new_graph = vendor_fixture_graph(&root, "new");
+
+        let installed = vendor_dependencies(&new_graph, &destination).unwrap();
+
+        assert_ne!(installed, old);
+        assert_eq!(
+            validate_owned_vendor_directory(&destination).unwrap(),
+            installed
+        );
+        assert_ne!(vendor_tree_bytes(&destination), old_bytes);
+        assert!(vendor_transaction_artifacts(&root, "vendor").is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vendor_refuses_to_replace_an_unowned_existing_directory() {
+        let root = temp("vendor-owned-target");
+        let destination = root.join("important-data");
+        let sentinel = destination.join("keep.txt");
+        write(&sentinel, "must survive\n");
+        let graph = ResolutionGraph {
+            root_dependencies: BTreeMap::new(),
+            root_dev_dependencies: BTreeMap::new(),
+            packages: BTreeMap::new(),
+            target: current_target(),
+        };
+
+        let error = vendor_dependencies(&graph, &destination).unwrap_err();
+
+        assert!(error.message.contains("拒绝覆盖"), "{error}");
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "must survive\n");
+        assert!(vendor_transaction_artifacts(&root, "important-data").is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vendor_precommit_failures_restore_the_previous_directory_byte_for_byte() {
+        for failure in [
+            VendorInstallCheckpoint::Backup,
+            VendorInstallCheckpoint::BackupSync,
+            VendorInstallCheckpoint::Publish,
+            VendorInstallCheckpoint::PublishValidation,
+            VendorInstallCheckpoint::PublishSync,
+            VendorInstallCheckpoint::BackupCleanup,
+        ] {
+            let root = temp(&format!("vendor-precommit-{failure:?}"));
+            fs::create_dir_all(&root).unwrap();
+            let destination = root.join("vendor");
+            let old_graph = vendor_fixture_graph(&root, "old");
+            let old = vendor_dependencies(&old_graph, &destination).unwrap();
+            let old_bytes = vendor_tree_bytes(&destination);
+            let new_graph = vendor_fixture_graph(&root, "new");
+
+            let error =
+                vendor_dependencies_with_checkpoint(&new_graph, &destination, |point, path| {
+                    if point == failure {
+                        Err(manifest_error(path, None, "模拟辖制提交前失败"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+
+            assert!(error.message.contains("模拟辖制提交前失败"), "{error}");
+            assert_eq!(vendor_tree_bytes(&destination), old_bytes);
+            assert_eq!(validate_owned_vendor_directory(&destination).unwrap(), old);
+            assert!(vendor_transaction_artifacts(&root, "vendor").is_empty());
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn vendor_restore_failure_reports_both_failures_and_preserves_recovery_trees() {
+        let root = temp("vendor-restore-failure");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("vendor");
+        let old_graph = vendor_fixture_graph(&root, "old");
+        let old = vendor_dependencies(&old_graph, &destination).unwrap();
+        let new_graph = vendor_fixture_graph(&root, "new");
+
+        let error =
+            vendor_dependencies_with_checkpoint(
+                &new_graph,
+                &destination,
+                |point, path| match point {
+                    VendorInstallCheckpoint::PublishSync => {
+                        Err(manifest_error(path, None, "模拟辖制发布同步失败"))
+                    }
+                    VendorInstallCheckpoint::Restore => {
+                        Err(manifest_error(path, None, "模拟旧辖制目录恢复失败"))
+                    }
+                    _ => Ok(()),
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.message.contains("模拟辖制发布同步失败"), "{error}");
+        assert!(error.message.contains("模拟旧辖制目录恢复失败"), "{error}");
+        assert!(!destination.exists());
+        let artifacts = vendor_transaction_artifacts(&root, "vendor");
+        assert_eq!(artifacts.len(), 2);
+        let backup = artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".backup-")
+            })
+            .unwrap();
+        let staging = artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".staging-")
+            })
+            .unwrap();
+        assert_eq!(validate_owned_vendor_directory(backup).unwrap(), old);
+        assert_ne!(validate_owned_vendor_directory(staging).unwrap(), old);
+        for artifact in artifacts {
+            assert!(
+                error.message.contains(&artifact.display().to_string()),
+                "{error}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vendor_rollback_sync_and_cleanup_failures_preserve_recovery_state() {
+        for secondary in [
+            VendorInstallCheckpoint::RollbackSync,
+            VendorInstallCheckpoint::RollbackCleanup,
+        ] {
+            let root = temp(&format!("vendor-rollback-{secondary:?}"));
+            fs::create_dir_all(&root).unwrap();
+            let destination = root.join("vendor");
+            let old_graph = vendor_fixture_graph(&root, "old");
+            let old = vendor_dependencies(&old_graph, &destination).unwrap();
+            let old_bytes = vendor_tree_bytes(&destination);
+            let new_graph = vendor_fixture_graph(&root, "new");
+
+            let error =
+                vendor_dependencies_with_checkpoint(&new_graph, &destination, |point, path| {
+                    match point {
+                        VendorInstallCheckpoint::PublishSync => {
+                            Err(manifest_error(path, None, "模拟辖制发布同步失败"))
+                        }
+                        point if point == secondary => {
+                            Err(manifest_error(path, None, "模拟辖制回滚失败"))
+                        }
+                        _ => Ok(()),
+                    }
+                })
+                .unwrap_err();
+
+            assert!(error.message.contains("模拟辖制回滚失败"), "{error}");
+            assert_eq!(vendor_tree_bytes(&destination), old_bytes);
+            assert_eq!(validate_owned_vendor_directory(&destination).unwrap(), old);
+            let artifacts = vendor_transaction_artifacts(&root, "vendor");
+            assert_eq!(artifacts.len(), 1);
+            assert!(
+                artifacts[0]
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".staging-")
+            );
+            assert!(error.message.contains(&artifacts[0].display().to_string()));
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn vendor_partial_backup_cleanup_preserves_the_valid_new_directory_and_evidence() {
+        let root = temp("vendor-partial-backup-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("vendor");
+        let old_graph = vendor_fixture_graph(&root, "old");
+        let old = vendor_dependencies(&old_graph, &destination).unwrap();
+        let new_graph = vendor_fixture_graph(&root, "new");
+
+        let error = vendor_dependencies_with_checkpoint(&new_graph, &destination, |point, path| {
+            if point == VendorInstallCheckpoint::BackupCleanup {
+                fs::remove_file(path.join("言序-vendor.json")).unwrap();
+                Err(manifest_error(path, None, "模拟旧辖制备份部分清理失败"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.message.contains("模拟旧辖制备份部分清理失败"));
+        let installed = validate_owned_vendor_directory(&destination).unwrap();
+        assert_ne!(installed, old);
+        assert_eq!(
+            installed.packages["fixture@1.0.0"].checksum,
+            new_graph.packages["fixture@1.0.0"].locked.checksum
+        );
+        let artifacts = vendor_transaction_artifacts(&root, "vendor");
+        assert_eq!(artifacts.len(), 1);
+        assert!(
+            artifacts[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".backup-")
+        );
+        assert!(!artifacts[0].join("言序-vendor.json").exists());
+        assert!(error.message.contains(&artifacts[0].display().to_string()));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn vendor_first_install_sync_failure_leaves_no_visible_directory() {
+        let root = temp("vendor-first-sync-failure");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("vendor");
+        let graph = vendor_fixture_graph(&root, "new");
+
+        let error = vendor_dependencies_with_checkpoint(&graph, &destination, |point, path| {
+            if point == VendorInstallCheckpoint::PublishSync {
+                Err(manifest_error(path, None, "模拟首次辖制发布同步失败"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(
+            error.message.contains("模拟首次辖制发布同步失败"),
+            "{error}"
+        );
+        assert!(!destination.exists());
+        assert!(vendor_transaction_artifacts(&root, "vendor").is_empty());
         fs::remove_dir_all(root).ok();
     }
 
