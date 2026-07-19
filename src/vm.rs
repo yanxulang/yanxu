@@ -3931,7 +3931,7 @@ impl Vm {
             return Err(host_event_error(span, runtime_error));
         }
         match native_result.map_err(|runtime_error| native_v2_error(span, runtime_error))? {
-            native_abi_v2::NativeV2CallResult::Value(value) => self.host_to_vm_value(value, span),
+            native_abi_v2::NativeV2CallResult::Value(value) => Self::host_to_vm_value(value, span),
             native_abi_v2::NativeV2CallResult::Resource(resource) => {
                 let type_name = resource.type_name().to_owned();
                 let parent = resource.parent();
@@ -4012,11 +4012,7 @@ impl Vm {
         })
     }
 
-    fn host_to_vm_value(
-        &self,
-        value: host_events::HostValue,
-        span: &Span,
-    ) -> Result<VmValue, VmError> {
+    fn host_to_vm_value(value: host_events::HostValue, span: &Span) -> Result<VmValue, VmError> {
         Ok(match value {
             host_events::HostValue::Nil => VmValue::Nil,
             host_events::HostValue::Bool(value) => VmValue::Bool(value),
@@ -4027,7 +4023,7 @@ impl Vm {
             host_events::HostValue::Array(values) => VmValue::List(Rc::new(RefCell::new(
                 values
                     .into_iter()
-                    .map(|value| self.host_to_vm_value(value, span))
+                    .map(|value| Self::host_to_vm_value(value, span))
                     .collect::<Result<Vec<_>, _>>()?,
             ))),
             host_events::HostValue::Map(entries) => VmValue::Map(Rc::new(RefCell::new(VmMap {
@@ -4035,8 +4031,8 @@ impl Vm {
                     .into_iter()
                     .map(|(key, value)| {
                         Ok((
-                            self.host_to_vm_value(key, span)?,
-                            self.host_to_vm_value(value, span)?,
+                            Self::host_to_vm_value(key, span)?,
+                            Self::host_to_vm_value(value, span)?,
                         ))
                     })
                     .collect::<Result<Vec<_>, VmError>>()?,
@@ -4084,7 +4080,7 @@ impl Vm {
                     )?;
                     let arguments = arguments
                         .into_iter()
-                        .map(|argument| self.host_to_vm_value(argument, &Span::synthetic()))
+                        .map(|argument| Self::host_to_vm_value(argument, &Span::synthetic()))
                         .collect::<Result<Vec<_>, _>>()?;
                     let directory = self.host_state.current_directory.borrow().clone();
                     // 常驻程序（GUI、服务）的每个宿主回调独立计量步数预算，
