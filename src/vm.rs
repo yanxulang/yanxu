@@ -3895,7 +3895,7 @@ impl Vm {
         let artifact = dependency.locked.native.as_ref().ok_or_else(|| {
             error(
                 span,
-                format!("直接依赖“{package_name}”没有当前目标的锁定原生制品"),
+                format!("所选锁定包“{package_name}”没有当前目标的原生制品"),
             )
         })?;
         let artifact_path = dependency.root.join(&artifact.path);
