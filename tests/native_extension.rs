@@ -90,6 +90,137 @@ fn loads_verified_native_functions_constants_and_resources() {
 }
 
 #[test]
+fn rejects_non_v1_and_size_mismatched_artifacts_before_loading() {
+    let library = example_library();
+    let permissions = PermissionSet::sandboxed().allow_native_extensions();
+
+    let mut wrong_abi = artifact(library);
+    wrong_abi.abi = 2;
+    let missing = library.with_extension("missing-native-extension");
+    let abi_error =
+        match NativeExtension::load_verified(&missing, &wrong_abi, &permissions, "example") {
+            Ok(_) => panic!("non-v1 artifact should be rejected"),
+            Err(error) => error,
+        };
+    assert_eq!(abi_error.code, "NATIVE_ABI");
+
+    let mut wrong_size = artifact(library);
+    wrong_size.size += 1;
+    let size_error =
+        match NativeExtension::load_verified(library, &wrong_size, &permissions, "example") {
+            Ok(_) => panic!("size-mismatched artifact should be rejected"),
+            Err(error) => error,
+        };
+    assert_eq!(size_error.code, "NATIVE_LIMIT");
+}
+
+#[test]
+fn rejects_directory_native_artifacts() {
+    let directory = std::env::temp_dir();
+    let artifact = NativeArtifact {
+        abi: 1,
+        target: yanxu::package::current_target(),
+        path: directory.to_string_lossy().into_owned(),
+        checksum: "0".repeat(64),
+        size: std::fs::metadata(&directory).unwrap().len(),
+    };
+    let error = match NativeExtension::load_verified(
+        &directory,
+        &artifact,
+        &PermissionSet::sandboxed().allow_native_extensions(),
+        "example",
+    ) {
+        Ok(_) => panic!("directory artifact should be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "NATIVE_IO");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn rejects_symlinked_or_reparsed_native_artifacts_without_following_them() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
+
+    let library = example_library();
+    let artifact = artifact(library);
+    let link = std::env::temp_dir().join(format!(
+        "yanxu-native-link-{}-{}{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        std::env::consts::DLL_SUFFIX
+    ));
+    symlink(library, &link).unwrap();
+    let error = match NativeExtension::load_verified(
+        &link,
+        &artifact,
+        &PermissionSet::sandboxed().allow_native_extensions(),
+        "example",
+    ) {
+        Ok(_) => panic!("symlinked artifact should be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "NATIVE_IO");
+    std::fs::remove_file(link).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_fifo_native_artifacts_without_blocking() {
+    let fifo = std::env::temp_dir().join(format!(
+        "yanxu-native-fifo-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let artifact = NativeArtifact {
+        abi: 1,
+        target: yanxu::package::current_target(),
+        path: fifo.to_string_lossy().into_owned(),
+        checksum: "0".repeat(64),
+        size: 0,
+    };
+    let error = match NativeExtension::load_verified(
+        &fifo,
+        &artifact,
+        &PermissionSet::sandboxed().allow_native_extensions(),
+        "example",
+    ) {
+        Ok(_) => panic!("FIFO artifact should be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "NATIVE_IO");
+    std::fs::remove_file(fifo).unwrap();
+}
+
+#[test]
+fn loads_verified_native_artifacts_from_relative_paths() {
+    let library = example_library();
+    let current = std::env::current_dir().unwrap();
+    let relative = library.strip_prefix(&current).unwrap();
+    let extension = NativeExtension::load_verified(
+        relative,
+        &artifact(library),
+        &PermissionSet::sandboxed().allow_native_extensions(),
+        "example",
+    )
+    .unwrap();
+    assert_eq!(extension.name(), "example");
+}
+
+#[test]
 fn replacing_the_original_after_verification_cannot_change_loaded_code() {
     let source = example_library();
     let path = std::env::temp_dir().join(format!(
