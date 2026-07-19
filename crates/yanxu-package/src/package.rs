@@ -15,8 +15,8 @@ use crate::path_policy::{
 #[cfg(target_os = "wasi")]
 use crate::path_policy::{WasiPackageDirectory, WasiPackageDirectoryEntry, WasiPackageEntry};
 use archive::{
-    ARCHIVE_LIMITS, ArchiveLimits, extract_archive_bytes_safely, find_manifest_root,
-    validate_archive_relative_path, validate_existing_package_archive,
+    ARCHIVE_LIMITS, ArchiveLimits, extract_archive_bytes_safely, extract_tar_bytes_with_limits,
+    find_manifest_root, validate_archive_relative_path, validate_existing_package_archive,
 };
 #[cfg(test)]
 use archive::{extract_archive_safely, extract_archive_with_limits};
@@ -62,6 +62,11 @@ const REGISTRY_VULNERABILITY_MAX_COUNT: usize = 1_024;
 const REGISTRY_VULNERABILITY_ID_MAX_BYTES: usize = 256;
 const REGISTRY_VULNERABILITY_SUMMARY_MAX_BYTES: usize = 8_192;
 const RESOLUTION_GENERATION_LAYOUT: &str = "tree-v1";
+const GIT_CACHE_LAYOUT: &str = "v2";
+const GIT_GENERATION_LAYOUT: &str = "tree-v1";
+const GIT_CONFIG_MAX_BYTES: u64 = 64 * 1024;
+const GIT_STORE_MAX_ENTRIES: usize = 1_000_000;
+const GIT_STORE_MAX_DEPTH: usize = 256;
 const MANIFEST_TOML_SYNTAX_ERROR: &str = "TOML 格式无效；请检查对应行的语法";
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1606,11 +1611,7 @@ fn bind_resolution_manifest(
             format!("规范包清单不是 UTF-8：{error}"),
         )
     })?;
-    let current = parse(
-        text,
-        manifest.path.clone(),
-        manifest.root.clone(),
-    )?;
+    let current = parse(text, manifest.path.clone(), manifest.root.clone())?;
     if current != *manifest {
         return Err(manifest_error(
             &manifest.path,
@@ -3059,87 +3060,859 @@ fn resolve_git(
     }
     validate_git_revision_security(revision)
         .map_err(|message| manifest_error("Git 来源", None, message))?;
-    let cache = cache_root().join("git").join(short_hash(url));
-    if !cache.join(".git").is_dir() {
-        if offline {
+    let exact_requested = exact_git_commit(revision);
+    if offline && !exact_requested {
+        return Err(manifest_error(
+            "Git 来源",
+            None,
+            "离线模式只接受锁文件中的 40 位精确 Git 提交；请先联网完成依赖锁定",
+        ));
+    }
+
+    let cache = git_cache_layout_root()?;
+    let identity = git_cache_identity(url);
+    let _lock = acquire_git_cache_lock(&cache, &identity)?;
+    let url_root = create_checked_cache_directory(&cache, &identity, "Git 来源缓存")?;
+    let (existing_store, invalid_store) = find_git_object_store(&url_root)?;
+    let (store, exact) = match existing_store {
+        Some(store) => {
+            let exact = if exact_requested && git_commit_exists(&store, revision) {
+                git_exact_revision(&store, revision)?
+            } else if offline {
+                let url = safe_git_source_value_for_display(url);
+                let revision = safe_git_revision_for_display(revision);
+                return Err(manifest_error(
+                    &url_root,
+                    None,
+                    format!("离线模式下未缓存 Git 依赖 {url}@{revision}"),
+                ));
+            } else {
+                fetch_git_revision(&store, url, revision)?
+            };
+            validate_git_object_store(&store)?;
+            (store, exact)
+        }
+        None if offline => {
+            if let Some(error) = invalid_store {
+                return Err(error);
+            }
             let url = safe_git_source_value_for_display(url);
             let revision = safe_git_revision_for_display(revision);
             return Err(manifest_error(
-                &cache,
+                &url_root,
                 None,
                 format!("离线模式下未缓存 Git 依赖 {url}@{revision}"),
             ));
         }
-        if cache.exists() {
-            fs::remove_dir_all(&cache).map_err(|error| {
-                manifest_error(&cache, None, format!("不能清理损坏缓存：{error}"))
-            })?;
-        }
-        fs::create_dir_all(cache.parent().expect("git cache parent"))
-            .map_err(|error| manifest_error(&cache, None, format!("不能创建 Git 缓存：{error}")))?;
-        run_command(
-            Command::new("git")
-                .arg("clone")
-                .arg("--quiet")
-                .arg("--")
-                .arg(url)
-                .arg(&cache),
-            &cache,
-            "克隆 Git 依赖",
-        )?;
-    }
-    let exact_revision =
-        revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit());
-    let exact_cached = exact_revision
-        && Command::new("git")
-            .arg("-C")
-            .arg(&cache)
-            .arg("cat-file")
-            .arg("-e")
-            .arg(format!("{revision}^{{commit}}"))
-            .status()
-            .is_ok_and(|status| status.success());
-    let checkout_revision = if !offline && (!exact_revision || !exact_cached) {
-        run_command(
-            Command::new("git")
-                .arg("-C")
-                .arg(&cache)
-                .arg("fetch")
-                .arg("--quiet")
-                .arg("--force")
-                .arg("origin")
-                .arg("--")
-                .arg(revision),
-            &cache,
-            "更新 Git 依赖",
-        )?;
-        "FETCH_HEAD"
-    } else {
-        revision
+        None => create_git_object_store(&url_root, url, revision)?,
     };
+    if !exact_git_commit(&exact) {
+        return Err(manifest_error(
+            &store,
+            None,
+            "Git 没有返回 40 位精确提交，拒绝建立依赖 generation",
+        ));
+    }
+    let snapshot = capture_git_commit_snapshot(&store, &url_root, &exact)?;
+    let generation = publish_git_generation(&url_root, &exact, &snapshot)?;
+    Ok((generation, exact))
+}
+
+fn git_cache_identity(url: &str) -> String {
+    format!("{:x}", Sha256::digest(url.as_bytes()))
+}
+
+fn exact_git_commit(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn create_checked_cache_directory(
+    parent: &Path,
+    component: &str,
+    kind: &str,
+) -> Result<PathBuf, ManifestError> {
+    let relative = Path::new(component);
+    if relative.components().count() != 1
+        || !matches!(relative.components().next(), Some(Component::Normal(_)))
+    {
+        return Err(manifest_error(
+            parent,
+            None,
+            format!("{kind}组件不是单一普通路径名"),
+        ));
+    }
+    let path = parent.join(component);
+    let created = match fs::create_dir(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            return Err(manifest_error(
+                &path,
+                None,
+                format!("不能创建{kind}：{error}"),
+            ));
+        }
+    };
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| manifest_error(&path, None, format!("不能检查{kind}：{error}")))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || standard_metadata_is_reparse(&metadata)
+    {
+        return Err(manifest_error(
+            &path,
+            None,
+            format!("{kind}不得为链接、重解析点或特殊文件"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions)
+            .map_err(|error| manifest_error(&path, None, format!("不能收紧{kind}权限：{error}")))?;
+    }
+    if created {
+        sync_registry_directory_parent(&path)?;
+    }
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|error| manifest_error(parent, None, format!("不能定位{kind}父目录：{error}")))?;
+    let canonical = fs::canonicalize(&path)
+        .map_err(|error| manifest_error(&path, None, format!("不能定位{kind}：{error}")))?;
+    if !canonical.starts_with(canonical_parent) {
+        return Err(manifest_error(&path, None, format!("{kind}越出缓存边界")));
+    }
+    Ok(canonical)
+}
+
+fn git_cache_layout_root() -> Result<PathBuf, ManifestError> {
+    let root = cache_root();
+    fs::create_dir_all(&root)
+        .map_err(|error| manifest_error(&root, None, format!("不能创建 Git 缓存根：{error}")))?;
+    let metadata = fs::symlink_metadata(&root)
+        .map_err(|error| manifest_error(&root, None, format!("不能检查 Git 缓存根：{error}")))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || standard_metadata_is_reparse(&metadata)
+    {
+        return Err(manifest_error(
+            &root,
+            None,
+            "Git 缓存根不得为链接、重解析点或特殊文件",
+        ));
+    }
+    let root = fs::canonicalize(&root)
+        .map_err(|error| manifest_error(&root, None, format!("不能定位 Git 缓存根：{error}")))?;
+    let git = create_checked_cache_directory(&root, "git", "Git 缓存目录")?;
+    create_checked_cache_directory(&git, GIT_CACHE_LAYOUT, "Git 缓存布局目录")
+}
+
+fn reject_invalid_existing_cache_directory(path: &Path, kind: &str) -> Result<(), ManifestError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || standard_metadata_is_reparse(&metadata) =>
+        {
+            Err(manifest_error(
+                path,
+                None,
+                format!("{kind}不得为链接、重解析点或特殊文件"),
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(manifest_error(
+            path,
+            None,
+            format!("不能检查{kind}：{error}"),
+        )),
+    }
+}
+
+fn acquire_git_cache_lock(
+    cache: &Path,
+    identity: &str,
+) -> Result<crate::storage::ProjectLock, ManifestError> {
+    let locks = cache.join(".locks");
+    let lock_root = locks.join(identity);
+    reject_invalid_existing_cache_directory(&locks, "Git 缓存锁目录")?;
+    reject_invalid_existing_cache_directory(&lock_root, "Git 缓存锁组件")?;
+    reject_invalid_existing_cache_directory(&lock_root.join(".yanxu"), "Git 缓存锁状态")?;
+    let lock = crate::storage::ProjectLock::acquire_under(cache, &[".locks", identity]).map_err(
+        |error| {
+            manifest_error(
+                &lock_root,
+                None,
+                format!("不能取得 Git 来源缓存锁：{error}"),
+            )
+        },
+    )?;
+    for directory in [&locks, &lock_root, &lock_root.join(".yanxu")] {
+        let metadata = fs::symlink_metadata(directory).map_err(|error| {
+            manifest_error(directory, None, format!("不能复验 Git 缓存锁组件：{error}"))
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || standard_metadata_is_reparse(&metadata)
+        {
+            return Err(manifest_error(
+                directory,
+                None,
+                "Git 缓存锁组件不得为链接、重解析点或特殊文件",
+            ));
+        }
+    }
+    let lock_file = lock_root.join(".yanxu/package.lock");
+    let metadata = fs::symlink_metadata(&lock_file).map_err(|error| {
+        manifest_error(
+            &lock_file,
+            None,
+            format!("不能复验 Git 缓存锁文件：{error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || standard_metadata_is_reparse(&metadata)
+    {
+        return Err(manifest_error(
+            &lock_file,
+            None,
+            "Git 缓存锁文件不得为链接、重解析点或特殊文件",
+        ));
+    }
+    let canonical = fs::canonicalize(&lock_root).map_err(|error| {
+        manifest_error(&lock_root, None, format!("不能定位 Git 缓存锁：{error}"))
+    })?;
+    if !canonical.starts_with(cache) {
+        return Err(manifest_error(&lock_root, None, "Git 缓存锁越出缓存边界"));
+    }
+    Ok(lock)
+}
+
+fn hardened_git_command() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ALLOW_PROTOCOL", "file:https:ssh:git+ssh")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("LC_ALL", "C")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE");
+    command
+}
+
+fn git_store_command(store: &Path) -> Command {
+    let mut command = hardened_git_command();
+    command
+        .arg("-c")
+        .arg("core.attributesFile=")
+        .arg("--no-optional-locks")
+        .arg("--git-dir")
+        .arg(store);
+    command
+}
+
+fn git_command_output(
+    command: &mut Command,
+    path: &Path,
+    action: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ManifestError> {
+    let output = command
+        .output()
+        .map_err(|_| manifest_error(path, None, format!("{action}失败：不能启动 Git")))?;
+    if !output.status.success() {
+        return Err(if let Some(code) = output.status.code() {
+            manifest_error(path, None, format!("{action}失败（退出码 {code}）"))
+        } else {
+            manifest_error(path, None, format!("{action}失败（进程异常终止）"))
+        });
+    }
+    if output.stdout.len() > max_bytes {
+        return Err(manifest_error(
+            path,
+            None,
+            format!("{action}输出超过 {max_bytes} 字节上限"),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn git_exact_revision(store: &Path, revision: &str) -> Result<String, ManifestError> {
+    let output = git_command_output(
+        git_store_command(store)
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg(format!("{revision}^{{commit}}")),
+        store,
+        "读取 Git 精确提交",
+        128,
+    )?;
+    let exact = std::str::from_utf8(&output)
+        .map_err(|_| manifest_error(store, None, "Git 精确提交输出不是 UTF-8"))?
+        .trim()
+        .to_ascii_lowercase();
+    if !exact_git_commit(&exact) {
+        return Err(manifest_error(
+            store,
+            None,
+            "Git 精确提交不是 40 位十六进制",
+        ));
+    }
+    Ok(exact)
+}
+
+fn git_commit_exists(store: &Path, revision: &str) -> bool {
+    git_store_command(store)
+        .arg("cat-file")
+        .arg("-e")
+        .arg(format!("{revision}^{{commit}}"))
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn fetch_git_revision(store: &Path, url: &str, revision: &str) -> Result<String, ManifestError> {
     run_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(&cache)
-            .arg("checkout")
+        git_store_command(store)
+            .arg("fetch")
             .arg("--quiet")
             .arg("--force")
-            .arg("--detach")
-            .arg(checkout_revision),
-        &cache,
-        "检出 Git 修订",
+            .arg("--no-tags")
+            .arg("--")
+            .arg(url)
+            .arg(revision),
+        store,
+        "获取 Git 修订",
     )?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&cache)
-        .arg("rev-parse")
-        .arg("HEAD")
-        .output()
-        .map_err(|error| manifest_error(&cache, None, format!("不能读取 Git 修订：{error}")))?;
-    if !output.status.success() {
-        return Err(manifest_error(&cache, None, "不能读取 Git 精确修订"));
+    git_exact_revision(store, "FETCH_HEAD")
+}
+
+fn validate_git_store_config(store: &Path) -> Result<(), ManifestError> {
+    let path = store.join("config");
+    let file = open_regular_file_for_snapshot(&path).map_err(|error| {
+        manifest_error(&path, None, format!("不能打开 Git 对象库配置：{error}"))
+    })?;
+    let bytes =
+        read_opened_regular_file_snapshot(file, &path, GIT_CONFIG_MAX_BYTES, "Git 对象库配置")?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| manifest_error(&path, None, "Git 对象库配置不是 UTF-8"))?;
+    let mut section = None;
+    let mut repository_format = false;
+    let mut bare = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let name = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            if name != "core" {
+                return Err(manifest_error(
+                    &path,
+                    None,
+                    "Git 对象库配置含非 core 节，拒绝可能改变命令行为的本地配置",
+                ));
+            }
+            section = Some(name);
+            continue;
+        }
+        if section.as_deref() != Some("core") || line.ends_with('\\') {
+            return Err(manifest_error(&path, None, "Git 对象库配置结构无效"));
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| manifest_error(&path, None, "Git 对象库配置项缺少等号"))?;
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        match key.as_str() {
+            "repositoryformatversion" if value == "0" => repository_format = true,
+            "bare" if value == "true" => bare = true,
+            "filemode" | "ignorecase" | "precomposeunicode" | "logallrefupdates" | "symlinks"
+                if matches!(value.as_str(), "true" | "false") => {}
+            _ => {
+                return Err(manifest_error(
+                    &path,
+                    None,
+                    format!("Git 对象库配置项 core.{key} 不在安全允许列表中"),
+                ));
+            }
+        }
     }
-    Ok((cache, String::from_utf8_lossy(&output.stdout).trim().into()))
+    if !repository_format || !bare {
+        return Err(manifest_error(
+            &path,
+            None,
+            "Git 对象库必须明确使用格式 0 且 bare=true",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_git_store_tree(store: &Path) -> Result<(), ManifestError> {
+    let metadata = fs::symlink_metadata(store).map_err(|error| {
+        manifest_error(store, None, format!("不能检查 Git bare 对象库：{error}"))
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || standard_metadata_is_reparse(&metadata)
+    {
+        return Err(manifest_error(
+            store,
+            None,
+            "Git bare 对象库不得为链接、重解析点或特殊文件",
+        ));
+    }
+    let mut pending = vec![(store.to_path_buf(), 0_usize)];
+    let mut entries = 0_usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > GIT_STORE_MAX_DEPTH {
+            return Err(manifest_error(
+                &directory,
+                None,
+                format!("Git 对象库目录深度超过 {GIT_STORE_MAX_DEPTH}"),
+            ));
+        }
+        for entry in fs::read_dir(&directory).map_err(|error| {
+            manifest_error(&directory, None, format!("不能遍历 Git 对象库：{error}"))
+        })? {
+            let entry = entry.map_err(|error| {
+                manifest_error(
+                    &directory,
+                    None,
+                    format!("不能读取 Git 对象库目录项：{error}"),
+                )
+            })?;
+            entries = entries.saturating_add(1);
+            if entries > GIT_STORE_MAX_ENTRIES {
+                return Err(manifest_error(
+                    store,
+                    None,
+                    format!("Git 对象库条目超过 {GIT_STORE_MAX_ENTRIES}"),
+                ));
+            }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(store)
+                .expect("Git object store walk remains inside root");
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                manifest_error(&path, None, format!("不能检查 Git 对象库目录项：{error}"))
+            })?;
+            if metadata.file_type().is_symlink() || standard_metadata_is_reparse(&metadata) {
+                return Err(manifest_error(
+                    &path,
+                    None,
+                    "Git 对象库不得包含链接或重解析点",
+                ));
+            }
+            if matches!(
+                relative,
+                path if path == Path::new("objects/info/alternates")
+                    || path == Path::new("objects/info/http-alternates")
+                    || path == Path::new("info/attributes")
+                    || path == Path::new("packed-refs")
+            ) || relative.starts_with("hooks") && metadata.is_file()
+                || relative.starts_with("refs") && metadata.is_file()
+            {
+                return Err(manifest_error(
+                    &path,
+                    None,
+                    "Git 对象库不得包含外部对象替代、仓库级属性、持久引用或可执行 hook",
+                ));
+            }
+            if metadata.is_dir() {
+                pending.push((path, depth.saturating_add(1)));
+            } else if !metadata.is_file() {
+                return Err(manifest_error(
+                    &path,
+                    None,
+                    "Git 对象库只能包含普通目录和文件",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_git_object_store(store: &Path) -> Result<(), ManifestError> {
+    validate_git_store_tree(store)?;
+    validate_git_store_config(store)?;
+    let head = store.join("HEAD");
+    let file = open_regular_file_for_snapshot(&head).map_err(|error| {
+        manifest_error(&head, None, format!("不能打开 Git 对象库 HEAD：{error}"))
+    })?;
+    let head_bytes = read_opened_regular_file_snapshot(file, &head, 4_096, "Git 对象库 HEAD")?;
+    let head_text = std::str::from_utf8(&head_bytes)
+        .map_err(|_| manifest_error(&head, None, "Git 对象库 HEAD 不是 UTF-8"))?
+        .trim();
+    if !head_text.starts_with("ref: refs/heads/") && !exact_git_commit(head_text) {
+        return Err(manifest_error(&head, None, "Git 对象库 HEAD 引用无效"));
+    }
+    let bare = git_command_output(
+        git_store_command(store)
+            .arg("rev-parse")
+            .arg("--is-bare-repository"),
+        store,
+        "验证 Git bare 对象库",
+        32,
+    )?;
+    if bare != b"true\n" && bare != b"true\r\n" {
+        return Err(manifest_error(store, None, "Git 缓存不是 bare 对象库"));
+    }
+    let format = git_command_output(
+        git_store_command(store)
+            .arg("rev-parse")
+            .arg("--show-object-format"),
+        store,
+        "验证 Git 对象格式",
+        32,
+    )?;
+    if format != b"sha1\n" && format != b"sha1\r\n" {
+        return Err(manifest_error(
+            store,
+            None,
+            "Git 依赖锁当前只支持产生 40 位提交的 SHA-1 对象格式",
+        ));
+    }
+    Ok(())
+}
+
+fn find_git_object_store(
+    url_root: &Path,
+) -> Result<(Option<PathBuf>, Option<ManifestError>), ManifestError> {
+    let mut candidates = fs::read_dir(url_root)
+        .map_err(|error| {
+            manifest_error(url_root, None, format!("不能枚举 Git bare 对象库：{error}"))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            manifest_error(
+                url_root,
+                None,
+                format!("不能读取 Git bare 对象库目录项：{error}"),
+            )
+        })?;
+    candidates.retain(|candidate| {
+        let name = candidate.file_name();
+        let name = name.to_string_lossy();
+        name == "objects.git" || name.starts_with("objects-repair-") && name.ends_with(".git")
+    });
+    candidates.sort_by_key(|candidate| {
+        let name = candidate.file_name();
+        let primary = name == "objects.git";
+        (!primary, name)
+    });
+    let mut invalid = None;
+    for candidate in candidates {
+        let path = candidate.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            manifest_error(
+                &path,
+                None,
+                format!("不能检查 Git bare 对象库候选：{error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || standard_metadata_is_reparse(&metadata)
+        {
+            return Err(manifest_error(
+                &path,
+                None,
+                "Git bare 对象库候选不得为链接、重解析点或特殊文件",
+            ));
+        }
+        match validate_git_object_store(&path) {
+            Ok(()) => {
+                let canonical = fs::canonicalize(&path).map_err(|error| {
+                    manifest_error(&path, None, format!("不能定位 Git bare 对象库：{error}"))
+                })?;
+                if !canonical.starts_with(url_root) {
+                    return Err(manifest_error(
+                        &path,
+                        None,
+                        "Git bare 对象库越出来源缓存边界",
+                    ));
+                }
+                return Ok((Some(canonical), invalid));
+            }
+            Err(error) => {
+                invalid.get_or_insert(error);
+            }
+        }
+    }
+    Ok((None, invalid))
+}
+
+fn git_object_store_destination(url_root: &Path) -> Result<PathBuf, ManifestError> {
+    let primary = url_root.join("objects.git");
+    match fs::symlink_metadata(&primary) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(primary),
+        Ok(_) => {}
+        Err(error) => {
+            return Err(manifest_error(
+                &primary,
+                None,
+                format!("不能检查 Git bare 对象库发布位置：{error}"),
+            ));
+        }
+    }
+    for _ in 0..1_024 {
+        let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let repair = url_root.join(format!(
+            "objects-repair-{}-{sequence}.git",
+            std::process::id()
+        ));
+        match fs::symlink_metadata(&repair) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(repair),
+            Ok(_) => continue,
+            Err(error) => {
+                return Err(manifest_error(
+                    &repair,
+                    None,
+                    format!("不能检查 Git bare 对象库修复位置：{error}"),
+                ));
+            }
+        }
+    }
+    Err(manifest_error(
+        url_root,
+        None,
+        "不能分配唯一 Git bare 对象库发布位置",
+    ))
+}
+
+fn create_git_object_store(
+    url_root: &Path,
+    url: &str,
+    revision: &str,
+) -> Result<(PathBuf, String), ManifestError> {
+    let temporary = RegistryTemporaryDirectory::create_within(url_root, url_root, "git-objects")?;
+    run_command(
+        hardened_git_command()
+            .arg("init")
+            .arg("--bare")
+            .arg("--quiet")
+            .arg("--template=")
+            .arg(temporary.path()),
+        temporary.path(),
+        "初始化 Git bare 对象库",
+    )?;
+    let exact = fetch_git_revision(temporary.path(), url, revision)?;
+    validate_git_object_store(temporary.path())?;
+    let destination = git_object_store_destination(url_root)?;
+    temporary.publish(&destination)?;
+    sync_registry_directory_parent(&destination)?;
+    let canonical = fs::canonicalize(&destination).map_err(|error| {
+        manifest_error(
+            &destination,
+            None,
+            format!("不能定位已发布 Git bare 对象库：{error}"),
+        )
+    })?;
+    validate_git_object_store(&canonical)?;
+    Ok((canonical, exact))
+}
+
+fn capture_git_commit_snapshot(
+    store: &Path,
+    url_root: &Path,
+    exact: &str,
+) -> Result<PackageTreeSnapshot, ManifestError> {
+    let temporary =
+        RegistryTemporaryDirectory::create_within(url_root, url_root, "git-materialize")?;
+    let archive_path = temporary.path().join("tree.tar");
+    run_command(
+        git_store_command(store)
+            .arg("archive")
+            .arg("--format=tar")
+            .arg("--output")
+            .arg(&archive_path)
+            .arg(exact),
+        store,
+        "导出精确 Git 提交",
+    )?;
+    let archive = open_regular_file_for_snapshot(&archive_path).map_err(|error| {
+        manifest_error(
+            &archive_path,
+            None,
+            format!("不能打开 Git 提交归档：{error}"),
+        )
+    })?;
+    let bytes = read_opened_regular_file_snapshot(
+        archive,
+        &archive_path,
+        PACKAGE_TREE_MAX_BYTES,
+        "Git 提交归档",
+    )?;
+    let unpacked = temporary.path().join("package-source");
+    fs::create_dir(&unpacked).map_err(|error| {
+        manifest_error(
+            &unpacked,
+            None,
+            format!("不能创建 Git 提交展开目录：{error}"),
+        )
+    })?;
+    extract_tar_bytes_with_limits(
+        &bytes,
+        &archive_path,
+        &unpacked,
+        ArchiveLimits {
+            compressed_bytes: PACKAGE_TREE_MAX_BYTES,
+            file_bytes: PACKAGE_TREE_MAX_FILE_BYTES,
+            expanded_bytes: PACKAGE_TREE_MAX_BYTES,
+            entries: PACKAGE_TREE_MAX_ENTRIES,
+            path_bytes: ARCHIVE_MAX_PATH_BYTES,
+            metadata_headers: true,
+        },
+    )?;
+    capture_package_tree(
+        &unpacked,
+        PackagePathPurpose::TreeChecksum,
+        PackageTreeCaptureLimits::dependency(),
+        None,
+    )
+}
+
+fn create_git_commit_generation_root(
+    url_root: &Path,
+    exact: &str,
+) -> Result<PathBuf, ManifestError> {
+    if !exact_git_commit(exact) {
+        return Err(manifest_error(
+            url_root,
+            None,
+            "Git generation 只接受 40 位精确提交",
+        ));
+    }
+    let generations =
+        create_checked_cache_directory(url_root, GIT_GENERATION_LAYOUT, "Git generation 布局")?;
+    create_checked_cache_directory(&generations, exact, "Git 精确提交 generation")
+}
+
+fn existing_git_generation(
+    commit_root: &Path,
+    checksum: &str,
+) -> Result<Option<PathBuf>, ManifestError> {
+    let mut candidates = fs::read_dir(commit_root)
+        .map_err(|error| {
+            manifest_error(
+                commit_root,
+                None,
+                format!("不能枚举 Git generation：{error}"),
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            manifest_error(
+                commit_root,
+                None,
+                format!("不能读取 Git generation 目录项：{error}"),
+            )
+        })?;
+    candidates.sort_by_key(fs::DirEntry::file_name);
+    for candidate in candidates {
+        let path = candidate.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            manifest_error(
+                &path,
+                None,
+                format!("不能检查 Git generation 候选：{error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink() || standard_metadata_is_reparse(&metadata) {
+            return Err(manifest_error(
+                &path,
+                None,
+                "Git generation 不得为链接或重解析点",
+            ));
+        }
+        if candidate.file_name().to_string_lossy().starts_with('.') {
+            if !metadata.is_dir() {
+                return Err(manifest_error(
+                    &path,
+                    None,
+                    "Git generation 临时项必须是普通目录",
+                ));
+            }
+            continue;
+        }
+        if !metadata.is_dir() {
+            return Err(manifest_error(
+                &path,
+                None,
+                "Git generation 候选必须是普通目录",
+            ));
+        }
+        let root = path.join("package");
+        if matches!(resolution_generation_checksum(&root), Ok(actual) if actual == checksum) {
+            set_resolution_generation_read_only(&path)?;
+            let canonical = fs::canonicalize(&root).map_err(|error| {
+                manifest_error(&root, None, format!("不能定位 Git generation：{error}"))
+            })?;
+            if !canonical.starts_with(commit_root) {
+                return Err(manifest_error(
+                    &root,
+                    None,
+                    "Git generation 越出精确提交缓存边界",
+                ));
+            }
+            return Ok(Some(canonical));
+        }
+    }
+    Ok(None)
+}
+
+fn publish_git_generation(
+    url_root: &Path,
+    exact: &str,
+    snapshot: &PackageTreeSnapshot,
+) -> Result<PathBuf, ManifestError> {
+    let checksum = portable_tree_snapshot_checksum(snapshot)?;
+    let commit_root = create_git_commit_generation_root(url_root, exact)?;
+    if let Some(root) = existing_git_generation(&commit_root, &checksum)? {
+        return Ok(root);
+    }
+    let temporary =
+        RegistryTemporaryDirectory::create_within(url_root, &commit_root, "git-generation")?;
+    write_resolution_snapshot(snapshot, &temporary.path().join("package"))?;
+    let destination = resolution_generation_destination(&commit_root)?;
+    temporary.publish(&destination)?;
+    sync_registry_directory_parent(&destination)?;
+    set_resolution_generation_read_only(&destination)?;
+    let root = destination.join("package");
+    let actual = resolution_generation_checksum(&root)?;
+    if actual != checksum {
+        return Err(manifest_error(
+            &root,
+            None,
+            format!("Git generation 发布后摘要改变：预期 {checksum}，实际 {actual}"),
+        ));
+    }
+    let canonical = fs::canonicalize(&root).map_err(|error| {
+        manifest_error(
+            &root,
+            None,
+            format!("不能定位已发布 Git generation：{error}"),
+        )
+    })?;
+    if !canonical.starts_with(commit_root) {
+        return Err(manifest_error(
+            &root,
+            None,
+            "已发布 Git generation 越出精确提交缓存边界",
+        ));
+    }
+    Ok(canonical)
 }
 
 const SOURCE_SECURITY_ERROR: &str = "依赖来源不得包含内嵌凭据、不安全用户信息、片段或敏感查询参数；请改用凭据管理器、SSH 密钥管理器或外部认证配置";
@@ -3479,7 +4252,10 @@ fn validate_git_revision_security(revision: &str) -> Result<(), &'static str> {
     if revision.is_empty()
         || revision.len() > GIT_REVISION_MAX_BYTES
         || revision.starts_with('-')
+        || revision.starts_with('+')
         || revision.contains('#')
+        || revision.contains(':')
+        || revision.contains('*')
         || revision.chars().any(char::is_control)
     {
         return Err(GIT_REVISION_ERROR);
@@ -6178,13 +6954,15 @@ fn acquire_resolution_generation_lock(
                 )
             })?
             .ok_or_else(|| manifest_error(cache, None, "依赖 generation 缓存根句柄不存在"))?;
-        let locks_directory = cache_directory.open_dir_nofollow(".locks").map_err(|error| {
-            manifest_error(
-                &locks,
-                None,
-                format!("不能按目录能力打开依赖 generation 缓存锁目录：{error}"),
-            )
-        })?;
+        let locks_directory = cache_directory
+            .open_dir_nofollow(".locks")
+            .map_err(|error| {
+                manifest_error(
+                    &locks,
+                    None,
+                    format!("不能按目录能力打开依赖 generation 缓存锁目录：{error}"),
+                )
+            })?;
         match locks_directory.create_dir(checksum) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -7719,6 +8497,62 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    fn run_git_fixture(root: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .args(arguments)
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    fn git_fixture_head(root: &Path) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn make_git_fixture_cache_writable(path: &Path) {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.file_type().is_symlink() {
+            return;
+        }
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            permissions.set_mode(if metadata.is_dir() { 0o700 } else { 0o600 });
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions).ok();
+        if metadata.is_dir() {
+            let Ok(entries) = fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                make_git_fixture_cache_writable(&entry.path());
+            }
+        }
+    }
+
+    fn remove_git_fixture_cache(url: &str) {
+        let Ok(cache) = git_cache_layout_root() else {
+            return;
+        };
+        let identity = git_cache_identity(url);
+        let source = cache.join(&identity);
+        make_git_fixture_cache_writable(&source);
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(cache.join(".locks").join(identity)).ok();
+    }
+
     fn read_dependency_entry(
         dependency: &ResolvedDependency,
         capabilities: &ResolutionCapabilities,
@@ -8066,6 +8900,10 @@ mod tests {
             tar::EntryType::Char,
             tar::EntryType::Block,
             tar::EntryType::Fifo,
+            tar::EntryType::GNULongName,
+            tar::EntryType::GNULongLink,
+            tar::EntryType::XHeader,
+            tar::EntryType::XGlobalHeader,
         ]
         .into_iter()
         .enumerate()
@@ -8401,8 +9239,7 @@ mod tests {
         );
         write(&root.join("主.yx"), "言 1；\n");
         let manifest = load(&manifest_path).unwrap();
-        let (application_root, application_roots, _) =
-            bind_resolution_manifest(&manifest).unwrap();
+        let (application_root, application_roots, _) = bind_resolution_manifest(&manifest).unwrap();
 
         write(
             &manifest_path,
@@ -10098,8 +10935,7 @@ mod tests {
         let error = plan_update(&manifest, false).unwrap_err();
         assert!(error.message.contains("原生扩展 = true"), "{error}");
         assert!(error.message.contains("图形界面权限不能代替"), "{error}");
-        let cache = cache_root().join("git").join(short_hash(&git_url));
-        fs::remove_dir_all(cache).ok();
+        remove_git_fixture_cache(&git_url);
         fs::remove_dir_all(root).ok();
     }
 
@@ -10737,6 +11573,17 @@ mod tests {
             );
             assert_eq!(safe_git_revision_for_display(revision), revision);
         }
+        for revision in [
+            "+refs/heads/main",
+            "refs/heads/main:refs/replace/0123456789abcdef0123456789abcdef01234567",
+            "refs/heads/*",
+        ] {
+            assert_eq!(
+                validate_git_revision_security(revision),
+                Err(GIT_REVISION_ERROR),
+                "Git refspec was accepted: {revision}"
+            );
+        }
         let marker = "revision-value-must-not-appear";
         for revision in [
             format!("https://user:{marker}@example.invalid/repo"),
@@ -10982,6 +11829,288 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_git_revisions_publish_distinct_immutable_generations() {
+        let root = temp("git-concurrent-generations");
+        let repository = root.join("repository");
+        write(
+            &repository.join(MANIFEST_NAME),
+            "[包]\n名='并发Git包'\n版='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&repository.join("主.yx"), "公 定 答：数 为 1；\n");
+        run_git_fixture(&repository, &["init", "--quiet"]);
+        run_git_fixture(
+            &repository,
+            &["config", "user.email", "yanxu@example.invalid"],
+        );
+        run_git_fixture(&repository, &["config", "user.name", "Yanxu Tests"]);
+        run_git_fixture(&repository, &["add", "."]);
+        run_git_fixture(&repository, &["commit", "--quiet", "-m", "first"]);
+        let first_revision = git_fixture_head(&repository);
+        write(&repository.join("主.yx"), "公 定 答：数 为 2；\n");
+        run_git_fixture(&repository, &["add", "."]);
+        run_git_fixture(&repository, &["commit", "--quiet", "-m", "second"]);
+        let second_revision = git_fixture_head(&repository);
+        let url = repository.to_string_lossy().into_owned();
+
+        let threads = (0..8)
+            .map(|index| {
+                let url = url.clone();
+                let revision = if index % 2 == 0 {
+                    first_revision.clone()
+                } else {
+                    second_revision.clone()
+                };
+                std::thread::spawn(move || {
+                    let (root, exact) = resolve_git(&url, &revision, false).unwrap();
+                    (revision, exact, root)
+                })
+            })
+            .collect::<Vec<_>>();
+        let resolved = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        let first_roots = resolved
+            .iter()
+            .filter(|(requested, _, _)| requested == &first_revision)
+            .map(|(_, exact, root)| {
+                assert_eq!(exact, &first_revision);
+                assert_eq!(
+                    fs::read_to_string(root.join("主.yx")).unwrap(),
+                    "公 定 答：数 为 1；\n"
+                );
+                assert!(!root.join(".git").exists());
+                root
+            })
+            .collect::<Vec<_>>();
+        let second_roots = resolved
+            .iter()
+            .filter(|(requested, _, _)| requested == &second_revision)
+            .map(|(_, exact, root)| {
+                assert_eq!(exact, &second_revision);
+                assert_eq!(
+                    fs::read_to_string(root.join("主.yx")).unwrap(),
+                    "公 定 答：数 为 2；\n"
+                );
+                root
+            })
+            .collect::<Vec<_>>();
+        assert!(first_roots.windows(2).all(|roots| roots[0] == roots[1]));
+        assert!(second_roots.windows(2).all(|roots| roots[0] == roots[1]));
+        assert_ne!(first_roots[0], second_roots[0]);
+        remove_git_fixture_cache(&url);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exact_file_git_revision_remains_available_offline_without_source() {
+        let root = temp("git-offline-generation");
+        let repository = root.join("repository");
+        write(
+            &repository.join(MANIFEST_NAME),
+            "[包]\n名='离线Git包'\n版='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&repository.join("主.yx"), "公 定 答：数 为 7；\n");
+        run_git_fixture(&repository, &["init", "--quiet"]);
+        run_git_fixture(
+            &repository,
+            &["config", "user.email", "yanxu@example.invalid"],
+        );
+        run_git_fixture(&repository, &["config", "user.name", "Yanxu Tests"]);
+        run_git_fixture(&repository, &["add", "."]);
+        run_git_fixture(&repository, &["commit", "--quiet", "-m", "offline"]);
+        let url = url::Url::from_directory_path(&repository)
+            .unwrap()
+            .to_string();
+        let (online_root, exact) = resolve_git(&url, "HEAD", false).unwrap();
+        fs::remove_dir_all(&repository).unwrap();
+        let (offline_root, offline_exact) = resolve_git(&url, &exact, true).unwrap();
+        assert_eq!(offline_exact, exact);
+        assert_eq!(offline_root, online_root);
+        assert_eq!(
+            fs::read_to_string(offline_root.join("主.yx")).unwrap(),
+            "公 定 答：数 为 7；\n"
+        );
+        remove_git_fixture_cache(&url);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn git_generation_preserves_bounded_long_archive_paths() {
+        let root = temp("git-long-archive-path");
+        let repository = root.join("repository");
+        write(
+            &repository.join(MANIFEST_NAME),
+            "[包]\n名='长路径Git包'\n版='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&repository.join("主.yx"), "公 定 答：数 为 12；\n");
+        let long_relative = PathBuf::from("甲".repeat(70))
+            .join("乙".repeat(70))
+            .join("深.yx");
+        assert!(long_relative.as_os_str().as_encoded_bytes().len() < ARCHIVE_MAX_PATH_BYTES);
+        write(&repository.join(&long_relative), "公 定 深值：数 为 13；\n");
+        run_git_fixture(&repository, &["init", "--quiet"]);
+        run_git_fixture(
+            &repository,
+            &["config", "user.email", "yanxu@example.invalid"],
+        );
+        run_git_fixture(&repository, &["config", "user.name", "Yanxu Tests"]);
+        run_git_fixture(&repository, &["add", "."]);
+        run_git_fixture(&repository, &["commit", "--quiet", "-m", "long-path"]);
+        let revision = git_fixture_head(&repository);
+        let url = repository.to_string_lossy().into_owned();
+
+        let (generation, exact) = resolve_git(&url, &revision, false).unwrap();
+        assert_eq!(exact, revision);
+        assert_eq!(
+            fs::read_to_string(generation.join(long_relative)).unwrap(),
+            "公 定 深值：数 为 13；\n"
+        );
+
+        remove_git_fixture_cache(&url);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn damaged_git_generation_is_preserved_while_repair_is_published() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp("git-generation-repair");
+        let repository = root.join("repository");
+        write(
+            &repository.join(MANIFEST_NAME),
+            "[包]\n名='修复Git包'\n版='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&repository.join("主.yx"), "公 定 答：数 为 8；\n");
+        run_git_fixture(&repository, &["init", "--quiet"]);
+        run_git_fixture(
+            &repository,
+            &["config", "user.email", "yanxu@example.invalid"],
+        );
+        run_git_fixture(&repository, &["config", "user.name", "Yanxu Tests"]);
+        run_git_fixture(&repository, &["add", "."]);
+        run_git_fixture(&repository, &["commit", "--quiet", "-m", "repair"]);
+        let exact = git_fixture_head(&repository);
+        let url = repository.to_string_lossy();
+        let (first_root, _) = resolve_git(&url, &exact, false).unwrap();
+        let first_entry = first_root.join("主.yx");
+        fs::set_permissions(&first_entry, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&first_entry, "公 定 答：数 为 9；\n").unwrap();
+
+        let (repair_root, _) = resolve_git(&url, &exact, false).unwrap();
+        assert_ne!(repair_root, first_root);
+        assert_eq!(
+            fs::read_to_string(&first_entry).unwrap(),
+            "公 定 答：数 为 9；\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repair_root.join("主.yx")).unwrap(),
+            "公 定 答：数 为 8；\n"
+        );
+        remove_git_fixture_cache(&url);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn invalid_git_store_config_is_preserved_while_repair_store_is_published() {
+        let root = temp("git-store-config-repair");
+        let repository = root.join("repository");
+        write(
+            &repository.join(MANIFEST_NAME),
+            "[包]\n名='配置修复包'\n版='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&repository.join("主.yx"), "公 定 答：数 为 11；\n");
+        run_git_fixture(&repository, &["init", "--quiet"]);
+        run_git_fixture(
+            &repository,
+            &["config", "user.email", "yanxu@example.invalid"],
+        );
+        run_git_fixture(&repository, &["config", "user.name", "Yanxu Tests"]);
+        run_git_fixture(&repository, &["add", "."]);
+        run_git_fixture(&repository, &["commit", "--quiet", "-m", "fixture"]);
+        let revision = git_fixture_head(&repository);
+        let url = repository.to_string_lossy().into_owned();
+
+        let (_, exact) = resolve_git(&url, &revision, false).unwrap();
+        assert_eq!(exact, revision);
+        let cache = git_cache_layout_root().unwrap();
+        let identity = format!("{:x}", Sha256::digest(url.as_bytes()));
+        let url_root = cache.join(identity);
+        let store = url_root.join("objects.git");
+        let replacement = store.join("refs/replace").join(&revision);
+        fs::create_dir_all(replacement.parent().unwrap()).unwrap();
+        fs::write(&replacement, format!("{revision}\n")).unwrap();
+        let reference_error = validate_git_object_store(&store).unwrap_err();
+        assert!(reference_error.message.contains("持久引用"));
+        fs::remove_dir_all(store.join("refs/replace")).unwrap();
+
+        let config_path = url_root.join("objects.git/config");
+        let mut invalid_config = fs::read_to_string(&config_path).unwrap();
+        invalid_config.push_str("\n[core]\n\thooksPath = ../../outside-hooks\n");
+        fs::write(&config_path, &invalid_config).unwrap();
+
+        let (repaired_root, repaired_exact) = resolve_git(&url, &revision, false).unwrap();
+        assert_eq!(repaired_exact, revision);
+        assert_eq!(
+            fs::read_to_string(repaired_root.join("主.yx")).unwrap(),
+            "公 定 答：数 为 11；\n"
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), invalid_config);
+        let repairs = fs::read_dir(&url_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with("objects-repair-") && name.ends_with(".git")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(repairs.len(), 1);
+        validate_git_object_store(&repairs[0]).unwrap();
+
+        remove_git_fixture_cache(&url);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_cache_rejects_linked_lock_store_and_generation_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("git-cache-links");
+        let cache = root.join("cache");
+        let outside = root.join("outside");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, cache.join(".locks")).unwrap();
+        let identity = "a".repeat(64);
+        let lock_error = match acquire_git_cache_lock(&cache, &identity) {
+            Ok(_) => panic!("linked Git cache lock was accepted"),
+            Err(error) => error,
+        };
+        assert!(lock_error.message.contains("链接"));
+        assert!(!outside.join(&identity).join(".yanxu/package.lock").exists());
+        fs::remove_file(cache.join(".locks")).unwrap();
+
+        let url_root = create_checked_cache_directory(&cache, &identity, "Git 测试缓存").unwrap();
+        symlink(&outside, url_root.join("objects.git")).unwrap();
+        let store_error = find_git_object_store(&url_root).unwrap_err();
+        assert!(store_error.message.contains("链接"));
+        fs::remove_file(url_root.join("objects.git")).unwrap();
+
+        let trees =
+            create_checked_cache_directory(&url_root, GIT_GENERATION_LAYOUT, "Git 测试树").unwrap();
+        let exact = "b".repeat(40);
+        symlink(&outside, trees.join(&exact)).unwrap();
+        let generation_error = create_git_commit_generation_root(&url_root, &exact).unwrap_err();
+        assert!(generation_error.message.contains("链接"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn git_source_is_pinned_to_an_exact_revision_and_reused_offline() {
         let root = temp("git");
         write(
@@ -11053,7 +12182,7 @@ mod tests {
         assert_eq!(stable_tag_revision, first_revision);
         let (_, offline_revision) = resolve_git(&url, &second_revision, true).unwrap();
         assert_eq!(second_revision, offline_revision);
-        fs::remove_dir_all(cache).ok();
+        remove_git_fixture_cache(&url);
         fs::remove_dir_all(root).ok();
     }
 }

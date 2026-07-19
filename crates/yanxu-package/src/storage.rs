@@ -5,8 +5,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(not(target_os = "wasi"))]
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+
 const LOCK_DIRECTORY: &str = ".yanxu";
 const LOCK_NAME: &str = "package.lock";
+#[cfg(not(target_os = "wasi"))]
+const CACHE_LOCK_BIND_ATTEMPTS: usize = 16;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct ProjectLock {
@@ -40,6 +45,100 @@ impl ProjectLock {
             Ok(Self { _file: file })
         }
     }
+
+    /// 从已经限定的缓存根逐级 no-follow 创建并打开锁，避免路径组件把锁文件
+    /// 重定向到缓存边界外。调用方仍负责验证缓存根本身的类型与身份。
+    pub(crate) fn acquire_under(root: &Path, components: &[&str]) -> io::Result<Self> {
+        for component in components {
+            let path = Path::new(component);
+            if path.components().count() != 1
+                || !matches!(
+                    path.components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cache lock component must be one normal path component",
+                ));
+            }
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            for attempt in 0..CACHE_LOCK_BIND_ATTEMPTS {
+                match Self::acquire_under_once(root, components) {
+                    Ok(lock) => return Ok(lock),
+                    Err(error)
+                        if attempt + 1 < CACHE_LOCK_BIND_ATTEMPTS
+                            && matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::Interrupted
+                            ) =>
+                    {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            unreachable!("bounded cache-lock binding loop always returns")
+        }
+        #[cfg(target_os = "wasi")]
+        {
+            let mut lock_root = root.to_path_buf();
+            lock_root.extend(components);
+            Self::acquire(&lock_root)
+        }
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    fn acquire_under_once(root: &Path, components: &[&str]) -> io::Result<Self> {
+        let mut directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+        for component in components {
+            match directory.create_dir(component) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            directory = directory.open_dir_nofollow(component)?;
+        }
+        match directory.create_dir(LOCK_DIRECTORY) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let state = directory.open_dir_nofollow(LOCK_DIRECTORY)?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .follow(FollowSymlinks::No)
+            .nonblock(true);
+        let file = state.open_with(LOCK_NAME, &options)?.into_std();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata_is_reparse(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache lock must be a regular non-reparse file",
+            ));
+        }
+        Self::acquire_opened(file)
+    }
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(all(not(windows), not(target_os = "wasi")))]
+fn metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 impl Drop for ProjectLock {
