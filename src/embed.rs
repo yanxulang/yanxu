@@ -208,6 +208,15 @@ impl Engine {
         name: impl Into<String>,
         directory: &Path,
     ) -> Result<Execution, EngineError> {
+        let name = name.into();
+        crate::package::validate_module_source_size(Path::new(&name), source.len() as u64)
+            .map_err(|error| {
+                EngineError::coded(
+                    EngineErrorKind::Frontend,
+                    error.code(),
+                    error.diagnostic_message(),
+                )
+            })?;
         let statements = parse_named(source, name)
             .map_err(|error| EngineError::new(EngineErrorKind::Frontend, error.to_string()))?;
         if self.config.static_check {
@@ -342,6 +351,9 @@ fn package_code_and_message(message: &str) -> Option<(&'static str, &str)> {
         crate::package::PACKAGE_ROOT_INVALID_CODE => crate::package::PACKAGE_ROOT_INVALID_CODE,
         crate::package::PACKAGE_MODULE_OUTSIDE_ROOT_CODE => {
             crate::package::PACKAGE_MODULE_OUTSIDE_ROOT_CODE
+        }
+        crate::package::PACKAGE_MODULE_SOURCE_LIMIT_CODE => {
+            crate::package::PACKAGE_MODULE_SOURCE_LIMIT_CODE
         }
         crate::package::PACKAGE_PATH_RESERVED_CODE => crate::package::PACKAGE_PATH_RESERVED_CODE,
         crate::package::PACKAGE_PATH_COLLISION_CODE => crate::package::PACKAGE_PATH_COLLISION_CODE,

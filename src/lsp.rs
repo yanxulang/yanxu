@@ -67,7 +67,11 @@ fn serve_io<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> io::Result<()
                 if let Some(document) = message.pointer("/params/textDocument") {
                     let uri = document.get("uri").and_then(Value::as_str).unwrap_or("");
                     let text = document.get("text").and_then(Value::as_str).unwrap_or("");
-                    documents.insert(uri.into(), text.into());
+                    if validate_lsp_source_size(uri, text).is_ok() {
+                        documents.insert(uri.into(), text.into());
+                    } else {
+                        documents.remove(uri);
+                    }
                     publish(&mut writer, uri, text)?;
                 }
             }
@@ -77,7 +81,11 @@ fn serve_io<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> io::Result<()
                     .pointer("/params/contentChanges/0/text")
                     .and_then(Value::as_str)
                 {
-                    documents.insert(uri.into(), text.into());
+                    if validate_lsp_source_size(uri, text).is_ok() {
+                        documents.insert(uri.into(), text.into());
+                    } else {
+                        documents.remove(uri);
+                    }
                     publish(&mut writer, uri, text)?;
                 }
             }
@@ -139,7 +147,7 @@ fn initialize_result() -> Value {
 }
 
 fn semantic_response(method: &str, uri: &str, source: &str, request: &Value) -> Value {
-    if validate_lsp_document_path(uri).is_err() {
+    if validate_lsp_document_path(uri).is_err() || validate_lsp_source_size(uri, source).is_err() {
         return if matches!(
             method,
             "textDocument/completion" | "textDocument/references" | "textDocument/documentSymbol"
@@ -297,12 +305,6 @@ fn package_member_completion_items(
     {
         return Vec::new();
     }
-    let Ok(metadata) = resolved_module.metadata() else {
-        return Vec::new();
-    };
-    if !metadata.is_file() || metadata.len() > 8 * 1024 * 1024 {
-        return Vec::new();
-    }
     let Ok(module_source) = crate::package::read_resolved_module_source_snapshot(resolved_module)
     else {
         return Vec::new();
@@ -456,6 +458,11 @@ fn uri_file_path(uri: &str) -> Option<std::path::PathBuf> {
     url::Url::parse(uri).ok()?.to_file_path().ok()
 }
 
+fn validate_lsp_source_size(uri: &str, source: &str) -> Result<(), crate::package::ManifestError> {
+    let path = uri_file_path(uri).unwrap_or_else(|| PathBuf::from(uri));
+    crate::package::validate_module_source_size(path, source.len() as u64)
+}
+
 fn validate_lsp_document_path(uri: &str) -> Result<(), String> {
     if uri.contains('\\') || uri.to_ascii_lowercase().contains("%5c") {
         return crate::package::validate_portable_path_text("\\")
@@ -551,6 +558,8 @@ struct QualifiedSelection {
 
 impl LspModuleGraph {
     fn build(uri: &str, source: &str) -> Result<Self, String> {
+        validate_lsp_source_size(uri, source)
+            .map_err(|error| format!("[{}] {}", error.code(), error.diagnostic_message()))?;
         let path = uri_file_path(uri).ok_or_else(|| "文档 URI 不是文件".to_owned())?;
         let canonical = validate_lsp_file_path(&path)
             .map_err(|error| format!("[{}] {}", error.code, error.message))?
@@ -1253,6 +1262,16 @@ fn document_symbol(symbol: &Symbol, source: &str, children: Option<Vec<Value>>) 
 }
 
 pub fn diagnostics(source: &str, name: &str) -> Vec<Value> {
+    if let Err(error) = validate_lsp_source_size(name, source) {
+        let span = Span::new(SourceFile::new(name, ""), 1, 1, 1, 1);
+        return vec![diagnostic_with_code(
+            &span,
+            source,
+            error.code(),
+            error.diagnostic_message(),
+            1,
+        )];
+    }
     if let Some(path) = uri_file_path(name)
         && let Err(error) = validate_lsp_file_path(&path)
     {

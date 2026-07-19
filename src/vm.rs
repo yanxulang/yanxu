@@ -4208,7 +4208,7 @@ impl Vm {
                 chunk
             } else {
                 let source = crate::package::read_resolved_module_source_snapshot(resolved)
-                    .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+                    .map_err(|runtime_error| package_error(span, runtime_error))?;
                 let statements = crate::parse_named(&source, canonical.display().to_string())
                     .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
                 let chunk = Rc::new(

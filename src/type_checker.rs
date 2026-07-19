@@ -39,6 +39,9 @@ impl TypeError {
             Some("[PACKAGE_MODULE_OUTSIDE_ROOT") => {
                 crate::package::PACKAGE_MODULE_OUTSIDE_ROOT_CODE
             }
+            Some("[PACKAGE_MODULE_SOURCE_LIMIT") => {
+                crate::package::PACKAGE_MODULE_SOURCE_LIMIT_CODE
+            }
             Some("[PACKAGE_PATH_RESERVED") => crate::package::PACKAGE_PATH_RESERVED_CODE,
             Some("[PACKAGE_PATH_COLLISION") => crate::package::PACKAGE_PATH_COLLISION_CODE,
             _ => "TYPE000",
@@ -1749,8 +1752,9 @@ impl Checker {
         let source = match crate::package::read_resolved_module_source_snapshot(resolved) {
             Ok(source) => source,
             Err(error) => {
-                self.error(
-                    format!("不能读取模块“{}”：{error}", canonical.display()),
+                self.coded_error(
+                    error.code(),
+                    format!("{}：{}", error.path.display(), error.diagnostic_message()),
                     import_span.clone(),
                 );
                 return None;

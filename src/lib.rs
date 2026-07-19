@@ -72,6 +72,9 @@ pub fn parse(source: &str) -> Result<Vec<ast::Stmt>, YanxuError> {
 }
 
 pub fn parse_named(source: &str, name: impl Into<String>) -> Result<Vec<ast::Stmt>, YanxuError> {
+    let name = name.into();
+    package::validate_module_source_size(Path::new(&name), source.len() as u64)
+        .map_err(|error| YanxuError::Io(module_manifest_error(error)))?;
     let tokens = lexer::scan_named(source, name).map_err(YanxuError::Lex)?;
     let statements = parser::parse(tokens).map_err(YanxuError::Parse)?;
     resolver::resolve(&statements).map_err(YanxuError::Semantic)?;

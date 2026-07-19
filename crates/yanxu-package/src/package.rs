@@ -52,6 +52,10 @@ pub const ARCHIVE_MAX_PATH_BYTES: usize = 512;
 pub const NATIVE_ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 pub const NATIVE_ARTIFACT_MAX_COUNT: usize = 32;
 pub const NATIVE_ARTIFACT_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+#[doc(hidden)]
+pub const MODULE_SOURCE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+#[doc(hidden)]
+pub const PACKAGE_MODULE_SOURCE_LIMIT_CODE: &str = "PACKAGE_MODULE_SOURCE_LIMIT";
 const PACKAGE_TREE_MAX_FILE_BYTES: u64 = NATIVE_ARTIFACT_MAX_BYTES;
 const PACKAGE_TREE_MAX_BYTES: u64 = NATIVE_ARTIFACT_MAX_TOTAL_BYTES + ARCHIVE_MAX_EXPANDED_BYTES;
 const PACKAGE_TREE_MAX_ENTRIES: usize = 100_000;
@@ -455,6 +459,7 @@ impl ManifestError {
             Some("[PACKAGE_MODULE_OUTSIDE_ROOT") => {
                 crate::path_policy::PACKAGE_MODULE_OUTSIDE_ROOT_CODE
             }
+            Some("[PACKAGE_MODULE_SOURCE_LIMIT") => PACKAGE_MODULE_SOURCE_LIMIT_CODE,
             Some("[PACKAGE_PATH_RESERVED") => crate::path_policy::PACKAGE_PATH_RESERVED_CODE,
             Some("[PACKAGE_PATH_COLLISION") => crate::path_policy::PACKAGE_PATH_COLLISION_CODE,
             _ => "PACKAGE000",
@@ -3423,8 +3428,13 @@ fn validate_git_store_config(store: &Path) -> Result<(), ManifestError> {
     let file = open_regular_file_for_snapshot(&path).map_err(|error| {
         manifest_error(&path, None, format!("不能打开 Git 对象库配置：{error}"))
     })?;
-    let bytes =
-        read_opened_regular_file_snapshot(file, &path, GIT_CONFIG_MAX_BYTES, "Git 对象库配置")?;
+    let bytes = read_opened_regular_file_snapshot(
+        file,
+        &path,
+        GIT_CONFIG_MAX_BYTES,
+        "Git 对象库配置",
+        None,
+    )?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| manifest_error(&path, None, "Git 对象库配置不是 UTF-8"))?;
     let mut section = None;
@@ -3571,7 +3581,8 @@ fn validate_git_object_store(store: &Path) -> Result<(), ManifestError> {
     let file = open_regular_file_for_snapshot(&head).map_err(|error| {
         manifest_error(&head, None, format!("不能打开 Git 对象库 HEAD：{error}"))
     })?;
-    let head_bytes = read_opened_regular_file_snapshot(file, &head, 4_096, "Git 对象库 HEAD")?;
+    let head_bytes =
+        read_opened_regular_file_snapshot(file, &head, 4_096, "Git 对象库 HEAD", None)?;
     let head_text = std::str::from_utf8(&head_bytes)
         .map_err(|_| manifest_error(&head, None, "Git 对象库 HEAD 不是 UTF-8"))?
         .trim();
@@ -3774,6 +3785,7 @@ fn capture_git_commit_snapshot(
         &archive_path,
         PACKAGE_TREE_MAX_BYTES,
         "Git 提交归档",
+        None,
     )?;
     let unpacked = temporary.path().join("package-source");
     fs::create_dir(&unpacked).map_err(|error| {
@@ -6306,7 +6318,7 @@ fn read_stable_regular_file_snapshot_with_hook(
         manifest_error(path, None, format!("不能保留已打开的{kind}身份：{error}"))
     })?;
     after_open()?;
-    let bytes = read_opened_regular_file_snapshot(file, path, max_bytes, kind)?;
+    let bytes = read_opened_regular_file_snapshot(file, path, max_bytes, kind, None)?;
     let verification = open_regular_file_for_snapshot(path).map_err(|error| {
         manifest_error(
             path,
@@ -6335,7 +6347,24 @@ pub fn read_resolved_regular_file_snapshot(
     kind: &str,
 ) -> Result<Vec<u8>, ManifestError> {
     let path = resolved.path().to_path_buf();
-    read_opened_regular_file_snapshot(resolved.into_file(), &path, max_bytes, kind)
+    read_opened_regular_file_snapshot(resolved.into_file(), &path, max_bytes, kind, None)
+}
+
+/// 统一验证内存或宿主直接提供的模块源码字节数。
+#[doc(hidden)]
+pub fn validate_module_source_size(
+    path: impl AsRef<Path>,
+    byte_len: u64,
+) -> Result<(), ManifestError> {
+    if byte_len > MODULE_SOURCE_MAX_BYTES {
+        return Err(snapshot_limit_error(
+            path.as_ref(),
+            "模块源码",
+            MODULE_SOURCE_MAX_BYTES,
+            Some(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+        ));
+    }
+    Ok(())
 }
 
 /// 只消费安全解析令牌中已经打开的模块句柄。
@@ -6344,8 +6373,13 @@ pub fn read_resolved_module_source_snapshot(
     resolved: ResolvedPackageFile,
 ) -> Result<String, ManifestError> {
     let path = resolved.path().to_path_buf();
-    let bytes =
-        read_resolved_regular_file_snapshot(resolved, u64::MAX.saturating_sub(1), "模块源码")?;
+    let bytes = read_opened_regular_file_snapshot(
+        resolved.into_file(),
+        &path,
+        MODULE_SOURCE_MAX_BYTES,
+        "模块源码",
+        Some(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+    )?;
     String::from_utf8(bytes)
         .map_err(|error| manifest_error(&path, None, format!("模块源码不是 UTF-8：{error}")))
 }
@@ -6355,6 +6389,7 @@ fn read_opened_regular_file_snapshot(
     path: &Path,
     max_bytes: u64,
     kind: &str,
+    limit_code: Option<&str>,
 ) -> Result<Vec<u8>, ManifestError> {
     let before = file
         .metadata()
@@ -6363,11 +6398,7 @@ fn read_opened_regular_file_snapshot(
         return Err(manifest_error(path, None, format!("{kind}必须是普通文件")));
     }
     if before.len() > max_bytes {
-        return Err(manifest_error(
-            path,
-            None,
-            format!("{kind}不得超过 {max_bytes} 字节"),
-        ));
+        return Err(snapshot_limit_error(path, kind, max_bytes, limit_code));
     }
     let capacity = usize::try_from(before.len())
         .map_err(|_| manifest_error(path, None, format!("{kind}大小无法由当前平台安全分配")))?;
@@ -6380,11 +6411,7 @@ fn read_opened_regular_file_snapshot(
         .read_to_end(&mut bytes)
         .map_err(|error| manifest_error(path, None, format!("不能读取{kind}：{error}")))?;
     if bytes.len() as u64 > max_bytes {
-        return Err(manifest_error(
-            path,
-            None,
-            format!("{kind}不得超过 {max_bytes} 字节"),
-        ));
+        return Err(snapshot_limit_error(path, kind, max_bytes, limit_code));
     }
     let after = file
         .metadata()
@@ -6401,6 +6428,20 @@ fn read_opened_regular_file_snapshot(
         ));
     }
     Ok(bytes)
+}
+
+fn snapshot_limit_error(
+    path: &Path,
+    kind: &str,
+    max_bytes: u64,
+    code: Option<&str>,
+) -> ManifestError {
+    let message = format!("{kind}不得超过 {max_bytes} 字节");
+    manifest_error(
+        path,
+        None,
+        code.map_or(message.clone(), |code| format!("[{code}] {message}")),
+    )
 }
 
 #[cfg(not(target_os = "wasi"))]
@@ -8038,6 +8079,7 @@ fn capture_package_directory_capability(
             &display,
             limits.file_bytes,
             "包内容",
+            None,
         )?;
         *total_bytes = total_bytes
             .checked_add(bytes.len() as u64)
@@ -8244,8 +8286,13 @@ fn capture_package_directory_wasi(
                 if let Some(path_bytes) = limits.path_bytes {
                     validated_yxp_archive_path(&relative, &display, path_bytes)?;
                 }
-                let bytes =
-                    read_opened_regular_file_snapshot(file, &display, limits.file_bytes, "包内容")?;
+                let bytes = read_opened_regular_file_snapshot(
+                    file,
+                    &display,
+                    limits.file_bytes,
+                    "包内容",
+                    None,
+                )?;
                 *total_bytes = total_bytes
                     .checked_add(bytes.len() as u64)
                     .filter(|total| *total <= limits.total_bytes)
@@ -12139,6 +12186,56 @@ mod tests {
             read_resolved_module_source_snapshot(resolved).unwrap(),
             "言「外部模块」；\n"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn module_source_reader_enforces_the_exact_byte_boundary() {
+        let root = temp("module-source-byte-limit");
+        fs::create_dir_all(&root).unwrap();
+        let accepted = root.join("恰好上限.yx");
+        let accepted_file = fs::File::create(&accepted).unwrap();
+        accepted_file.set_len(MODULE_SOURCE_MAX_BYTES).unwrap();
+        drop(accepted_file);
+
+        let accepted = open_external_module_file(&fs::canonicalize(accepted).unwrap()).unwrap();
+        let source = read_resolved_module_source_snapshot(accepted).unwrap();
+        assert_eq!(source.len() as u64, MODULE_SOURCE_MAX_BYTES);
+
+        let rejected = root.join("超过上限.yx");
+        let rejected_file = fs::File::create(&rejected).unwrap();
+        rejected_file.set_len(MODULE_SOURCE_MAX_BYTES + 1).unwrap();
+        drop(rejected_file);
+
+        let rejected = open_external_module_file(&fs::canonicalize(rejected).unwrap()).unwrap();
+        let error = read_resolved_module_source_snapshot(rejected).unwrap_err();
+        assert_eq!(error.code(), PACKAGE_MODULE_SOURCE_LIMIT_CODE);
+        assert_eq!(
+            error.diagnostic_message(),
+            format!("模块源码不得超过 {MODULE_SOURCE_MAX_BYTES} 字节")
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn replacing_an_oversized_module_path_cannot_bypass_the_bound_limit() {
+        let root = temp("module-source-limit-replacement");
+        fs::create_dir_all(&root).unwrap();
+        let requested = root.join("模块.yx");
+        let original = root.join("原模块.yx");
+        let file = fs::File::create(&requested).unwrap();
+        file.set_len(MODULE_SOURCE_MAX_BYTES + 1).unwrap();
+        drop(file);
+        let canonical = fs::canonicalize(&requested).unwrap();
+        let resolved = open_external_module_file(&canonical).unwrap();
+
+        fs::rename(&requested, &original).unwrap();
+        write(&requested, "言「替换后很小」；\n");
+
+        let error = read_resolved_module_source_snapshot(resolved).unwrap_err();
+        assert_eq!(error.code(), PACKAGE_MODULE_SOURCE_LIMIT_CODE);
+        assert_eq!(error.path, canonical);
         fs::remove_dir_all(root).ok();
     }
 

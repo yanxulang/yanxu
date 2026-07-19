@@ -3019,10 +3019,8 @@ impl Interpreter {
         resolved: crate::package::ResolvedPackageFile,
     ) -> Result<Rc<YanxuModule>, RuntimeError> {
         let path = resolved.path().to_path_buf();
-        let source =
-            crate::package::read_resolved_module_source_snapshot(resolved).map_err(|error| {
-                RuntimeError::new(format!("不能读取模块“{}”：{error}", path.display()))
-            })?;
+        let source = crate::package::read_resolved_module_source_snapshot(resolved)
+            .map_err(RuntimeError::package)?;
         let tokens = crate::lexer::scan_named(&source, path.display().to_string())
             .map_err(|error| RuntimeError::new(error.message).at(error.span))?;
         let statements = crate::parser::parse(tokens)
