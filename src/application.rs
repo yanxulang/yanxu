@@ -270,6 +270,7 @@ impl ApplicationError {
             Some("[PACKAGE_PATH_INVALID") => package::PACKAGE_PATH_INVALID_CODE,
             Some("[PACKAGE_ROOT_INVALID") => package::PACKAGE_ROOT_INVALID_CODE,
             Some("[PACKAGE_MODULE_OUTSIDE_ROOT") => package::PACKAGE_MODULE_OUTSIDE_ROOT_CODE,
+            Some("[PACKAGE_MODULE_SOURCE_LIMIT") => package::PACKAGE_MODULE_SOURCE_LIMIT_CODE,
             Some("[PACKAGE_PATH_RESERVED") => package::PACKAGE_PATH_RESERVED_CODE,
             Some("[PACKAGE_PATH_COLLISION") => package::PACKAGE_PATH_COLLISION_CODE,
             Some("[YXB_FORMAT_UNSUPPORTED") => YXB_FORMAT_UNSUPPORTED_CODE,
@@ -481,9 +482,8 @@ impl ApplicationCompiler {
             return Err(application_error(format!("模块循环相引：{id}")));
         }
         let resolved = resolved.open().map_err(package_error)?;
-        let source = package::read_resolved_module_source_snapshot(resolved).map_err(|error| {
-            application_error(format!("不能读取模块 {}：{error}", path.display()))
-        })?;
+        let source =
+            package::read_resolved_module_source_snapshot(resolved).map_err(package_error)?;
         let statements = crate::parse_named(&source, self.display_path(&path))
             .map_err(|error| application_error(error.to_string()))?;
         crate::type_checker::check_in_directory(&statements, path.parent().unwrap_or(&self.root))

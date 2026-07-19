@@ -1,6 +1,7 @@
 use crate::source::{SourceFile, Span};
 use crate::token::{Token, TokenKind};
 use std::fmt;
+use std::path::Path;
 use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +25,18 @@ pub fn scan(source: &str) -> Result<Vec<Token>, LexError> {
 }
 
 pub fn scan_named(source: &str, name: impl Into<String>) -> Result<Vec<Token>, LexError> {
+    let name = name.into();
+    if let Err(error) =
+        crate::package::validate_module_source_size(Path::new(&name), source.len() as u64)
+    {
+        let span = Span::new(SourceFile::new(name, ""), 1, 1, 1, 1);
+        return Err(LexError {
+            message: format!("[{}] {}", error.code(), error.diagnostic_message()),
+            line: 1,
+            column: 1,
+            span,
+        });
+    }
     Scanner::new(SourceFile::new(name, source)).scan_tokens()
 }
 

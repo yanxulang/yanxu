@@ -6,7 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use yanxu::bytecode;
 use yanxu::embed::{Backend, Engine, EngineConfig, EngineErrorKind};
 use yanxu::interpreter::Interpreter;
-use yanxu::package::{self, PACKAGE_MODULE_OUTSIDE_ROOT_CODE, PACKAGE_MODULE_RESERVED_PATH_CODE};
+use yanxu::package::{
+    self, MODULE_SOURCE_MAX_BYTES, PACKAGE_MODULE_OUTSIDE_ROOT_CODE,
+    PACKAGE_MODULE_RESERVED_PATH_CODE, PACKAGE_MODULE_SOURCE_LIMIT_CODE,
+};
 use yanxu::vm::Vm;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -31,6 +34,15 @@ fn write(path: impl AsRef<Path>, contents: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, contents).unwrap();
+}
+
+fn sparse_file(path: impl AsRef<Path>, length: u64) {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let file = fs::File::create(path).unwrap();
+    file.set_len(length).unwrap();
 }
 
 fn package_fixture(
@@ -312,6 +324,154 @@ fn failed_module_reads_do_not_poison_later_loader_state() {
     assert_eq!(interpreter.take_output(), ["7"]);
     vm.execute_in_directory(&chunk, &root).unwrap();
     assert_eq!(vm.take_output(), ["7"]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_source_limit_is_shared_by_parser_embedding_and_lsp() {
+    let mut source = " ".repeat(MODULE_SOURCE_MAX_BYTES as usize);
+    assert!(yanxu::parse(&source).is_ok());
+    source.push(' ');
+    let parse_error = yanxu::parse(&source).unwrap_err().to_string();
+    assert!(
+        parse_error.contains(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+        "{parse_error}"
+    );
+    let lex_error = yanxu::lexer::scan(&source).unwrap_err().to_string();
+    assert!(
+        lex_error.contains(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+        "{lex_error}"
+    );
+
+    for backend in [Backend::Tree, Backend::Bytecode] {
+        let error = Engine::new(EngineConfig::unrestricted(backend))
+            .run(&source)
+            .unwrap_err();
+        assert_eq!(error.kind, EngineErrorKind::Frontend);
+        assert!(
+            error
+                .message
+                .starts_with(&format!("[{PACKAGE_MODULE_SOURCE_LIMIT_CODE}]")),
+            "{error}"
+        );
+    }
+
+    let root = temporary_root("memory-limit-lsp");
+    let uri = url::Url::from_file_path(root.join("巨大.yx"))
+        .unwrap()
+        .to_string();
+    let diagnostics = yanxu::lsp::diagnostics(&source, &uri);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0]["code"], PACKAGE_MODULE_SOURCE_LIMIT_CODE);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn disk_source_limit_is_shared_by_every_module_consumer() {
+    let root = temporary_root("disk-limit");
+    let entry = root.join("主.yx");
+    let oversized = root.join("巨大.yx");
+    let entry_source = "引「巨大.yx」为 巨大；言 巨大.值；\n";
+    write(
+        root.join(package::MANIFEST_NAME),
+        "[包]\n格式=2\n名称='源码上限'\n版本='1.0.0'\n入口='主.yx'\n",
+    );
+    write(&entry, entry_source);
+    sparse_file(&oversized, MODULE_SOURCE_MAX_BYTES + 1);
+    let statements = yanxu::parse_named(entry_source, entry.display().to_string()).unwrap();
+
+    let type_errors = yanxu::type_checker::check_in_directory(&statements, &root).unwrap_err();
+    assert!(
+        type_errors
+            .iter()
+            .any(|error| error.code() == PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+        "{type_errors:#?}"
+    );
+
+    let mut interpreter = Interpreter::silent();
+    let tree_error = interpreter
+        .execute_in_directory(&statements, &root)
+        .unwrap_err();
+    assert_eq!(tree_error.code, PACKAGE_MODULE_SOURCE_LIMIT_CODE);
+
+    let chunk = bytecode::compile(&statements).unwrap();
+    let mut vm = Vm::silent();
+    let vm_error = vm.execute_in_directory(&chunk, &root).unwrap_err();
+    assert_eq!(vm_error.code, PACKAGE_MODULE_SOURCE_LIMIT_CODE);
+
+    let application_error = yanxu::application::compile_application(&root, "release").unwrap_err();
+    assert_eq!(application_error.code(), PACKAGE_MODULE_SOURCE_LIMIT_CODE);
+
+    let run_error = yanxu::run_file(&oversized).unwrap_err().to_string();
+    assert!(
+        run_error.contains(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+        "{run_error}"
+    );
+    for backend in [Backend::Tree, Backend::Bytecode] {
+        let error = Engine::new(EngineConfig::unrestricted(backend))
+            .run_file(&oversized)
+            .unwrap_err();
+        assert_eq!(error.kind, EngineErrorKind::Io);
+        assert!(
+            error.message.contains(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+            "{error}"
+        );
+    }
+
+    let runtime = env!("CARGO_BIN_EXE_yanxu");
+    for arguments in [
+        vec![oversized.display().to_string()],
+        vec!["check".into(), oversized.display().to_string()],
+        vec!["vm".into(), oversized.display().to_string()],
+        vec!["fmt".into(), oversized.display().to_string()],
+        vec!["debug".into(), oversized.display().to_string()],
+        vec!["migrate".into(), oversized.display().to_string()],
+        vec!["doc".into(), oversized.display().to_string()],
+        vec![
+            "doc".into(),
+            "--json".into(),
+            oversized.display().to_string(),
+        ],
+    ] {
+        let output = Command::new(runtime).args(&arguments).output().unwrap();
+        assert!(!output.status.success(), "{arguments:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+            "{arguments:?}: {stderr}"
+        );
+    }
+
+    let test_error = yanxu::testing::run(&oversized).unwrap_err();
+    assert!(
+        test_error.contains(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+        "{test_error}"
+    );
+
+    let compatibility = yanxu::compatibility::run(&oversized).unwrap();
+    assert_eq!(compatibility.failed(), 1);
+    assert!(
+        compatibility
+            .human()
+            .contains(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+        "{}",
+        compatibility.human()
+    );
+
+    let document_error = yanxu::docgen::markdown_directory(&root).unwrap_err();
+    assert!(
+        document_error.contains(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+        "{document_error}"
+    );
+
+    let uri = url::Url::from_file_path(&entry).unwrap().to_string();
+    let diagnostics = yanxu::lsp::diagnostics(entry_source, &uri);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|item| item["code"] == PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+        "{diagnostics:#?}"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
