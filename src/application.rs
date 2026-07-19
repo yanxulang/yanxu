@@ -261,6 +261,32 @@ impl fmt::Display for ApplicationError {
 
 impl std::error::Error for ApplicationError {}
 
+impl ApplicationError {
+    #[doc(hidden)]
+    pub fn code(&self) -> &'static str {
+        match self.message.split_once(']').map(|(code, _)| code) {
+            Some("[PACKAGE_MODULE_RESERVED_PATH") => package::PACKAGE_MODULE_RESERVED_PATH_CODE,
+            Some("[PACKAGE_PATH_NON_PORTABLE") => package::PACKAGE_PATH_NON_PORTABLE_CODE,
+            Some("[PACKAGE_PATH_INVALID") => package::PACKAGE_PATH_INVALID_CODE,
+            Some("[PACKAGE_ROOT_INVALID") => package::PACKAGE_ROOT_INVALID_CODE,
+            Some("[PACKAGE_MODULE_OUTSIDE_ROOT") => package::PACKAGE_MODULE_OUTSIDE_ROOT_CODE,
+            Some("[PACKAGE_PATH_RESERVED") => package::PACKAGE_PATH_RESERVED_CODE,
+            Some("[PACKAGE_PATH_COLLISION") => package::PACKAGE_PATH_COLLISION_CODE,
+            Some("[YXB_FORMAT_UNSUPPORTED") => YXB_FORMAT_UNSUPPORTED_CODE,
+            Some("[YXB_BYTECODE_UNSUPPORTED") => YXB_BYTECODE_UNSUPPORTED_CODE,
+            _ => "APP000",
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn diagnostic_message(&self) -> &str {
+        self.message
+            .strip_prefix('[')
+            .and_then(|message| message.split_once("] ").map(|(_, message)| message))
+            .unwrap_or(&self.message)
+    }
+}
+
 impl From<package::ManifestError> for ApplicationError {
     fn from(error: package::ManifestError) -> Self {
         package_error(error)
@@ -279,12 +305,8 @@ pub fn compile_application(
     if let Some(manifest) = manifest {
         validate_runtime_version(&manifest)?;
         return package::with_locked_resolution(&manifest, false, |graph| {
-            let entry = fs::canonicalize(manifest.root.join(&manifest.entry)).map_err(|error| {
-                application_error(format!(
-                    "不能定位入口 {}：{error}",
-                    manifest.entry.display()
-                ))
-            })?;
+            let canonical_root = fs::canonicalize(&manifest.root).map_err(io_error)?;
+            let entry = canonical_root.join(&manifest.entry);
             let resources = collect_resources(&manifest)?;
             let lock_checksum = checksum_file(&manifest.root.join(package::LOCK_NAME)).ok();
             let summary =
@@ -294,7 +316,7 @@ pub fn compile_application(
             let licenses = collect_licenses(&manifest, &graph)?;
             compile_resolved_application(
                 entry,
-                fs::canonicalize(&manifest.root).map_err(io_error)?,
+                canonical_root,
                 Some(manifest.root.clone()),
                 ApplicationPackage {
                     name: manifest.name.clone(),
@@ -356,15 +378,34 @@ fn compile_resolved_application(
     lock_checksum: Option<String>,
     profile: &str,
 ) -> Result<ApplicationArchive, ApplicationError> {
+    let mut trusted_package_roots = package::TrustedPackageRoots::default();
+    if package_root.is_some() {
+        trusted_package_roots
+            .insert(&root)
+            .map_err(application_path_error)?;
+    }
+    if let Some(graph) = &graph {
+        for dependency in graph.packages.values() {
+            trusted_package_roots
+                .insert(&dependency.root)
+                .map_err(application_path_error)?;
+        }
+    }
     let mut compiler = ApplicationCompiler {
         root,
         package_root,
         graph,
+        trusted_package_roots,
         modules: BTreeMap::new(),
         visiting: BTreeSet::new(),
     };
-    let entry_module = compiler.logical_id(&entry)?;
-    compiler.compile_module(&entry, &entry_module)?;
+    let compiler_root = compiler.root.clone();
+    let (entry, _) = compiler
+        .trusted_package_roots
+        .resolve_import_file(&compiler_root, &entry, false)
+        .map_err(package_error)?;
+    let entry_module = compiler.logical_id(entry.path())?;
+    compiler.compile_module(entry, &entry_module)?;
     let mut archive = ApplicationArchive {
         format_version: YXB_FORMAT_VERSION,
         bytecode_format: bytecode::BYTECODE_FORMAT_VERSION,
@@ -405,29 +446,44 @@ struct ApplicationCompiler {
     root: PathBuf,
     package_root: Option<PathBuf>,
     graph: Option<ResolutionGraph>,
+    trusted_package_roots: package::TrustedPackageRoots,
     modules: BTreeMap<String, ApplicationModule>,
     visiting: BTreeSet<String>,
 }
 
 impl ApplicationCompiler {
-    fn compile_module(&mut self, path: &Path, id: &str) -> Result<(), ApplicationError> {
+    fn compile_module(
+        &mut self,
+        resolved: package::ResolvedImportFile,
+        id: &str,
+    ) -> Result<(), ApplicationError> {
+        let path = resolved.path().to_path_buf();
+        self.trusted_package_roots
+            .authorize_module(&path, &path)
+            .map_err(application_path_error)?;
         if self.modules.contains_key(id) {
             return Ok(());
         }
         if !self.visiting.insert(id.to_owned()) {
             return Err(application_error(format!("模块循环相引：{id}")));
         }
-        let source = fs::read_to_string(path).map_err(|error| {
+        let resolved = resolved.open().map_err(package_error)?;
+        let source = package::read_resolved_module_source_snapshot(resolved).map_err(|error| {
             application_error(format!("不能读取模块 {}：{error}", path.display()))
         })?;
-        let statements = crate::parse_named(&source, self.display_path(path))
+        let statements = crate::parse_named(&source, self.display_path(&path))
             .map_err(|error| application_error(error.to_string()))?;
         crate::type_checker::check_in_directory(&statements, path.parent().unwrap_or(&self.root))
             .map_err(|errors| {
-            application_error(
+            let code = errors
+                .iter()
+                .find(|error| error.code() != "TYPE000")
+                .map_or("APP000", |error| error.code());
+            application_coded_error(
+                code,
                 errors
                     .into_iter()
-                    .map(|error| error.to_string())
+                    .map(|error| error.span.render("类型有误", error.diagnostic_message()))
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
@@ -435,14 +491,14 @@ impl ApplicationCompiler {
         let mut chunk =
             bytecode::compile_with_module_id(&statements, ModuleId::archive(id.to_owned()))
                 .map_err(|error| application_error(error.to_string()))?;
-        self.rewrite_chunk_imports(&mut chunk, path)?;
+        self.rewrite_chunk_imports(&mut chunk, &path)?;
         compact_debug_sources(&mut chunk);
         self.visiting.remove(id);
         self.modules.insert(
             id.to_owned(),
             ApplicationModule {
                 id: id.to_owned(),
-                display_path: self.display_path(path),
+                display_path: self.display_path(&path),
                 chunk,
             },
         );
@@ -467,8 +523,8 @@ impl ApplicationCompiler {
             .collect::<Vec<_>>();
         for (index, requested) in imports {
             let resolved = self.resolve_import(current_path, &requested)?;
-            let id = self.logical_id(&resolved)?;
-            self.compile_module(&resolved, &id)?;
+            let id = self.logical_id(resolved.path())?;
+            self.compile_module(resolved, &id)?;
             if let Instruction::Import { path, .. } = &mut chunk.code[index] {
                 *path = format!("归档:{id}");
             }
@@ -485,49 +541,68 @@ impl ApplicationCompiler {
     }
 
     fn resolve_import(
-        &self,
+        &mut self,
         current_path: &Path,
         requested: &str,
-    ) -> Result<PathBuf, ApplicationError> {
-        if let Some(name) = requested.strip_prefix("包:") {
-            return package::resolve_dependency_scoped(
+    ) -> Result<package::ResolvedImportFile, ApplicationError> {
+        package::validate_portable_path_text(requested).map_err(application_path_error)?;
+        let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
+            let dependency = package::resolve_dependency_scoped(
                 self.package_root.as_deref(),
                 current_path.parent().unwrap_or_else(|| Path::new(".")),
                 name,
             )
-            .map(|dependency| dependency.entry)
-            .map_err(package_error);
-        }
-        let path = Path::new(requested);
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
+            .map_err(package_error)?;
+            (dependency.entry, true)
         } else {
-            current_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(path)
+            let path = Path::new(requested);
+            let joined = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                current_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(path)
+            };
+            (joined, false)
         };
-        fs::canonicalize(&joined)
-            .map_err(|error| application_error(format!("不能解析模块“{requested}”：{error}")))
+        self.trusted_package_roots
+            .resolve_import_file(
+                current_path.parent().unwrap_or_else(|| Path::new(".")),
+                &joined,
+                package_import,
+            )
+            .map(|(resolved, _)| resolved)
+            .map_err(package_error)
     }
 
     fn logical_id(&self, path: &Path) -> Result<String, ApplicationError> {
-        let canonical = fs::canonicalize(path).map_err(io_error)?;
-        if canonical.starts_with(&self.root) {
-            return Ok(format!(
-                "app:{}",
-                relative_string(canonical.strip_prefix(&self.root).expect("prefix"))
-            ));
+        if !path.is_absolute() {
+            return Err(application_error("模块身份路径必须是绝对路径"));
         }
-        if let Some(graph) = &self.graph
-            && let Some((id, dependency)) = graph
+        let canonical = path;
+        let application_relative = canonical.strip_prefix(&self.root).ok();
+        let dependency_owner = self.graph.as_ref().and_then(|graph| {
+            graph
                 .packages
                 .iter()
                 .filter(|(_, dependency)| canonical.starts_with(&dependency.root))
                 .max_by_key(|(_, dependency)| dependency.root.components().count())
+        });
+        if let Some((id, dependency)) = dependency_owner
+            && application_relative.is_none_or(|_| {
+                dependency.root.components().count() > self.root.components().count()
+            })
         {
             let relative = canonical.strip_prefix(&dependency.root).expect("prefix");
-            return Ok(format!("pkg:{id}:{}", relative_string(relative)));
+            let relative =
+                package::portable_package_path(relative).map_err(application_path_error)?;
+            return Ok(format!("pkg:{id}:{relative}"));
+        }
+        if let Some(relative) = application_relative {
+            let relative =
+                package::portable_package_path(relative).map_err(application_path_error)?;
+            return Ok(format!("app:{relative}"));
         }
         Err(application_error(format!(
             "模块 {} 不属于项目或锁定依赖图",
@@ -1607,7 +1682,14 @@ fn relative_string(path: &Path) -> String {
 }
 
 fn package_error(error: package::ManifestError) -> ApplicationError {
-    application_error(error.to_string())
+    if error.code() == "PACKAGE000" {
+        application_error(error.to_string())
+    } else {
+        application_coded_error(
+            error.code(),
+            format!("{}：{}", error.path.display(), error.diagnostic_message()),
+        )
+    }
 }
 
 fn io_error(error: std::io::Error) -> ApplicationError {
@@ -1618,6 +1700,20 @@ fn application_error(message: impl Into<String>) -> ApplicationError {
     ApplicationError {
         message: message.into(),
     }
+}
+
+fn application_coded_error(code: &'static str, message: impl Into<String>) -> ApplicationError {
+    if code == "APP000" {
+        application_error(message)
+    } else {
+        ApplicationError {
+            message: format!("[{code}] {}", message.into()),
+        }
+    }
+}
+
+fn application_path_error(error: package::PackagePathError) -> ApplicationError {
+    application_coded_error(error.code, error.diagnostic_message())
 }
 
 fn unsupported_yxb_format(detected: u64) -> ApplicationError {

@@ -211,6 +211,15 @@ pub fn resolve_existing_package_path(
     resolve_existing_portable_relative_path_inner(root, relative, Some(purpose))
 }
 
+/// 供清单发现复用的逐组件解析；保留路径在成为更深包根前仍可被定位，
+/// 但大小写别名、Unicode 碰撞和符号链接仍一律拒绝。
+pub(crate) fn resolve_existing_portable_relative_path(
+    root: &Path,
+    relative: &Path,
+) -> Result<PathBuf, PackagePathError> {
+    resolve_existing_portable_relative_path_inner(root, relative, None)
+}
+
 fn resolve_existing_portable_relative_path_inner(
     root: &Path,
     relative: &Path,
@@ -1388,7 +1397,8 @@ impl TrustedPackageRoots {
 
     /// 返回包含路径的最深可信包根。
     pub fn matching_root(&self, path: &Path) -> Option<&Path> {
-        self.matching(path).map(|matched| matched.prefix)
+        let path = lexical_absolute(path).ok()?;
+        self.matching(&path).map(|matched| matched.prefix)
     }
 
     /// 若请求落在可信包根内，按可移植身份解析真实模块路径。

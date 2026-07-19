@@ -207,11 +207,30 @@ pub struct RuntimeError {
 
 impl RuntimeError {
     fn new(message: impl Into<String>) -> Self {
+        Self::coded("RUN000", message)
+    }
+
+    fn coded(code: &'static str, message: impl Into<String>) -> Self {
         Self {
-            code: "RUN000",
+            code,
             message: message.into(),
             frames: Vec::new(),
             span: None,
+        }
+    }
+
+    fn package_path(error: crate::package::PackagePathError) -> Self {
+        Self::coded(error.code, error.diagnostic_message())
+    }
+
+    fn package(error: crate::package::ManifestError) -> Self {
+        if error.code() == "PACKAGE000" {
+            Self::new(error.to_string())
+        } else {
+            Self::coded(
+                error.code(),
+                format!("{}：{}", error.path.display(), error.diagnostic_message()),
+            )
         }
     }
 
@@ -822,7 +841,7 @@ pub struct Interpreter {
     echo: bool,
     current_dir: PathBuf,
     package_root: Option<PathBuf>,
-    package_module_roots: Vec<PathBuf>,
+    package_module_roots: crate::package::TrustedPackageRoots,
     module_cache: HashMap<PathBuf, Rc<YanxuModule>>,
     loading_modules: Vec<PathBuf>,
     initialization_order: Vec<PathBuf>,
@@ -936,7 +955,7 @@ impl Interpreter {
             echo,
             current_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             package_root: None,
-            package_module_roots: Vec::new(),
+            package_module_roots: crate::package::TrustedPackageRoots::default(),
             module_cache: HashMap::new(),
             loading_modules: Vec::new(),
             initialization_order: Vec::new(),
@@ -996,22 +1015,47 @@ impl Interpreter {
         directory: Option<&Path>,
     ) -> Result<Value, RuntimeError> {
         self.resources.reset();
+        let execution_directory = directory.map(|directory| {
+            let absolute = if directory.is_absolute() {
+                directory.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(directory)
+            };
+            fs::canonicalize(&absolute).unwrap_or(absolute)
+        });
+        let package_root = execution_directory
+            .as_deref()
+            .map(|directory| crate::package::discover(directory).map_err(RuntimeError::package))
+            .transpose()?
+            .flatten()
+            .map(|manifest| {
+                fs::canonicalize(&manifest.root).map_err(|error| {
+                    RuntimeError::new(format!(
+                        "不能定位包根目录“{}”：{error}",
+                        manifest.root.display()
+                    ))
+                })
+            })
+            .transpose()?;
+        let mut package_module_roots = crate::package::TrustedPackageRoots::default();
+        if let Some(root) = &package_root {
+            package_module_roots
+                .insert(root)
+                .map_err(RuntimeError::package_path)?;
+        }
         let module_id = statements
             .first()
             .map(|statement| ModuleId::for_source(&statement.span.source.name))
             .unwrap_or_else(|| ModuleId::for_source("<空模块>"));
         let previous_module_id = std::mem::replace(&mut self.current_module_id, module_id);
-        let previous = directory
-            .map(|directory| std::mem::replace(&mut self.current_dir, directory.to_path_buf()));
-        let previous_package_root = directory.map(|directory| {
-            let package_root = crate::package::discover(directory)
-                .ok()
-                .flatten()
-                .map(|manifest| manifest.root);
-            std::mem::replace(&mut self.package_root, package_root)
-        });
-        let previous_package_module_roots =
-            directory.map(|_| std::mem::take(&mut self.package_module_roots));
+        let previous = execution_directory
+            .map(|directory| std::mem::replace(&mut self.current_dir, directory));
+        let previous_package_root =
+            directory.map(|_| std::mem::replace(&mut self.package_root, package_root));
+        let previous_package_module_roots = directory
+            .map(|_| std::mem::replace(&mut self.package_module_roots, package_module_roots));
         let owns_debug_frame = self.debug_hook.is_some() && self.debug_frames.is_empty();
         if owns_debug_frame {
             self.debug_frames.push(ActiveDebugFrame {
@@ -2896,36 +2940,42 @@ impl Interpreter {
     }
 
     fn load_module(&mut self, requested: &str) -> Result<Rc<YanxuModule>, RuntimeError> {
+        crate::package::validate_portable_path_text(requested)
+            .map_err(RuntimeError::package_path)?;
         if let Some(name) = requested.strip_prefix("标准:") {
             return standard_module(name);
         }
-        let joined = if let Some(name) = requested.strip_prefix("包:") {
+        let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
             let dependency = crate::package::resolve_dependency_scoped(
                 self.package_root.as_deref(),
                 &self.current_dir,
                 name,
             )
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-            if !self.package_module_roots.contains(&dependency.root) {
-                self.package_module_roots.push(dependency.root);
-            }
-            dependency.entry
+            .map_err(RuntimeError::package)?;
+            self.package_module_roots
+                .insert(&dependency.root)
+                .map_err(RuntimeError::package_path)?;
+            (dependency.entry, true)
         } else {
             let requested_path = Path::new(requested);
             if requested_path.is_absolute() {
-                requested_path.to_path_buf()
+                (requested_path.to_path_buf(), false)
             } else {
-                self.current_dir.join(requested_path)
+                (self.current_dir.join(requested_path), false)
             }
         };
-        let canonical = fs::canonicalize(&joined).map_err(|error| {
-            RuntimeError::new(format!("不能载入模块“{}”：{error}", joined.display()))
-        })?;
+        if !package_import && self.package_module_roots.matching_root(&joined).is_none() {
+            self.permissions
+                .check_file(&joined)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+        let (resolved, authority) = self
+            .package_module_roots
+            .resolve_import_file(&self.current_dir, &joined, package_import)
+            .map_err(RuntimeError::package)?;
+        let canonical = resolved.path().to_path_buf();
         if let Err(error) = self.permissions.check_file(&canonical)
-            && !self
-                .package_module_roots
-                .iter()
-                .any(|root| canonical.starts_with(root))
+            && !authority.is_verified()
         {
             return Err(RuntimeError::new(error.to_string()));
         }
@@ -2948,9 +2998,10 @@ impl Interpreter {
                 chain.join(" → ")
             )));
         }
+        let resolved = resolved.open().map_err(RuntimeError::package)?;
         self.loading_modules.push(canonical.clone());
 
-        let result = self.load_module_uncached(&canonical);
+        let result = self.load_module_uncached(resolved);
         self.loading_modules.pop();
         let module = result?;
         self.initialization_order.push(canonical.clone());
@@ -2958,10 +3009,15 @@ impl Interpreter {
         Ok(module)
     }
 
-    fn load_module_uncached(&mut self, path: &Path) -> Result<Rc<YanxuModule>, RuntimeError> {
-        let source = fs::read_to_string(path).map_err(|error| {
-            RuntimeError::new(format!("不能读取模块“{}”：{error}", path.display()))
-        })?;
+    fn load_module_uncached(
+        &mut self,
+        resolved: crate::package::ResolvedPackageFile,
+    ) -> Result<Rc<YanxuModule>, RuntimeError> {
+        let path = resolved.path().to_path_buf();
+        let source =
+            crate::package::read_resolved_module_source_snapshot(resolved).map_err(|error| {
+                RuntimeError::new(format!("不能读取模块“{}”：{error}", path.display()))
+            })?;
         let tokens = crate::lexer::scan_named(&source, path.display().to_string())
             .map_err(|error| RuntimeError::new(error.message).at(error.span))?;
         let statements = crate::parser::parse(tokens)
@@ -2972,7 +3028,7 @@ impl Interpreter {
         let module_env = self.child_env(self.globals.clone());
         let directory = path.parent().unwrap_or_else(|| Path::new("."));
         let previous = std::mem::replace(&mut self.current_dir, directory.to_path_buf());
-        let module_id = ModuleId::for_path(path);
+        let module_id = ModuleId::for_path(&path);
         let previous_module_id = std::mem::replace(&mut self.current_module_id, module_id.clone());
         let execution = self
             .execute_statements(&statements, module_env.clone())

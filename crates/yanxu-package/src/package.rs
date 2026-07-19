@@ -7,10 +7,10 @@
 mod archive;
 
 use crate::path_policy::{
-    PACKAGE_PATH_NON_PORTABLE_CODE, PackagePathDecision, PackagePathError, PackagePathPurpose,
-    PackagePathReason, PortablePackagePaths, ResolvedPackageFile, TrustedPackageRoots,
-    package_path_decision, portable_case_fold, portable_package_path,
-    resolve_existing_package_path,
+    ModuleAuthority, PACKAGE_PATH_NON_PORTABLE_CODE, PackagePathDecision, PackagePathError,
+    PackagePathPurpose, PackagePathReason, PortablePackagePaths, ResolvedPackageFile,
+    TrustedPackageRoots, package_path_decision, portable_case_fold, portable_package_path,
+    resolve_existing_package_path, resolve_existing_portable_relative_path,
 };
 #[cfg(target_os = "wasi")]
 use crate::path_policy::{WasiPackageDirectory, WasiPackageDirectoryEntry, WasiPackageEntry};
@@ -419,6 +419,48 @@ impl ManifestError {
     }
 }
 
+/// 模块导入解析结果。可信包内容在解析阶段已经打开；包外路径必须先由宿主
+/// 权限系统授权，再调用 [`Self::open`] 建立绑定最终对象的文件令牌。
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct ResolvedImportFile {
+    inner: ResolvedImportFileInner,
+}
+
+#[derive(Debug)]
+enum ResolvedImportFileInner {
+    Package(ResolvedPackageFile),
+    External(PathBuf),
+}
+
+impl ResolvedImportFile {
+    fn package(resolved: ResolvedPackageFile) -> Self {
+        Self {
+            inner: ResolvedImportFileInner::Package(resolved),
+        }
+    }
+
+    fn external(path: PathBuf) -> Self {
+        Self {
+            inner: ResolvedImportFileInner::External(path),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match &self.inner {
+            ResolvedImportFileInner::Package(resolved) => resolved.path(),
+            ResolvedImportFileInner::External(path) => path,
+        }
+    }
+
+    pub fn open(self) -> Result<ResolvedPackageFile, ManifestError> {
+        match self.inner {
+            ResolvedImportFileInner::Package(resolved) => Ok(resolved),
+            ResolvedImportFileInner::External(path) => open_external_module_file(&path),
+        }
+    }
+}
+
 fn atomic_write(path: &Path, bytes: &[u8], kind: &str) -> Result<(), ManifestError> {
     crate::storage::atomic_write(path, bytes)
         .map_err(|error| manifest_error(path, None, format!("不能原子写入{kind}：{error}")))
@@ -438,23 +480,267 @@ pub fn discover(start: impl AsRef<Path>) -> Result<Option<Manifest>, ManifestErr
             .map_err(|error| manifest_error(start, None, format!("不能定位当前目录：{error}")))?
             .join(start)
     };
-    let mut directory = if absolute_start.is_dir() {
-        absolute_start
+    let absolute_start = absolute_normalized(&absolute_start)?;
+    let host_candidates = discovery_manifest_candidates(&absolute_start);
+    let Some(host_nearest) = host_candidates.first() else {
+        return Ok(None);
+    };
+    let Some(outer_root) = host_candidates
+        .last()
+        .and_then(|manifest| manifest.parent())
+    else {
+        return load(host_nearest).map(Some);
+    };
+    let Some(resolved_start) = resolve_discovery_start_within_root(outer_root, &absolute_start)?
+    else {
+        return load(host_nearest).map(Some);
+    };
+    let resolved_candidates = discovery_manifest_candidates(&resolved_start);
+    load(resolved_candidates.first().unwrap_or(host_nearest)).map(Some)
+}
+
+fn discovery_manifest_candidates(start: &Path) -> Vec<PathBuf> {
+    let mut directory = if start.is_dir() {
+        start.to_path_buf()
     } else {
-        absolute_start
+        start
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf()
     };
+    let mut manifests = Vec::new();
     loop {
         let candidate = directory.join(MANIFEST_NAME);
         if candidate.is_file() {
-            return load(candidate).map(Some);
+            manifests.push(candidate);
         }
         if !directory.pop() {
-            return Ok(None);
+            break;
         }
     }
+    manifests
+}
+
+fn resolve_discovery_start_within_root(
+    root: &Path,
+    requested: &Path,
+) -> Result<Option<PathBuf>, ManifestError> {
+    let Ok(relative) = requested.strip_prefix(root) else {
+        return Ok(None);
+    };
+    let mut probe = relative.to_path_buf();
+    loop {
+        match resolve_existing_portable_relative_path(root, &probe) {
+            Ok(path) => return Ok(Some(path)),
+            Err(error)
+                if error.code == crate::path_policy::PACKAGE_PATH_INVALID_CODE
+                    && error.message.contains("不存在") => {}
+            Err(error) => return Err(package_path_manifest_error(requested, error)),
+        }
+        if !probe.pop() {
+            return Ok(fs::canonicalize(root).ok());
+        }
+    }
+}
+
+fn resolve_existing_discovered_path(path: &Path) -> Result<Option<PathBuf>, ManifestError> {
+    let absolute = absolute_normalized(path)?;
+    let candidates = discovery_manifest_candidates(&absolute);
+    let Some(outer_root) = candidates.last().and_then(|manifest| manifest.parent()) else {
+        return Ok(None);
+    };
+    let Ok(relative) = absolute.strip_prefix(outer_root) else {
+        return Ok(None);
+    };
+    match resolve_existing_portable_relative_path(outer_root, relative) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(error)
+            if error.code == crate::path_policy::PACKAGE_PATH_INVALID_CODE
+                && error.message.contains("不存在") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(package_path_manifest_error(path, error)),
+    }
+}
+
+impl TrustedPackageRoots {
+    /// 发现包含 `start` 的最深包并把其规范根加入当前授权集合。
+    ///
+    /// 模块加载器在校验普通文件导入前调用此方法，可识别尚未通过 `包:`
+    /// 导入访问过的嵌套路径依赖，避免把依赖私有源码误当成应用自身内容。
+    #[doc(hidden)]
+    pub fn insert_discovered(
+        &mut self,
+        start: impl AsRef<Path>,
+    ) -> Result<Option<Manifest>, ManifestError> {
+        let start = start.as_ref();
+        let manifest = discover(start)?;
+        if let Some(manifest) = &manifest {
+            self.insert(&manifest.root)
+                .map_err(|error| package_path_manifest_error(&manifest.path, error))?;
+            let absolute_start = if start.is_absolute() {
+                start.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| {
+                        manifest_error(start, None, format!("不能定位当前目录：{error}"))
+                    })?
+                    .join(start)
+            };
+            let manifest_identity = fs::canonicalize(&manifest.path).map_err(|error| {
+                manifest_error(
+                    &manifest.path,
+                    None,
+                    format!("不能复验发现的包清单：{error}"),
+                )
+            })?;
+            if let Some(alias_root) = discovery_manifest_candidates(&absolute_start)
+                .into_iter()
+                .find(|candidate| {
+                    fs::canonicalize(candidate).is_ok_and(|path| path == manifest_identity)
+                })
+                .and_then(|candidate| candidate.parent().map(Path::to_path_buf))
+            {
+                self.insert_alias(&alias_root, &manifest.root)
+                    .map_err(|error| package_path_manifest_error(&manifest.path, error))?;
+            }
+        }
+        Ok(manifest)
+    }
+
+    /// 在文件系统读取前准备普通或 `包:` 导入的可信根并完成词法授权。
+    fn prepare_import(
+        &mut self,
+        current_base: &Path,
+        requested_or_joined: &Path,
+        allow_cross_package: bool,
+    ) -> Result<(), ManifestError> {
+        self.validate_requested_portability(requested_or_joined)
+            .map_err(|error| package_path_manifest_error(requested_or_joined, error))?;
+        if let Err(discovery_error) = self.insert_discovered(requested_or_joined) {
+            self.validate_requested_import(current_base, requested_or_joined, allow_cross_package)
+                .map_err(|error| package_path_manifest_error(requested_or_joined, error))?;
+            return Err(discovery_error);
+        }
+        self.validate_requested_import(current_base, requested_or_joined, allow_cross_package)
+            .map_err(|error| package_path_manifest_error(requested_or_joined, error))
+    }
+
+    /// 完成模块导入授权并返回解析阶段已经打开的最终文件句柄。
+    #[doc(hidden)]
+    pub fn resolve_import_file(
+        &mut self,
+        current_base: &Path,
+        requested_or_joined: &Path,
+        allow_cross_package: bool,
+    ) -> Result<(ResolvedImportFile, ModuleAuthority), ManifestError> {
+        self.prepare_import(current_base, requested_or_joined, allow_cross_package)?;
+        let resolved_requested = resolve_existing_discovered_path(requested_or_joined)?;
+        let requested_for_resolution = resolved_requested.as_deref().unwrap_or(requested_or_joined);
+        let resolved = match self
+            .resolve_existing_module_file(requested_for_resolution)
+            .map_err(|error| package_path_manifest_error(requested_or_joined, error))?
+        {
+            Some(resolved) => ResolvedImportFile::package(resolved),
+            None => {
+                let canonical = fs::canonicalize(requested_for_resolution).map_err(|error| {
+                    manifest_error(
+                        requested_or_joined,
+                        None,
+                        format!("不能定位模块路径：{error}"),
+                    )
+                })?;
+                self.insert_discovered(&canonical)?;
+                match self
+                    .resolve_existing_module_file(&canonical)
+                    .map_err(|error| package_path_manifest_error(&canonical, error))?
+                {
+                    Some(resolved) => ResolvedImportFile::package(resolved),
+                    None => ResolvedImportFile::external(canonical),
+                }
+            }
+        };
+        let canonical = resolved.path().to_path_buf();
+        self.insert_discovered(&canonical)?;
+        let resolved_current = resolve_existing_discovered_path(current_base)?;
+        let current_for_authority = resolved_current.as_deref().unwrap_or(current_base);
+        let authority = self
+            .authorize_import(
+                current_for_authority,
+                requested_for_resolution,
+                &canonical,
+                allow_cross_package,
+            )
+            .map_err(|error| package_path_manifest_error(requested_or_joined, error))?;
+        Ok((resolved, authority))
+    }
+}
+
+fn open_external_module_file(path: &Path) -> Result<ResolvedPackageFile, ManifestError> {
+    open_external_module_file_with_hook(path, || Ok(()))
+}
+
+fn open_external_module_file_with_hook(
+    path: &Path,
+    before_bound_open: impl FnOnce() -> Result<(), ManifestError>,
+) -> Result<ResolvedPackageFile, ManifestError> {
+    let canonical = path.to_path_buf();
+    let before_file = open_regular_file_for_snapshot(&canonical)
+        .map_err(|error| manifest_error(&canonical, None, format!("不能预先打开模块：{error}")))?;
+    let before = before_file.metadata().map_err(|error| {
+        manifest_error(&canonical, None, format!("不能检查预先打开的模块：{error}"))
+    })?;
+    if !is_regular_file_metadata(&before) {
+        return Err(manifest_error(
+            &canonical,
+            None,
+            "模块必须是普通文件，不得为符号链接或特殊文件",
+        ));
+    }
+    before_bound_open()?;
+    let file = open_regular_file_for_snapshot(&canonical)
+        .map_err(|error| manifest_error(&canonical, None, format!("不能打开模块：{error}")))?;
+    let opened = file.metadata().map_err(|error| {
+        manifest_error(&canonical, None, format!("不能检查已打开的模块：{error}"))
+    })?;
+    let verified = fs::canonicalize(path)
+        .map_err(|error| manifest_error(path, None, format!("不能复验模块路径：{error}")))?;
+    let verification = open_regular_file_for_snapshot(&verified).map_err(|error| {
+        manifest_error(
+            &verified,
+            None,
+            format!("不能重新打开模块以复验身份：{error}"),
+        )
+    })?;
+    let verified_metadata = verification
+        .metadata()
+        .map_err(|error| manifest_error(&verified, None, format!("不能复验模块身份：{error}")))?;
+    let before_matches_opened =
+        same_opened_file_identity(&before_file, &file).map_err(|error| {
+            manifest_error(
+                &canonical,
+                None,
+                format!("不能比较模块打开前后的身份：{error}"),
+            )
+        })?;
+    let opened_matches_verified =
+        same_opened_file_identity(&file, &verification).map_err(|error| {
+            manifest_error(&canonical, None, format!("不能复验模块文件身份：{error}"))
+        })?;
+    if verified != canonical
+        || !is_regular_file_metadata(&opened)
+        || !is_regular_file_metadata(&verified_metadata)
+        || !before_matches_opened
+        || !opened_matches_verified
+    {
+        return Err(manifest_error(
+            &canonical,
+            None,
+            "模块在解析期间被替换或经目录重定向改变了身份",
+        ));
+    }
+    Ok(ResolvedPackageFile::new(canonical, file))
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<Manifest, ManifestError> {
@@ -4530,6 +4816,18 @@ pub fn read_resolved_regular_file_snapshot(
     read_opened_regular_file_snapshot(resolved.into_file(), &path, max_bytes, kind)
 }
 
+/// 只消费安全解析令牌中已经打开的模块句柄。
+#[doc(hidden)]
+pub fn read_resolved_module_source_snapshot(
+    resolved: ResolvedPackageFile,
+) -> Result<String, ManifestError> {
+    let path = resolved.path().to_path_buf();
+    let bytes =
+        read_resolved_regular_file_snapshot(resolved, u64::MAX.saturating_sub(1), "模块源码")?;
+    String::from_utf8(bytes)
+        .map_err(|error| manifest_error(&path, None, format!("模块源码不是 UTF-8：{error}")))
+}
+
 fn read_opened_regular_file_snapshot(
     mut file: fs::File,
     path: &Path,
@@ -4665,7 +4963,64 @@ fn wasi_regular_file_identity(metadata: &rustix::fs::Stat) -> io::Result<(u64, u
     Ok((metadata.st_dev, metadata.st_ino))
 }
 
-#[cfg(not(target_os = "wasi"))]
+#[cfg(windows)]
+fn windows_file_identity(file: &fs::File) -> io::Result<(u64, [u8; 16])> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = MaybeUninit::<FILE_ID_INFO>::zeroed();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            information.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok((
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    ))
+}
+
+#[cfg(all(unix, not(target_os = "wasi")))]
+fn same_opened_file_identity(left: &fs::File, right: &fs::File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
+fn same_opened_file_identity(left: &fs::File, right: &fs::File) -> io::Result<bool> {
+    Ok(windows_file_identity(left)? == windows_file_identity(right)?)
+}
+
+#[cfg(target_os = "wasi")]
+fn same_opened_file_identity(left: &fs::File, right: &fs::File) -> io::Result<bool> {
+    let left = rustix::fs::fstat(left).map_err(io::Error::from)?;
+    let right = rustix::fs::fstat(right).map_err(io::Error::from)?;
+    Ok(wasi_regular_file_identity(&left)? == wasi_regular_file_identity(&right)?)
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
+fn same_opened_file_identity(left: &fs::File, right: &fs::File) -> io::Result<bool> {
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.is_file()
+        && right.is_file()
+        && left.len() == right.len()
+        && left.created().ok() == right.created().ok())
+}
+
 fn is_regular_file_metadata(metadata: &fs::Metadata) -> bool {
     metadata.is_file()
         && !metadata.file_type().is_symlink()
@@ -4680,7 +5035,7 @@ fn standard_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-#[cfg(all(not(windows), not(target_os = "wasi")))]
+#[cfg(not(windows))]
 fn standard_metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
     false
 }
@@ -6364,6 +6719,62 @@ mod tests {
         fs::remove_dir_all(relative_root).unwrap();
     }
 
+    #[test]
+    fn discovers_the_deepest_unicode_equivalent_nested_project() {
+        let root = temp("unicode-nested-discovery");
+        let nested = root.join("packages/é");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='外层'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言「外层」；\n");
+        write(
+            &nested.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='内层'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&nested.join("主.yx"), "言「内层」；\n");
+
+        let manifest = discover(root.join("packages/e\u{301}")).unwrap().unwrap();
+        assert_eq!(manifest.name, "内层");
+        assert_eq!(
+            fs::canonicalize(&manifest.root).unwrap(),
+            fs::canonicalize(&nested).unwrap()
+        );
+        let case_error = discover(root.join("packages/É")).unwrap_err();
+        assert_eq!(case_error.code(), PACKAGE_PATH_NON_PORTABLE_CODE);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_resolution_uses_the_discovered_unicode_equivalent_nested_root() {
+        let root = temp("unicode-nested-import");
+        let nested = root.join("packages/é");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='外层'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言「外层」；\n");
+        write(
+            &nested.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='内层'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&nested.join("主.yx"), "言「内层」；\n");
+
+        let requested = root.join("packages/e\u{301}/主.yx");
+        let mut roots = TrustedPackageRoots::default();
+        let (resolved, authority) = roots
+            .resolve_import_file(requested.parent().unwrap(), &requested, false)
+            .unwrap();
+        assert!(authority.is_verified());
+        assert_eq!(
+            read_resolved_module_source_snapshot(resolved.open().unwrap()).unwrap(),
+            "言「内层」；\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn write_archive(path: &Path, files: &[(&str, &[u8])]) {
         let file = fs::File::create(path).unwrap();
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
@@ -7587,6 +7998,78 @@ mod tests {
         fs::remove_dir_all(root).ok();
         fs::remove_dir_all(backup).ok();
         fs::remove_dir_all(output_root).ok();
+    }
+
+    #[test]
+    fn external_module_resolution_reads_only_from_its_bound_handle() {
+        let root = temp("external-module-handle");
+        let requested = root.join("模块.yx");
+        write(&requested, "言「外部模块」；\n");
+        let mut roots = TrustedPackageRoots::default();
+        let (resolved, authority) = roots.resolve_import_file(&root, &requested, false).unwrap();
+        assert!(!authority.is_verified());
+
+        let resolved = resolved.open().unwrap();
+        assert_eq!(
+            read_resolved_module_source_snapshot(resolved).unwrap(),
+            "言「外部模块」；\n"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn external_module_open_rejects_replacement_before_binding() {
+        let root = temp("external-module-replacement");
+        let module = root.join("模块.yx");
+        let original = root.join("原模块.yx");
+        write(&module, "言「可信」；\n");
+        let canonical = fs::canonicalize(&module).unwrap();
+
+        let error = open_external_module_file_with_hook(&canonical, || {
+            fs::rename(&canonical, &original).map_err(|error| {
+                manifest_error(&canonical, None, format!("不能模拟模块替换：{error}"))
+            })?;
+            write(&canonical, "言「替换」；\n");
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.message.contains("被替换"), "{error}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn resolved_module_handle_survives_package_root_replacement() {
+        let root = temp("resolved-module-root");
+        let requested = root.join("src/模块.yx");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='根句柄回归'\n版本='1.0.0'\n入口='src/模块.yx'\n",
+        );
+        write(&requested, "言「可信根」；\n");
+        let mut roots = TrustedPackageRoots::default();
+        roots.insert(&root).unwrap();
+        let (resolved, authority) = roots
+            .resolve_import_file(requested.parent().unwrap(), &requested, false)
+            .unwrap();
+        assert!(authority.is_verified());
+
+        let backup = root.with_extension("original");
+        fs::rename(&root, &backup).unwrap();
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='根句柄回归'\n版本='1.0.0'\n入口='src/模块.yx'\n",
+        );
+        write(&requested, "言「替换根」；\n");
+
+        let resolved = resolved.open().unwrap();
+        assert_eq!(
+            read_resolved_module_source_snapshot(resolved).unwrap(),
+            "言「可信根」；\n"
+        );
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
     }
 
     #[test]

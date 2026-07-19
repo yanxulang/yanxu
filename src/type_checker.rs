@@ -26,6 +26,34 @@ impl fmt::Display for TypeError {
     }
 }
 
+impl TypeError {
+    #[doc(hidden)]
+    pub fn code(&self) -> &'static str {
+        match self.message.split_once(']').map(|(code, _)| code) {
+            Some("[PACKAGE_MODULE_RESERVED_PATH") => {
+                crate::package::PACKAGE_MODULE_RESERVED_PATH_CODE
+            }
+            Some("[PACKAGE_PATH_NON_PORTABLE") => crate::package::PACKAGE_PATH_NON_PORTABLE_CODE,
+            Some("[PACKAGE_PATH_INVALID") => crate::package::PACKAGE_PATH_INVALID_CODE,
+            Some("[PACKAGE_ROOT_INVALID") => crate::package::PACKAGE_ROOT_INVALID_CODE,
+            Some("[PACKAGE_MODULE_OUTSIDE_ROOT") => {
+                crate::package::PACKAGE_MODULE_OUTSIDE_ROOT_CODE
+            }
+            Some("[PACKAGE_PATH_RESERVED") => crate::package::PACKAGE_PATH_RESERVED_CODE,
+            Some("[PACKAGE_PATH_COLLISION") => crate::package::PACKAGE_PATH_COLLISION_CODE,
+            _ => "TYPE000",
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn diagnostic_message(&self) -> &str {
+        self.message
+            .strip_prefix('[')
+            .and_then(|message| message.split_once("] ").map(|(_, message)| message))
+            .unwrap_or(&self.message)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum StaticType {
     Any,
@@ -363,11 +391,7 @@ pub fn check_in_directory(
 ) -> Result<(), Vec<TypeError>> {
     let mut checker = Checker::new();
     let directory = directory.as_ref();
-    checker.current_dir = Some(directory.to_path_buf());
-    checker.package_root = crate::package::discover(directory)
-        .ok()
-        .flatten()
-        .map(|manifest| manifest.root);
+    checker.configure_directory(statements, directory);
     checker.check_root_module(statements);
     checker.finish()
 }
@@ -379,11 +403,7 @@ pub fn check_in_directory_with_permissions(
 ) -> Result<(), Vec<TypeError>> {
     let mut checker = Checker::new();
     let directory = directory.as_ref();
-    checker.current_dir = Some(directory.to_path_buf());
-    checker.package_root = crate::package::discover(directory)
-        .ok()
-        .flatten()
-        .map(|manifest| manifest.root);
+    checker.configure_directory(statements, directory);
     checker.permissions = Some(permissions);
     checker.check_root_module(statements);
     checker.finish()
@@ -399,7 +419,7 @@ struct Checker {
     current_method_static: bool,
     current_dir: Option<PathBuf>,
     package_root: Option<PathBuf>,
-    package_module_roots: Vec<PathBuf>,
+    package_module_roots: crate::package::TrustedPackageRoots,
     module_cache: HashMap<PathBuf, ModuleSummary>,
     loading_modules: Vec<PathBuf>,
     module_contexts: Vec<ModuleContext>,
@@ -418,12 +438,57 @@ impl Checker {
             current_method_static: false,
             current_dir: None,
             package_root: None,
-            package_module_roots: Vec::new(),
+            package_module_roots: crate::package::TrustedPackageRoots::default(),
             module_cache: HashMap::new(),
             loading_modules: Vec::new(),
             module_contexts: Vec::new(),
             permissions: None,
         }
+    }
+
+    fn configure_directory(&mut self, statements: &[Stmt], directory: &Path) {
+        self.current_dir =
+            Some(fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf()));
+        let span = statements
+            .first()
+            .map_or_else(Span::synthetic, |statement| statement.span.clone());
+        let manifest = match crate::package::discover(directory) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.coded_error(
+                    error.code(),
+                    format!("{}：{}", error.path.display(), error.diagnostic_message()),
+                    span,
+                );
+                return;
+            }
+        };
+        let Some(manifest) = manifest else {
+            return;
+        };
+        let root = match fs::canonicalize(&manifest.root) {
+            Ok(root) => root,
+            Err(error) => {
+                self.error(
+                    format!("不能定位包根目录“{}”：{error}", manifest.root.display()),
+                    span,
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.package_module_roots.insert(&root) {
+            self.package_path_error(error, span);
+            return;
+        }
+        if let Some(source) = statements
+            .first()
+            .and_then(|statement| existing_source_path(&statement.span.source.name))
+            && let Err(error) = self.package_module_roots.authorize_module(&source, &source)
+        {
+            self.package_path_error(error, span);
+            return;
+        }
+        self.package_root = Some(root);
     }
 
     fn finish(self) -> Result<(), Vec<TypeError>> {
@@ -1577,6 +1642,10 @@ impl Checker {
         requested: &str,
         import_span: &Span,
     ) -> Option<ModuleSummary> {
+        if let Err(error) = crate::package::validate_portable_path_text(requested) {
+            self.package_path_error(error, import_span.clone());
+            return None;
+        }
         if let Some(name) = requested.strip_prefix("标准:") {
             return standard_module_shape(name)
                 .map(|shape| standard_summary(name, shape, import_span))
@@ -1586,47 +1655,63 @@ impl Checker {
                 });
         }
         let current_dir = self.current_dir.clone()?;
-        let joined = if let Some(name) = requested.strip_prefix("包:") {
+        let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
             match crate::package::resolve_dependency_scoped(
                 self.package_root.as_deref(),
                 &current_dir,
                 name,
             ) {
                 Ok(dependency) => {
-                    if !self.package_module_roots.contains(&dependency.root) {
-                        self.package_module_roots.push(dependency.root);
+                    if let Err(error) = self.package_module_roots.insert(&dependency.root) {
+                        self.package_path_error(error, import_span.clone());
+                        return None;
                     }
-                    dependency.entry
+                    (dependency.entry, true)
                 }
                 Err(error) => {
-                    self.error(error.to_string(), import_span.clone());
+                    self.coded_error(
+                        error.code(),
+                        format!("{}：{}", error.path.display(), error.diagnostic_message()),
+                        import_span.clone(),
+                    );
                     return None;
                 }
             }
         } else {
             let requested = Path::new(requested);
             if requested.is_absolute() {
-                requested.to_path_buf()
+                (requested.to_path_buf(), false)
             } else {
-                current_dir.join(requested)
+                (current_dir.join(requested), false)
             }
         };
-        let canonical = match fs::canonicalize(&joined) {
-            Ok(path) => path,
+        if !package_import
+            && self.package_module_roots.matching_root(&joined).is_none()
+            && let Some(permissions) = &self.permissions
+            && let Err(error) = permissions.check_file(&joined)
+        {
+            self.error(error.to_string(), import_span.clone());
+            return None;
+        }
+        let (resolved, authority) = match self.package_module_roots.resolve_import_file(
+            &current_dir,
+            &joined,
+            package_import,
+        ) {
+            Ok(resolved) => resolved,
             Err(error) => {
-                self.error(
-                    format!("不能读取模块“{}”：{error}", joined.display()),
+                self.coded_error(
+                    error.code(),
+                    format!("{}：{}", error.path.display(), error.diagnostic_message()),
                     import_span.clone(),
                 );
                 return None;
             }
         };
+        let canonical = resolved.path().to_path_buf();
         if let Some(permissions) = &self.permissions
             && let Err(error) = permissions.check_file(&canonical)
-            && !self
-                .package_module_roots
-                .iter()
-                .any(|root| canonical.starts_with(root))
+            && !authority.is_verified()
         {
             self.error(error.to_string(), import_span.clone());
             return None;
@@ -1650,7 +1735,18 @@ impl Checker {
             );
             return None;
         }
-        let source = match fs::read_to_string(&canonical) {
+        let resolved = match resolved.open() {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.coded_error(
+                    error.code(),
+                    format!("{}：{}", error.path.display(), error.diagnostic_message()),
+                    import_span.clone(),
+                );
+                return None;
+            }
+        };
+        let source = match crate::package::read_resolved_module_source_snapshot(resolved) {
             Ok(source) => source,
             Err(error) => {
                 self.error(
@@ -1902,10 +1998,23 @@ impl Checker {
     }
 
     fn error(&mut self, message: impl Into<String>, span: Span) {
+        self.coded_error("TYPE000", message, span);
+    }
+
+    fn coded_error(&mut self, code: &'static str, message: impl Into<String>, span: Span) {
+        let message = message.into();
         self.errors.push(TypeError {
-            message: message.into(),
+            message: if matches!(code, "TYPE000" | "PACKAGE000") {
+                message
+            } else {
+                format!("[{code}] {message}")
+            },
             span,
         });
+    }
+
+    fn package_path_error(&mut self, error: crate::package::PackagePathError, span: Span) {
+        self.coded_error(error.code, error.diagnostic_message(), span);
     }
 }
 
