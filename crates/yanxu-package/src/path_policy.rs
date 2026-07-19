@@ -2885,7 +2885,7 @@ fn cap_metadata_is_reparse(_metadata: &cap_std::fs::Metadata) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "wasi")))]
-fn same_opened_directory_identity(
+pub(crate) fn same_opened_directory_identity(
     left: &cap_std::fs::Dir,
     right: &cap_std::fs::Dir,
 ) -> io::Result<bool> {
@@ -2897,7 +2897,7 @@ fn same_opened_directory_identity(
 }
 
 #[cfg(windows)]
-fn same_opened_directory_identity(
+pub(crate) fn same_opened_directory_identity(
     left: &cap_std::fs::Dir,
     right: &cap_std::fs::Dir,
 ) -> io::Result<bool> {
@@ -2932,7 +2932,7 @@ fn same_opened_directory_identity(
 }
 
 #[cfg(not(any(unix, windows, target_os = "wasi")))]
-fn same_opened_directory_identity(
+pub(crate) fn same_opened_directory_identity(
     left: &cap_std::fs::Dir,
     right: &cap_std::fs::Dir,
 ) -> io::Result<bool> {

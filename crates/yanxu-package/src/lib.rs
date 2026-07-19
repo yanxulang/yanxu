@@ -4,6 +4,7 @@ mod package;
 mod path_policy;
 mod permissions;
 mod storage;
+mod subprocess;
 
 pub use package::*;
 #[doc(hidden)]
