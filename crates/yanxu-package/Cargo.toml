@@ -20,6 +20,8 @@ serde_json = "1.0"
 sha2 = "0.10"
 tar = "0.4"
 toml = "0.8"
+unicode-normalization = "0.1.25"
+url = "2"
 
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 fs2 = "0.4"

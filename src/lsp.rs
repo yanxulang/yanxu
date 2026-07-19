@@ -403,7 +403,12 @@ fn package_completion_items(uri: &str, source: &str, line: usize, column: usize)
                 "kind": 9,
                 "detail": locked.map_or_else(
                     || dependency.to_string(),
-                    |package| format!("{} {} · {}", package.name, package.version, package.source)
+                    |package| format!(
+                        "{} {} · {}",
+                        package.name,
+                        package.version,
+                        crate::package::safe_dependency_source_for_display(&package.source)
+                    )
                 ),
                 "documentation": format!("包:{alias}；输入 / 可选择公开子模块"),
                 "sortText": format!("0-package-{alias}")
@@ -1590,6 +1595,53 @@ mod tests {
                 .unwrap()
                 .contains("锁文件与清单不一致")
         }));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn package_completion_and_diagnostics_redact_unsafe_lock_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "yanxu-lsp-lock-source-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = root.join("app");
+        let dependency = root.join("dependency");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::create_dir_all(&dependency).unwrap();
+        std::fs::write(
+            dependency.join(crate::package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='依赖包'\n版本='1.0.0'\n入口='main.yx'\n",
+        )
+        .unwrap();
+        std::fs::write(dependency.join("main.yx"), "公 定 值 为 1；").unwrap();
+        std::fs::write(
+            app.join(crate::package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='src/主.yx'\n[依赖]\n依赖={包='依赖包',路径='../dependency'}\n",
+        )
+        .unwrap();
+        let entry = app.join("src/主.yx");
+        std::fs::write(&entry, "言 1；").unwrap();
+        let manifest = crate::package::load(app.join(crate::package::MANIFEST_NAME)).unwrap();
+        crate::package::ensure_lock(&manifest, false).unwrap();
+
+        let lock_path = app.join(crate::package::LOCK_NAME);
+        let mut lock = crate::package::read_lock(&lock_path).unwrap();
+        let marker = "lsp-lock-value-must-not-appear";
+        lock.packages[0].source = format!("path:https://user:{marker}@example.invalid/package.git");
+        lock.packages[0].revision = Some(format!("user:{marker}@example.invalid"));
+        std::fs::write(&lock_path, toml::to_string_pretty(&lock).unwrap()).unwrap();
+
+        let uri = url::Url::from_file_path(&entry).unwrap().to_string();
+        let source = "引「包:依";
+        let items = package_completion_items(&uri, source, 1, source.chars().count() + 1);
+        let completion_text = serde_json::to_string(&items).unwrap();
+        assert!(!completion_text.contains(marker), "{completion_text}");
+
+        let diagnostic_text = serde_json::to_string(&diagnostics("言 1；", &uri)).unwrap();
+        assert!(!diagnostic_text.contains(marker), "{diagnostic_text}");
         std::fs::remove_dir_all(root).ok();
     }
 

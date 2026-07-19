@@ -211,28 +211,30 @@ fn dependency_from_request(request: &Value) -> Result<Dependency, EngineeringErr
         .map(VersionReq::parse)
         .transpose()
         .map_err(|error| engineering_error(format!("版本要求无效：{error}")))?;
-    match source {
-        "path" => Ok(Dependency::Path {
+    let dependency = match source {
+        "path" => Dependency::Path {
             path: required_string(request, "source_value")?.into(),
             requirement,
-        }),
-        "git" => Ok(Dependency::Git {
+        },
+        "git" => Dependency::Git {
             url: required_string(request, "source_value")?.into(),
             revision: optional_string(request, "revision")
                 .unwrap_or("HEAD")
                 .into(),
             requirement,
-        }),
-        "registry" => Ok(Dependency::Registry {
+        },
+        "registry" => Dependency::Registry {
             requirement: requirement.unwrap_or(VersionReq::STAR),
             registry: optional_string(request, "source_value")
                 .unwrap_or(package::DEFAULT_REGISTRY)
                 .into(),
-        }),
-        other => Err(engineering_error(format!(
-            "依赖来源只可为 path、git 或 registry，不可为“{other}”"
-        ))),
-    }
+        },
+        _ => {
+            return Err(engineering_error("依赖来源只可为 path、git 或 registry"));
+        }
+    };
+    package::validate_dependency_source_security(&dependency).map_err(engineering_error)?;
+    Ok(dependency)
 }
 
 fn resolve_graph(request: &Value) -> Result<Value, EngineeringError> {
@@ -273,16 +275,24 @@ fn plan_update(request: &Value) -> Result<Value, EngineeringError> {
                     "to_id": planned_id,
                     "from_version": dependency.locked.version,
                     "to_version": planned_dependency.locked.version,
-                    "from_revision": dependency.locked.revision,
-                    "to_revision": planned_dependency.locked.revision,
-                    "source": planned_dependency.locked.source,
+                    "from_revision": dependency
+                        .locked
+                        .revision
+                        .as_deref()
+                        .map(package::safe_git_revision_for_display),
+                    "to_revision": planned_dependency
+                        .locked
+                        .revision
+                        .as_deref()
+                        .map(package::safe_git_revision_for_display),
+                    "source": package::safe_dependency_source_for_display(&planned_dependency.locked.source),
                 })),
                 None => Some(json!({
                     "kind": "add",
                     "name": planned_dependency.locked.name,
                     "to_id": planned_id,
                     "to_version": planned_dependency.locked.version,
-                    "source": planned_dependency.locked.source,
+                    "source": package::safe_dependency_source_for_display(&planned_dependency.locked.source),
                 })),
             }
         })
@@ -302,7 +312,7 @@ fn plan_update(request: &Value) -> Result<Value, EngineeringError> {
                 "name": dependency.locked.name,
                 "from_id": id,
                 "from_version": dependency.locked.version,
-                "source": dependency.locked.source,
+                "source": package::safe_dependency_source_for_display(&dependency.locked.source),
             })
         });
     let mut changes = changes;
@@ -523,7 +533,10 @@ fn audit_findings(
                 "warning",
                 "AUDIT_INSECURE_SOURCE",
                 package_name,
-                format!("依赖来源未使用 HTTPS 或 SSH：{}", dependency.locked.source),
+                format!(
+                    "依赖来源未使用 HTTPS 或 SSH：{}",
+                    package::safe_dependency_source_for_display(&dependency.locked.source)
+                ),
             ));
         }
         if let Some(registry) = dependency.locked.source.strip_prefix("registry:") {
@@ -542,7 +555,12 @@ fn audit_findings(
                 package_name,
                 format!(
                     "Git 依赖锁文件未固定 40 位提交修订：{}",
-                    dependency.locked.revision.as_deref().unwrap_or("<缺失>")
+                    dependency
+                        .locked
+                        .revision
+                        .as_deref()
+                        .map(package::safe_git_revision_for_display)
+                        .unwrap_or_else(|| "<缺失>".into())
                 ),
             ));
         }
@@ -635,8 +653,10 @@ fn audit_declared_dependencies(manifest: &Manifest, findings: &mut Vec<AuditFind
                 "AUDIT_GIT_SYMBOLIC_REVISION",
                 package_name.as_str(),
                 format!(
-                    "{} 通过符号修订 {revision} 声明 Git 依赖 {url}；锁文件虽固定提交，显式更新仍可能改变来源",
-                    manifest.name
+                    "{} 通过符号修订 {} 声明 Git 依赖 {}；锁文件虽固定提交，显式更新仍可能改变来源",
+                    manifest.name,
+                    package::safe_git_revision_for_display(revision),
+                    package::safe_git_source_value_for_display(url)
                 ),
             ));
         }
@@ -659,7 +679,10 @@ fn audit_registry_dependency(
             "warning",
             "AUDIT_REGISTRY_METADATA_MISSING",
             locked.name.as_str(),
-            format!("索引中缺少当前锁定版本的可审计元数据：{}", locked.source),
+            format!(
+                "索引中缺少当前锁定版本的可审计元数据：{}",
+                package::safe_dependency_source_for_display(&locked.source)
+            ),
         ));
         return Ok(());
     };
@@ -676,7 +699,10 @@ fn audit_registry_dependency(
             "warning",
             "AUDIT_INSECURE_SOURCE",
             locked.name.as_str(),
-            format!("索引制品地址未使用 HTTPS：{}", metadata.url),
+            format!(
+                "索引制品地址未使用 HTTPS：{}",
+                package::safe_artifact_source_value_for_display(&metadata.url)
+            ),
         ));
     }
     match metadata.yanked {
@@ -732,7 +758,12 @@ fn audit_registry_dependency(
         let reference = vulnerability
             .url
             .as_deref()
-            .map_or_else(String::new, |url| format!("（{url}）"));
+            .map_or_else(String::new, |url| {
+                format!(
+                    "（{}）",
+                    package::safe_advisory_source_value_for_display(url)
+                )
+            });
         findings.push(AuditFinding::new(
             severity,
             code,
@@ -747,10 +778,13 @@ fn audit_registry_dependency(
 }
 
 fn secure_registry_artifact_source(registry: &str, source: &str) -> bool {
-    if registry.starts_with("https://") {
-        source.starts_with("https://")
+    if package::secure_https_source(registry) {
+        package::secure_https_source(source)
     } else {
-        source.starts_with("https://") || source.starts_with("file://") || !source.contains("://")
+        package::validate_artifact_source_security(source).is_ok()
+            && (package::secure_https_source(source)
+                || source.starts_with("file://")
+                || !source.contains("://"))
     }
 }
 
@@ -1006,7 +1040,7 @@ fn dependency_json(dependency: &Dependency) -> Value {
     match dependency {
         Dependency::Path { path, requirement } => json!({
             "source": "path",
-            "source_value": path,
+            "source_value": package::safe_local_source_path_for_display(path),
             "version": requirement.as_ref().map(ToString::to_string),
         }),
         Dependency::Git {
@@ -1015,8 +1049,8 @@ fn dependency_json(dependency: &Dependency) -> Value {
             requirement,
         } => json!({
             "source": "git",
-            "source_value": url,
-            "revision": revision,
+            "source_value": package::safe_git_source_value_for_display(url),
+            "revision": package::safe_git_revision_for_display(revision),
             "version": requirement.as_ref().map(ToString::to_string),
         }),
         Dependency::Registry {
@@ -1024,7 +1058,7 @@ fn dependency_json(dependency: &Dependency) -> Value {
             registry,
         } => json!({
             "source": "registry",
-            "source_value": registry,
+            "source_value": package::safe_registry_source_value_for_display(registry),
             "version": requirement.to_string(),
         }),
     }
@@ -1040,8 +1074,8 @@ fn graph_json(manifest: &Manifest, graph: &ResolutionGraph) -> Value {
             "id": id,
             "name": dependency.locked.name,
             "version": dependency.locked.version,
-            "source": dependency.locked.source,
-            "revision": dependency.locked.revision,
+            "source": package::safe_dependency_source_for_display(&dependency.locked.source),
+            "revision": dependency.locked.revision.as_deref().map(package::safe_git_revision_for_display),
             "checksum": dependency.locked.checksum,
             "root": dependency.root,
             "entry": dependency.entry,
@@ -1258,7 +1292,7 @@ mod tests {
         let mut index = json!({
             "versions": [{
                 "version": "1.2.3",
-                "url": "ftp://packages.example.invalid/索引包-1.2.3.tar.gz",
+                "url": "https://packages.example.invalid/索引包-1.2.3.tar.gz",
                 "checksum": "a".repeat(64),
                 "yanked": false,
                 "vulnerabilities": [
@@ -1310,11 +1344,228 @@ mod tests {
             .filter_map(|finding| finding["code"].as_str())
             .collect::<std::collections::BTreeSet<_>>();
         assert!(codes.contains("AUDIT_YANKED"));
-        assert!(codes.contains("AUDIT_INSECURE_SOURCE"));
+        assert!(!codes.contains("AUDIT_INSECURE_SOURCE"));
         assert!(codes.contains("AUDIT_VULNERABILITY_YXSA_2026_0001"));
         assert!(!codes.contains("AUDIT_VULNERABILITY_YXSA_2026_0000"));
         assert!(codes.contains("AUDIT_VULNERABILITY_METADATA_INVALID"));
         assert!(!codes.contains("AUDIT_VULNERABILITY_METADATA_MISSING"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn engineering_source_inputs_and_json_outputs_do_not_echo_credentials() {
+        let root = temporary_root("source-redaction");
+        write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n",
+        );
+        write(root.join("main.yx"), "言 1；\n");
+        let mut manifest = package::load(root.join(package::MANIFEST_NAME)).unwrap();
+        let marker = "engineering-value-must-not-appear";
+        let unsafe_git_url = format!("https://user:{marker}@example.invalid/package.git");
+        let unsafe_revision = format!("https://user:{marker}@example.invalid/revision");
+        let unsafe_git = Dependency::Git {
+            url: unsafe_git_url.clone(),
+            revision: unsafe_revision.clone(),
+            requirement: None,
+        };
+        let unsafe_registry = Dependency::Registry {
+            requirement: VersionReq::STAR,
+            registry: format!("https://packages.example.invalid/v1?access_token={marker}"),
+        };
+
+        let source_kind = format!("https://user:{marker}@example.invalid/source-kind");
+        let source_kind_error = dependency_from_request(&json!({"source": source_kind}))
+            .unwrap_err()
+            .to_string();
+        assert!(!source_kind_error.contains(marker), "{source_kind_error}");
+
+        for request in [
+            json!({
+                "source": "git",
+                "source_value": unsafe_git_url,
+                "revision": "HEAD",
+            }),
+            json!({
+                "source": "git",
+                "source_value": "https://example.invalid/package.git",
+                "revision": unsafe_revision,
+            }),
+        ] {
+            let error = dependency_from_request(&request).unwrap_err().to_string();
+            assert!(!error.contains(marker), "{error}");
+        }
+
+        let unsafe_path = Dependency::Path {
+            path: PathBuf::from(format!("../dependency?authorization_code={marker}")),
+            requirement: None,
+        };
+        let encoded_registry = Dependency::Registry {
+            requirement: VersionReq::STAR,
+            registry: format!(
+                "https://packages.example.invalid/v1?%252561ccess_%252574oken={marker}"
+            ),
+        };
+        for dependency in [&unsafe_git, &unsafe_path, &encoded_registry] {
+            let output = serde_json::to_string(&dependency_json(dependency)).unwrap();
+            assert!(!output.contains(marker), "{output}");
+            let display = dependency.to_string();
+            assert!(!display.contains(marker), "{display}");
+        }
+
+        manifest
+            .dependencies
+            .insert("git-fixture".into(), unsafe_git.clone());
+        manifest
+            .dependency_packages
+            .insert("git-fixture".into(), "git-fixture".into());
+        manifest
+            .dev_dependencies
+            .insert("registry-fixture".into(), unsafe_registry);
+        manifest
+            .dev_dependency_packages
+            .insert("registry-fixture".into(), "registry-fixture".into());
+        let manifest_text = serde_json::to_string(&manifest_json(&manifest)).unwrap();
+        assert!(!manifest_text.contains(marker), "{manifest_text}");
+
+        let graph = ResolutionGraph {
+            root_dependencies: BTreeMap::from([("git-fixture".into(), "git-fixture@1.0.0".into())]),
+            root_dev_dependencies: BTreeMap::new(),
+            packages: BTreeMap::from([(
+                "git-fixture@1.0.0".into(),
+                package::ResolvedDependency {
+                    locked: package::LockedPackage {
+                        id: "git-fixture@1.0.0".into(),
+                        name: "git-fixture".into(),
+                        version: "1.0.0".into(),
+                        source: format!("git:{unsafe_git_url}"),
+                        revision: Some(format!("user:{marker}@example.invalid")),
+                        checksum: "0".repeat(64),
+                        entry: "main.yx".into(),
+                        dependencies: BTreeMap::new(),
+                        exports: BTreeMap::new(),
+                        target: package::current_target(),
+                        native: None,
+                        minimum_yanxu: None,
+                    },
+                    root: root.clone(),
+                    entry: root.join("main.yx"),
+                },
+            )]),
+            target: package::current_target(),
+        };
+        let graph_text = serde_json::to_string(&graph_json(&manifest, &graph)).unwrap();
+        assert!(!graph_text.contains(marker), "{graph_text}");
+
+        let mut findings = Vec::new();
+        audit_declared_dependencies(&manifest, &mut findings);
+        assert!(!findings.is_empty());
+        for finding in findings {
+            assert!(!finding.message.contains(marker), "{}", finding.message);
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn plan_update_rejects_unsafe_locked_revision_without_echoing_it() {
+        let root = temporary_root("plan-update-source-redaction");
+        let application = root.join("application");
+        let dependency = root.join("dependency");
+        write(
+            dependency.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='fixture'\n版本='1.0.0'\n入口='main.yx'\n",
+        );
+        write(dependency.join("main.yx"), "公 定 值 为 1；\n");
+        write(
+            application.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture={路径='../dependency'}\n",
+        );
+        write(application.join("main.yx"), "言 1；\n");
+        let manifest = package::load(application.join(package::MANIFEST_NAME)).unwrap();
+        package::ensure_lock(&manifest, false).unwrap();
+
+        let lock_path = application.join(package::LOCK_NAME);
+        let mut lock = package::read_lock(&lock_path).unwrap();
+        let marker = "plan-update-revision-must-not-appear";
+        lock.packages[0].revision = Some(format!("https://user:{marker}@example.invalid/revision"));
+        write(&lock_path, toml::to_string_pretty(&lock).unwrap());
+
+        let error = plan_update(&json!({
+            "path": application,
+            "offline": true,
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains(marker), "{error}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audit_rejects_unsafe_advisory_references_without_echoing_values() {
+        let root = temporary_root("audit-advisory-source");
+        let application = root.join("application");
+        let registry = root.join("registry");
+        let dependency_root = registry.join("fixture/1.0.0");
+        write(
+            application.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n",
+        );
+        write(application.join("main.yx"), "言 1；\n");
+        write(
+            dependency_root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='fixture'\n版本='1.0.0'\n入口='main.yx'\n许可='MIT'\n",
+        );
+        write(dependency_root.join("main.yx"), "公 定 值：数 为 1；\n");
+        let marker = "audit-value-must-not-appear";
+        write(
+            registry.join("fixture/index.json"),
+            serde_json::to_vec_pretty(&json!({
+                "versions": [{
+                    "version": "1.0.0",
+                    "url": "https://example.invalid/fixture.tar.gz",
+                    "checksum": "a".repeat(64),
+                    "vulnerabilities": [{
+                        "id": "YXSA-2026-0001",
+                        "severity": "high",
+                        "summary": "fixture advisory",
+                        "url": format!("https://security.example.invalid/advisory?token={marker}"),
+                    }]
+                }]
+            }))
+            .unwrap(),
+        );
+        let manifest = package::load(application.join(package::MANIFEST_NAME)).unwrap();
+        let graph = ResolutionGraph {
+            root_dependencies: BTreeMap::from([("fixture".into(), "fixture@1.0.0".into())]),
+            root_dev_dependencies: BTreeMap::new(),
+            packages: BTreeMap::from([(
+                "fixture@1.0.0".into(),
+                package::ResolvedDependency {
+                    locked: package::LockedPackage {
+                        id: "fixture@1.0.0".into(),
+                        name: "fixture".into(),
+                        version: "1.0.0".into(),
+                        source: format!("registry:{}", registry.display()),
+                        revision: None,
+                        checksum: "a".repeat(64),
+                        entry: "main.yx".into(),
+                        dependencies: BTreeMap::new(),
+                        exports: BTreeMap::new(),
+                        target: package::current_target(),
+                        native: None,
+                        minimum_yanxu: None,
+                    },
+                    root: dependency_root.clone(),
+                    entry: dependency_root.join("main.yx"),
+                },
+            )]),
+            target: package::current_target(),
+        };
+        let error = match audit_findings(&manifest, &graph, true) {
+            Ok(_) => panic!("unsafe advisory reference was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(!error.contains(marker), "{error}");
         fs::remove_dir_all(root).ok();
     }
 
@@ -1355,10 +1606,15 @@ mod tests {
             "https://packages.example.invalid/v1",
             "https://cdn.example.invalid/package.tar.gz"
         ));
+        assert!(secure_registry_artifact_source(
+            "https://packages.example.invalid/v1",
+            "HTTPS://cdn.example.invalid/package.tar.gz"
+        ));
         for source in [
             "http://cdn.example.invalid/package.tar.gz",
             "ftp://cdn.example.invalid/package.tar.gz",
-            "HTTPS://cdn.example.invalid/package.tar.gz",
+            "https://user@cdn.example.invalid/package.tar.gz",
+            "https://cdn.example.invalid/package.tar.gz?access_token=hidden",
         ] {
             assert!(!secure_registry_artifact_source(
                 "https://packages.example.invalid/v1",
