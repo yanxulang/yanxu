@@ -127,5 +127,9 @@ mod tests {
             #[cfg(not(target_family = "wasm"))]
             native_library(seed);
         }
+
+        let deeply_nested = "[".repeat(768);
+        frontend(deeply_nested.as_bytes());
+        formatting(deeply_nested.as_bytes());
     }
 }

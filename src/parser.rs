@@ -6,6 +6,9 @@ use crate::source::Span;
 use crate::token::{Token, TokenKind};
 use std::fmt;
 
+const MAX_SYNTAX_DEPTH: usize = 32;
+const SYNTAX_DEPTH_ERROR: &str = "语法结构深度不得超过 32 层";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
     pub message: String,
@@ -27,14 +30,25 @@ pub fn parse(tokens: Vec<Token>) -> Result<Vec<Stmt>, ParseError> {
         tokens,
         current: 0,
         scope_depth: 0,
+        statement_depth: 0,
+        expression_depth: 0,
+        type_depth: 0,
     }
     .program()
+}
+
+struct ParsedExpr {
+    expr: Expr,
+    depth: usize,
 }
 
 struct Parser {
     tokens: Vec<Token>,
     current: usize,
     scope_depth: usize,
+    statement_depth: usize,
+    expression_depth: usize,
+    type_depth: usize,
 }
 
 impl Parser {
@@ -47,6 +61,10 @@ impl Parser {
     }
 
     fn declaration(&mut self) -> Result<Stmt, ParseError> {
+        self.with_statement_depth(Self::declaration_inner)
+    }
+
+    fn declaration_inner(&mut self) -> Result<Stmt, ParseError> {
         if self.matches(&TokenKind::Public) {
             let public_span = self.previous().span.clone();
             let mut statement = self.declaration()?;
@@ -389,7 +407,7 @@ impl Parser {
     }
 
     fn set_statement(&mut self, start: Span) -> Result<Stmt, ParseError> {
-        let target = self.call()?;
+        let target = self.with_expression_depth(Self::call)?.expr;
         if !matches!(
             target.kind,
             ExprKind::Variable(_) | ExprKind::Get { .. } | ExprKind::Index { .. }
@@ -507,72 +525,82 @@ impl Parser {
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
-        self.or()
+        Ok(self.parsed_expression()?.expr)
     }
 
-    fn or(&mut self) -> Result<Expr, ParseError> {
+    fn parsed_expression(&mut self) -> Result<ParsedExpr, ParseError> {
+        self.with_expression_depth(Self::or)
+    }
+
+    fn or(&mut self) -> Result<ParsedExpr, ParseError> {
         let mut expr = self.and()?;
         while self.matches(&TokenKind::Or) {
             let operator = self.previous().kind.clone();
             let right = self.and()?;
-            let span = expr.span.through(&right.span);
-            expr = Expr::new(
+            let span = expr.expr.span.through(&right.expr.span);
+            let depth = expr.depth.max(right.depth).saturating_add(1);
+            expr = self.parsed_expr(
                 ExprKind::Binary {
-                    left: Box::new(expr),
+                    left: Box::new(expr.expr),
                     operator,
-                    right: Box::new(right),
+                    right: Box::new(right.expr),
                 },
                 span,
-            );
+                depth,
+            )?;
         }
         Ok(expr)
     }
 
-    fn and(&mut self) -> Result<Expr, ParseError> {
+    fn and(&mut self) -> Result<ParsedExpr, ParseError> {
         let mut expr = self.equality()?;
         while self.matches(&TokenKind::And) {
             let operator = self.previous().kind.clone();
             let right = self.equality()?;
-            let span = expr.span.through(&right.span);
-            expr = Expr::new(
+            let span = expr.expr.span.through(&right.expr.span);
+            let depth = expr.depth.max(right.depth).saturating_add(1);
+            expr = self.parsed_expr(
                 ExprKind::Binary {
-                    left: Box::new(expr),
+                    left: Box::new(expr.expr),
                     operator,
-                    right: Box::new(right),
+                    right: Box::new(right.expr),
                 },
                 span,
-            );
+                depth,
+            )?;
         }
         Ok(expr)
     }
 
-    fn equality(&mut self) -> Result<Expr, ParseError> {
+    fn equality(&mut self) -> Result<ParsedExpr, ParseError> {
         self.binary(
             Self::type_test,
             &[TokenKind::EqualEqual, TokenKind::BangEqual],
         )
     }
 
-    fn type_test(&mut self) -> Result<Expr, ParseError> {
+    fn type_test(&mut self) -> Result<ParsedExpr, ParseError> {
         let mut expr = self.comparison()?;
         while self.matches(&TokenKind::Is) {
             let (kind, type_span) = self.type_union().map_err(|mut error| {
                 error.message = "“是”之后须有完整类型".into();
                 error
             })?;
-            let span = expr.span.through(&type_span);
-            expr = Expr::new(
+            let span = expr.expr.span.through(&type_span);
+            let depth = expr.depth.saturating_add(1);
+            expr = self.parsed_expr(
                 ExprKind::TypeTest {
-                    value: Box::new(expr),
+                    value: Box::new(expr.expr),
                     type_ref: TypeRef::new(kind, type_span),
                 },
                 span,
-            );
+                depth,
+            )?;
         }
         Ok(expr)
     }
 
-    fn comparison(&mut self) -> Result<Expr, ParseError> {
+    fn comparison(&mut self) -> Result<ParsedExpr, ParseError> {
         self.binary(
             Self::term,
             &[
@@ -584,67 +612,73 @@ impl Parser {
         )
     }
 
-    fn term(&mut self) -> Result<Expr, ParseError> {
+    fn term(&mut self) -> Result<ParsedExpr, ParseError> {
         self.binary(Self::factor, &[TokenKind::Plus, TokenKind::Minus])
     }
 
-    fn factor(&mut self) -> Result<Expr, ParseError> {
+    fn factor(&mut self) -> Result<ParsedExpr, ParseError> {
         self.binary(Self::unary, &[TokenKind::Star, TokenKind::Slash])
     }
 
     fn binary(
         &mut self,
-        next: fn(&mut Self) -> Result<Expr, ParseError>,
+        next: fn(&mut Self) -> Result<ParsedExpr, ParseError>,
         operators: &[TokenKind],
-    ) -> Result<Expr, ParseError> {
+    ) -> Result<ParsedExpr, ParseError> {
         let mut expr = next(self)?;
         while operators.iter().any(|kind| self.check(kind)) {
             let operator = self.advance().kind.clone();
             let right = next(self)?;
-            let span = expr.span.through(&right.span);
-            expr = Expr::new(
+            let span = expr.expr.span.through(&right.expr.span);
+            let depth = expr.depth.max(right.depth).saturating_add(1);
+            expr = self.parsed_expr(
                 ExprKind::Binary {
-                    left: Box::new(expr),
+                    left: Box::new(expr.expr),
                     operator,
-                    right: Box::new(right),
+                    right: Box::new(right.expr),
                 },
                 span,
-            );
+                depth,
+            )?;
         }
         Ok(expr)
     }
 
-    fn unary(&mut self) -> Result<Expr, ParseError> {
+    fn unary(&mut self) -> Result<ParsedExpr, ParseError> {
         if self.matches(&TokenKind::Await) {
             let start = self.previous().span.clone();
-            let task = self.unary()?;
-            let span = start.through(&task.span);
-            return Ok(Expr::new(
+            let task = self.with_expression_depth(Self::unary)?;
+            let span = start.through(&task.expr.span);
+            let depth = task.depth.saturating_add(1);
+            return self.parsed_expr(
                 ExprKind::Await {
-                    task: Box::new(task),
+                    task: Box::new(task.expr),
                 },
                 span,
-            ));
+                depth,
+            );
         }
         if self.matches(&TokenKind::Bang)
             || self.matches(&TokenKind::Not)
             || self.matches(&TokenKind::Minus)
         {
             let operator_token = self.previous().clone();
-            let right = self.unary()?;
-            let span = operator_token.span.through(&right.span);
-            return Ok(Expr::new(
+            let right = self.with_expression_depth(Self::unary)?;
+            let span = operator_token.span.through(&right.expr.span);
+            let depth = right.depth.saturating_add(1);
+            return self.parsed_expr(
                 ExprKind::Unary {
                     operator: operator_token.kind,
-                    right: Box::new(right),
+                    right: Box::new(right.expr),
                 },
                 span,
-            ));
+                depth,
+            );
         }
         self.call()
     }
 
-    fn call(&mut self) -> Result<Expr, ParseError> {
+    fn call(&mut self) -> Result<ParsedExpr, ParseError> {
         let mut expr = self.primary()?;
         loop {
             if self.matches(&TokenKind::LeftParen) {
@@ -654,7 +688,7 @@ impl Parser {
                         if arguments.len() >= 255 {
                             return Err(self.error_here("一次调用至多可传 255 个参数"));
                         }
-                        arguments.push(self.expression()?);
+                        arguments.push(self.parsed_expression()?);
                         if !self.matches(&TokenKind::Comma) {
                             break;
                         }
@@ -667,24 +701,37 @@ impl Parser {
                     .consume(&TokenKind::RightParen, "实参之后须有右括号")?
                     .span
                     .clone();
-                let span = expr.span.through(&close);
-                expr = Expr::new(
+                let span = expr.expr.span.through(&close);
+                let depth = arguments
+                    .iter()
+                    .map(|argument| argument.depth)
+                    .max()
+                    .unwrap_or(0)
+                    .max(expr.depth)
+                    .saturating_add(1);
+                expr = self.parsed_expr(
                     ExprKind::Call {
-                        callee: Box::new(expr),
-                        arguments,
+                        callee: Box::new(expr.expr),
+                        arguments: arguments
+                            .into_iter()
+                            .map(|argument| argument.expr)
+                            .collect(),
                     },
                     span,
-                );
+                    depth,
+                )?;
             } else if self.matches(&TokenKind::Dot) {
                 let (name, name_span) = self.identifier_token("点号之后须有成员名")?;
-                let span = expr.span.through(&name_span);
-                expr = Expr::new(
+                let span = expr.expr.span.through(&name_span);
+                let depth = expr.depth.saturating_add(1);
+                expr = self.parsed_expr(
                     ExprKind::Get {
-                        object: Box::new(expr),
+                        object: Box::new(expr.expr),
                         name,
                     },
                     span,
-                );
+                    depth,
+                )?;
             } else if self.matches(&TokenKind::LeftBracket) {
                 expr = self.index_or_slice(expr)?;
             } else {
@@ -694,89 +741,99 @@ impl Parser {
         Ok(expr)
     }
 
-    fn index_or_slice(&mut self, object: Expr) -> Result<Expr, ParseError> {
+    fn index_or_slice(&mut self, object: ParsedExpr) -> Result<ParsedExpr, ParseError> {
         if self.matches(&TokenKind::Colon) {
             let end = if self.check(&TokenKind::RightBracket) {
                 None
             } else {
-                Some(Box::new(self.expression()?))
+                Some(self.parsed_expression()?)
             };
             let close = self
                 .consume(&TokenKind::RightBracket, "切片末尾须有右方括号")?
                 .span
                 .clone();
-            let span = object.span.through(&close);
-            return Ok(Expr::new(
+            let span = object.expr.span.through(&close);
+            let depth = end
+                .as_ref()
+                .map_or(object.depth, |end| object.depth.max(end.depth))
+                .saturating_add(1);
+            return self.parsed_expr(
                 ExprKind::Slice {
-                    object: Box::new(object),
+                    object: Box::new(object.expr),
                     start: None,
-                    end,
+                    end: end.map(|end| Box::new(end.expr)),
                 },
                 span,
-            ));
+                depth,
+            );
         }
 
-        let first = self.expression()?;
+        let first = self.parsed_expression()?;
         if self.matches(&TokenKind::Colon) {
             let end = if self.check(&TokenKind::RightBracket) {
                 None
             } else {
-                Some(Box::new(self.expression()?))
+                Some(self.parsed_expression()?)
             };
             let close = self
                 .consume(&TokenKind::RightBracket, "切片末尾须有右方括号")?
                 .span
                 .clone();
-            let span = object.span.through(&close);
-            Ok(Expr::new(
+            let span = object.expr.span.through(&close);
+            let depth = object
+                .depth
+                .max(first.depth)
+                .max(end.as_ref().map_or(0, |end| end.depth))
+                .saturating_add(1);
+            self.parsed_expr(
                 ExprKind::Slice {
-                    object: Box::new(object),
-                    start: Some(Box::new(first)),
-                    end,
+                    object: Box::new(object.expr),
+                    start: Some(Box::new(first.expr)),
+                    end: end.map(|end| Box::new(end.expr)),
                 },
                 span,
-            ))
+                depth,
+            )
         } else {
             let close = self
                 .consume(&TokenKind::RightBracket, "下标之后须有右方括号")?
                 .span
                 .clone();
-            let span = object.span.through(&close);
-            Ok(Expr::new(
+            let span = object.expr.span.through(&close);
+            let depth = object.depth.max(first.depth).saturating_add(1);
+            self.parsed_expr(
                 ExprKind::Index {
-                    object: Box::new(object),
-                    index: Box::new(first),
+                    object: Box::new(object.expr),
+                    index: Box::new(first.expr),
                 },
                 span,
-            ))
+                depth,
+            )
         }
     }
 
-    fn primary(&mut self) -> Result<Expr, ParseError> {
+    fn primary(&mut self) -> Result<ParsedExpr, ParseError> {
         if self.check(&TokenKind::Eof) {
             return Err(self.error_here("此处应有数值、文字、变量或括号表达式"));
         }
         let token = self.advance().clone();
         let span = token.span.clone();
         match token.kind {
-            TokenKind::False => Ok(Expr::new(ExprKind::Literal(Literal::Bool(false)), span)),
-            TokenKind::True => Ok(Expr::new(ExprKind::Literal(Literal::Bool(true)), span)),
-            TokenKind::Nil => Ok(Expr::new(ExprKind::Literal(Literal::Nil), span)),
+            TokenKind::False => self.parsed_expr(ExprKind::Literal(Literal::Bool(false)), span, 1),
+            TokenKind::True => self.parsed_expr(ExprKind::Literal(Literal::Bool(true)), span, 1),
+            TokenKind::Nil => self.parsed_expr(ExprKind::Literal(Literal::Nil), span, 1),
             TokenKind::Number(value) => {
-                Ok(Expr::new(ExprKind::Literal(Literal::Number(value)), span))
+                self.parsed_expr(ExprKind::Literal(Literal::Number(value)), span, 1)
             }
             TokenKind::String(value) => {
-                Ok(Expr::new(ExprKind::Literal(Literal::String(value)), span))
+                self.parsed_expr(ExprKind::Literal(Literal::String(value)), span, 1)
             }
-            TokenKind::Identifier(name) => Ok(Expr::new(ExprKind::Variable(name), span)),
-            TokenKind::This => Ok(Expr::new(ExprKind::This, span)),
+            TokenKind::Identifier(name) => self.parsed_expr(ExprKind::Variable(name), span, 1),
+            TokenKind::This => self.parsed_expr(ExprKind::This, span, 1),
             TokenKind::Super => {
                 self.consume(&TokenKind::Dot, "“父”之后须以点号指定父类方法")?;
                 let (method, method_span) = self.identifier_token("“父.”之后须有父类方法名")?;
-                Ok(Expr::new(
-                    ExprKind::Super { method },
-                    span.through(&method_span),
-                ))
+                self.parsed_expr(ExprKind::Super { method }, span.through(&method_span), 1)
             }
             TokenKind::LeftBracket => self.list_literal(span),
             TokenKind::LeftBrace => self.map_literal(span),
@@ -790,11 +847,11 @@ impl Parser {
         }
     }
 
-    fn group_or_tuple(&mut self, open: Span) -> Result<Expr, ParseError> {
+    fn group_or_tuple(&mut self, open: Span) -> Result<ParsedExpr, ParseError> {
         if self.check(&TokenKind::RightParen) {
             return Err(self.error_here("空元组请写为“元组（）”尚未支持；元组至少须有一项"));
         }
-        let first = self.expression()?;
+        let first = self.parsed_expression()?;
         if !self.matches(&TokenKind::Comma) {
             self.consume(&TokenKind::RightParen, "表达式之后须有右括号")?;
             return Ok(first);
@@ -802,7 +859,7 @@ impl Parser {
 
         let mut items = vec![first];
         while !self.check(&TokenKind::RightParen) {
-            items.push(self.expression()?);
+            items.push(self.parsed_expression()?);
             if !self.matches(&TokenKind::Comma) {
                 break;
             }
@@ -811,14 +868,24 @@ impl Parser {
             .consume(&TokenKind::RightParen, "元组末尾须有右括号")?
             .span
             .clone();
-        Ok(Expr::new(ExprKind::Tuple(items), open.through(&close)))
+        let depth = items
+            .iter()
+            .map(|item| item.depth)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.parsed_expr(
+            ExprKind::Tuple(items.into_iter().map(|item| item.expr).collect()),
+            open.through(&close),
+            depth,
+        )
     }
 
-    fn list_literal(&mut self, open: Span) -> Result<Expr, ParseError> {
+    fn list_literal(&mut self, open: Span) -> Result<ParsedExpr, ParseError> {
         let mut items = Vec::new();
         if !self.check(&TokenKind::RightBracket) {
             loop {
-                items.push(self.expression()?);
+                items.push(self.parsed_expression()?);
                 if !self.matches(&TokenKind::Comma) {
                     break;
                 }
@@ -831,16 +898,26 @@ impl Parser {
             .consume(&TokenKind::RightBracket, "列末尾须有右方括号")?
             .span
             .clone();
-        Ok(Expr::new(ExprKind::List(items), open.through(&close)))
+        let depth = items
+            .iter()
+            .map(|item| item.depth)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.parsed_expr(
+            ExprKind::List(items.into_iter().map(|item| item.expr).collect()),
+            open.through(&close),
+            depth,
+        )
     }
 
-    fn map_literal(&mut self, open: Span) -> Result<Expr, ParseError> {
+    fn map_literal(&mut self, open: Span) -> Result<ParsedExpr, ParseError> {
         let mut entries = Vec::new();
         if !self.check(&TokenKind::RightBrace) {
             loop {
-                let key = self.expression()?;
+                let key = self.parsed_expression()?;
                 self.consume(&TokenKind::Colon, "典之键后须有冒号")?;
-                let value = self.expression()?;
+                let value = self.parsed_expression()?;
                 entries.push((key, value));
                 if !self.matches(&TokenKind::Comma) {
                     break;
@@ -854,7 +931,22 @@ impl Parser {
             .consume(&TokenKind::RightBrace, "典末尾须有右花括号")?
             .span
             .clone();
-        Ok(Expr::new(ExprKind::Map(entries), open.through(&close)))
+        let depth = entries
+            .iter()
+            .flat_map(|(key, value)| [key.depth, value.depth])
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.parsed_expr(
+            ExprKind::Map(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.expr, value.expr))
+                    .collect(),
+            ),
+            open.through(&close),
+            depth,
+        )
     }
 
     fn optional_type_ref(&mut self) -> Result<Option<TypeRef>, ParseError> {
@@ -867,6 +959,10 @@ impl Parser {
     }
 
     fn type_union(&mut self) -> Result<(TypeKind, Span), ParseError> {
+        self.with_type_depth(Self::type_union_inner)
+    }
+
+    fn type_union_inner(&mut self) -> Result<(TypeKind, Span), ParseError> {
         let (first, mut span) = self.type_primary()?;
         let mut variants = vec![first];
         while self.matches(&TokenKind::Pipe) {
@@ -1031,6 +1127,65 @@ impl Parser {
 
     fn stmt(&self, start: Span, kind: StmtKind) -> Stmt {
         Stmt::new(kind, start.through(&self.previous().span))
+    }
+
+    fn with_statement_depth<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.statement_depth >= MAX_SYNTAX_DEPTH {
+            return Err(self.error_here(SYNTAX_DEPTH_ERROR));
+        }
+        self.statement_depth += 1;
+        let result = parse(self);
+        self.statement_depth -= 1;
+        result
+    }
+
+    fn with_expression_depth<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.expression_depth >= MAX_SYNTAX_DEPTH {
+            return Err(self.error_here(SYNTAX_DEPTH_ERROR));
+        }
+        self.expression_depth += 1;
+        let result = parse(self);
+        self.expression_depth -= 1;
+        result
+    }
+
+    fn with_type_depth<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.type_depth >= MAX_SYNTAX_DEPTH {
+            return Err(self.error_here(SYNTAX_DEPTH_ERROR));
+        }
+        self.type_depth += 1;
+        let result = parse(self);
+        self.type_depth -= 1;
+        result
+    }
+
+    fn parsed_expr(
+        &self,
+        kind: ExprKind,
+        span: Span,
+        depth: usize,
+    ) -> Result<ParsedExpr, ParseError> {
+        if depth > MAX_SYNTAX_DEPTH {
+            return Err(ParseError {
+                message: SYNTAX_DEPTH_ERROR.into(),
+                line: span.line,
+                column: span.column,
+                span,
+            });
+        }
+        Ok(ParsedExpr {
+            expr: Expr::new(kind, span),
+            depth,
+        })
     }
 
     fn error_here(&self, message: impl Into<String>) -> ParseError {
@@ -1257,5 +1412,65 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("坏例.yx:2:1"));
         assert!(rendered.contains("语句末尾须有"));
+    }
+
+    #[test]
+    fn accepts_syntax_at_the_depth_limit() {
+        let list_depth = MAX_SYNTAX_DEPTH - 1;
+        let sources = [
+            format!("言 {}1{}；", "[".repeat(list_depth), "]".repeat(list_depth)),
+            format!("言 {}1；", "-".repeat(MAX_SYNTAX_DEPTH - 1)),
+            format!("言 {}1；", "1 加 ".repeat(MAX_SYNTAX_DEPTH - 1)),
+            format!("言 值{}；", ".成员".repeat(MAX_SYNTAX_DEPTH - 1)),
+            format!(
+                "定 值：{}数{} 为 1；",
+                "列<".repeat(MAX_SYNTAX_DEPTH - 1),
+                ">".repeat(MAX_SYNTAX_DEPTH - 1)
+            ),
+            format!(
+                "{}言 1；{}",
+                "若 真 则 ".repeat(MAX_SYNTAX_DEPTH - 1),
+                "终 ".repeat(MAX_SYNTAX_DEPTH - 1)
+            ),
+            format!(
+                "{}言 {}1{}；{}",
+                "若 真 则 ".repeat(MAX_SYNTAX_DEPTH - 1),
+                "[".repeat(MAX_SYNTAX_DEPTH - 1),
+                "]".repeat(MAX_SYNTAX_DEPTH - 1),
+                "终 ".repeat(MAX_SYNTAX_DEPTH - 1)
+            ),
+        ];
+
+        for source in sources {
+            parse(lexer::scan(&source).unwrap()).unwrap();
+            let statements = crate::parse(&source).unwrap();
+            let formatted = crate::formatter::format(&statements);
+            crate::parse(&formatted).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_every_unbounded_syntax_depth_path() {
+        let sources = [
+            "[".repeat(MAX_SYNTAX_DEPTH + 1),
+            format!("言 {}1；", "-".repeat(MAX_SYNTAX_DEPTH)),
+            format!("言 {}1；", "1 加 ".repeat(MAX_SYNTAX_DEPTH)),
+            format!("言 值{}；", ".成员".repeat(MAX_SYNTAX_DEPTH)),
+            format!(
+                "定 值：{}数{} 为 1；",
+                "列<".repeat(MAX_SYNTAX_DEPTH),
+                ">".repeat(MAX_SYNTAX_DEPTH)
+            ),
+            format!(
+                "{}言 1；{}",
+                "若 真 则 ".repeat(MAX_SYNTAX_DEPTH),
+                "终 ".repeat(MAX_SYNTAX_DEPTH)
+            ),
+        ];
+
+        for source in sources {
+            let error = parse(lexer::scan(&source).unwrap()).unwrap_err();
+            assert_eq!(error.message, SYNTAX_DEPTH_ERROR, "source: {source}");
+        }
     }
 }
