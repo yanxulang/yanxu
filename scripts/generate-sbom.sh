@@ -27,6 +27,7 @@ root=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
 version=$(cargo metadata --manifest-path "$root/Cargo.toml" --no-deps --format-version 1 \
   | jq -er '.packages[] | select(.name == "yanxu") | .version')
 metadata=$(cargo metadata --manifest-path "$root/Cargo.toml" --no-deps --format-version 1)
+core_id=$(printf '%s\n' "$metadata" | jq -er '.packages[] | select(.name == "yanxu") | .id')
 package_version=$(printf '%s\n' "$metadata" | jq -er '.packages[] | select(.name == "yanxu-package") | .version')
 native_v1_version=$(printf '%s\n' "$metadata" | jq -er '.packages[] | select(.name == "yanxu-native-example") | .version')
 native_v2_version=$(printf '%s\n' "$metadata" | jq -er '.packages[] | select(.name == "yanxu-native-v2-example") | .version')
@@ -60,6 +61,7 @@ normalize_bom() {
   mv "$input" "$destination"
   jq -S \
     --arg version "$version" \
+    --arg core_id "$core_id" \
     --arg package_version "$package_version" \
     --arg native_v1_version "$native_v1_version" \
     --arg native_v2_version "$native_v2_version" \
@@ -78,6 +80,8 @@ normalize_bom() {
         elif startswith("path+file:") and contains("/examples/native-extension-v2-rust#") then
           sub("path\\+file://[^#]*/examples/native-extension-v2-rust#[^ ]+";
               "pkg:cargo/yanxu-native-v2-example@" + $native_v2_version)
+        elif startswith($core_id) then
+          "pkg:cargo/yanxu@" + $version + ltrimstr($core_id)
         elif startswith("path+file:") and contains("#yanxu@") then
           sub("path\\+file://[^#]*#yanxu@[^ ]+"; "pkg:cargo/yanxu@" + $version)
         elif startswith("pkg:cargo/") and contains("?download_url=file://") then
