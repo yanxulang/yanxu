@@ -1,7 +1,8 @@
 //! 言序原生扩展 ABI v2。
 //!
 //! v2 与 v1 使用不同入口符号。参数在调用期间借用，返回值由模块的
-//! `free_value` 递归释放；异步投递会在返回前深拷贝为 [`HostValue`]。
+//! `free_value` 递归释放；异步投递会在返回前深拷贝为 [`HostValue`]。任何 v2
+//! 动态库都必须通过顶层应用的`原生扩展`权限门禁。
 
 use crate::host_events::{HostValue, HostValueLimits};
 use crate::native_abi::{NativeError, native_error};
@@ -185,6 +186,8 @@ pub struct YanxuNativeModuleV2 {
 type NativeModuleEntryV2 = unsafe extern "C" fn() -> *const YanxuNativeModuleV2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 装载请求的历史分类。该分类不授予权限；所有变体都必须通过
+/// [`PermissionSet::check_native_extension`]。
 pub enum NativeLoadAuthority {
     NativeExtension,
     OfficialGui,
