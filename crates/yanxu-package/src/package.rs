@@ -10697,6 +10697,7 @@ mod tests {
             "言「内层」；\n"
         );
 
+        drop(roots);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -11252,26 +11253,42 @@ mod tests {
             assert_eq!(fs::read(&lock_path).unwrap(), stale_lock_before);
         }
 
-        fs::rename(&application, &original).unwrap();
-        write(&application.join(MANIFEST_NAME), manifest_text);
-        write(&application.join("主.yx"), "引「包:工具」为 工具；\n");
-        graph_cache()
-            .lock()
-            .expect("graph cache poisoned")
-            .remove(&graph_cache_key(&application));
-        let error = resolve_dependency_scoped_with_opened_capabilities(
-            &opened_roots,
-            Some(&application),
-            &application,
-            "工具",
-        )
-        .unwrap_err();
-        assert!(
-            error.message.contains("工具包根在目录发现后被替换"),
-            "{error}"
-        );
+        #[cfg(not(windows))]
+        {
+            fs::rename(&application, &original).unwrap();
+            write(&application.join(MANIFEST_NAME), manifest_text);
+            write(&application.join("主.yx"), "引「包:工具」为 工具；\n");
+            graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .remove(&graph_cache_key(&application));
+            let error = resolve_dependency_scoped_with_opened_capabilities(
+                &opened_roots,
+                Some(&application),
+                &application,
+                "工具",
+            )
+            .unwrap_err();
+            assert!(
+                error.message.contains("工具包根在目录发现后被替换"),
+                "{error}"
+            );
+        }
 
-        fs::remove_dir_all(root).ok();
+        #[cfg(windows)]
+        {
+            let error = fs::rename(&application, &original).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32), "{error}");
+            assert!(application.is_dir());
+            assert!(!original.exists());
+        }
+
+        drop(reused_capabilities);
+        drop(reused);
+        drop(capabilities);
+        drop(resolved);
+        drop(opened_roots);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11318,28 +11335,43 @@ mod tests {
         .unwrap_err();
         assert!(error.message.contains("没有直接声明名为“别名”"), "{error}");
 
-        fs::rename(&application, &original).unwrap();
-        write(&application.join(MANIFEST_NAME), manifest_text);
-        write(&application.join("主.yx"), "言 2；\n");
-        graph_cache()
-            .lock()
-            .expect("graph cache poisoned")
-            .remove(&graph_cache_key(&application));
-        let error = resolve_native_dependency_scoped_with_opened_capabilities(
-            &opened_roots,
-            Some(&application),
-            &application,
-            "真实工具",
-        )
-        .unwrap_err();
-        assert!(
-            error.message.contains("应用包根在执行开始后被替换"),
-            "{error}"
-        );
-        assert!(!application.join(LOCK_NAME).exists());
-        assert_eq!(fs::read(original.join(LOCK_NAME)).unwrap(), lock_before);
+        #[cfg(not(windows))]
+        {
+            fs::rename(&application, &original).unwrap();
+            write(&application.join(MANIFEST_NAME), manifest_text);
+            write(&application.join("主.yx"), "言 2；\n");
+            graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .remove(&graph_cache_key(&application));
+            let error = resolve_native_dependency_scoped_with_opened_capabilities(
+                &opened_roots,
+                Some(&application),
+                &application,
+                "真实工具",
+            )
+            .unwrap_err();
+            assert!(
+                error.message.contains("应用包根在执行开始后被替换"),
+                "{error}"
+            );
+            assert!(!application.join(LOCK_NAME).exists());
+            assert_eq!(fs::read(original.join(LOCK_NAME)).unwrap(), lock_before);
+        }
 
-        fs::remove_dir_all(root).ok();
+        #[cfg(windows)]
+        {
+            let error = fs::rename(&application, &original).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32), "{error}");
+            assert!(application.is_dir());
+            assert!(!original.exists());
+            assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+        }
+
+        drop(capabilities);
+        drop(resolved);
+        drop(opened_roots);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
