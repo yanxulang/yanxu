@@ -18,6 +18,9 @@ fn library_path() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target"));
         let status = std::process::Command::new(env!("CARGO"))
             .args([
                 "build",
@@ -29,7 +32,7 @@ fn library_path() -> PathBuf {
             .status()
             .unwrap();
         assert!(status.success());
-        root.join("target").join("debug").join(format!(
+        target.join("debug").join(format!(
             "{}yanxu_native_v2_example{}",
             std::env::consts::DLL_PREFIX,
             std::env::consts::DLL_SUFFIX
