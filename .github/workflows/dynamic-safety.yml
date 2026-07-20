@@ -118,7 +118,9 @@ jobs:
           corpus="$RUNNER_TEMP/corpus-$FUZZ_TARGET"
           mkdir -p "$corpus"
           cp "fuzz/corpus/$FUZZ_TARGET/"* "$corpus/"
-          cargo "+$YANXU_NIGHTLY" fuzz run "$FUZZ_TARGET" --fuzz-dir fuzz "$corpus" -- \
+          cargo "+$YANXU_NIGHTLY" fuzz run \
+            --target x86_64-unknown-linux-gnu --fuzz-dir fuzz \
+            "$FUZZ_TARGET" "$corpus" -- \
             -max_total_time=60 -max_len=65536 -timeout=10 -rss_limit_mb=4096
       - name: 保存崩溃输入
         if: failure()
