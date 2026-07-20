@@ -253,6 +253,7 @@ fn opened_v2_artifact_token_does_not_follow_same_length_path_replacement() {
         );
     }
     drop(extension);
+    drop(roots);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -291,6 +292,7 @@ fn opened_v2_artifact_token_does_not_follow_replaced_package_root() {
     .unwrap();
     assert_eq!(extension.name(), "v2-example");
     drop(extension);
+    drop(roots);
     if root.exists() {
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -375,6 +377,7 @@ fn vm_rejects_transitive_native_package_without_a_direct_dependency_edge() {
         "意外错误：{}",
         failure.message
     );
+    drop(vm);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -444,6 +447,7 @@ fn vm_allows_a_locked_native_package_to_load_its_own_artifact() {
     let mut vm = yanxu::vm::Vm::silent();
     vm.execute_in_directory(&chunk, entry.parent().unwrap())
         .unwrap();
+    drop(vm);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -622,6 +626,7 @@ fn host_callback_step_budget_is_metered_per_event_not_cumulatively() {
         .unwrap();
     // 十二个回调必须全部真实执行过，防止“事件未被泵送”造成的假通过。
     assert_eq!(vm.output(), &["99"; 12]);
+    drop(vm);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -652,5 +657,6 @@ fn runaway_host_callback_still_exhausts_step_budget() {
         "意外错误：{}",
         error.message
     );
+    drop(vm);
     std::fs::remove_dir_all(root).unwrap();
 }
