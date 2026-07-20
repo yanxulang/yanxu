@@ -32,6 +32,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
       commit: ${{ steps.version.outputs.commit }}
+      attestation_digest: ${{ steps.version.outputs.attestation_digest }}
       attestation_ref: ${{ steps.version.outputs.attestation_ref }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -68,9 +69,27 @@ jobs:
             refs/heads/main|"refs/tags/$tag") ;;
             *) echo "发行工作流只能从 main 或目标标签触发，当前为 $GITHUB_REF" >&2; exit 1 ;;
           esac
+          attestation_digest="$tag_commit"
           if [[ "$GITHUB_SHA" != "$tag_commit" ]]; then
-            echo "发行证明要求工作流提交与标签提交一致；恢复旧标签时请从该标签 ref 触发" >&2
-            exit 1
+            if [[ "$GITHUB_REF" != "refs/heads/main" || "$GITHUB_SHA" != "$main_commit" ]]; then
+              echo "既有标签只能从最新 main 恢复" >&2
+              exit 1
+            fi
+            unexpected_paths="$(
+              git diff --name-only "$tag_commit" "$GITHUB_SHA" |
+                while IFS= read -r path; do
+                  case "$path" in
+                    .github/workflows/auto-release.yml|.github/workflows/dynamic-safety.yml|.github/workflows/release.yml) ;;
+                    *) printf '%s\n' "$path" ;;
+                  esac
+                done
+            )"
+            if [[ -n "$unexpected_paths" ]]; then
+              echo "既有标签之后包含非发行工作流变更，拒绝恢复：" >&2
+              printf '%s\n' "$unexpected_paths" >&2
+              exit 1
+            fi
+            attestation_digest="$GITHUB_SHA"
           fi
           if ! grep -Fqx "## $version" CHANGELOG.md; then
             echo "CHANGELOG.md 缺少 ## $version" >&2
@@ -80,6 +99,7 @@ jobs:
             echo "tag=$tag"
             echo "version=$version"
             echo "commit=$tag_commit"
+            echo "attestation_digest=$attestation_digest"
             echo "attestation_ref=$GITHUB_REF"
           } >> "$GITHUB_OUTPUT"
 
@@ -365,6 +385,7 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
           COMMIT_SHA: ${{ needs.validate.outputs.commit }}
+          ATTESTATION_DIGEST: ${{ needs.validate.outputs.attestation_digest }}
           ATTESTATION_REF: ${{ needs.validate.outputs.attestation_ref }}
         run: |
           set -euo pipefail
@@ -416,7 +437,7 @@ jobs:
             gh attestation verify "dist/$subject" --repo "$REPOSITORY" \
               --signer-workflow "$REPOSITORY/.github/workflows/release.yml" \
               --bundle "$provenance" \
-              --source-digest "$COMMIT_SHA" \
+              --source-digest "$ATTESTATION_DIGEST" \
               --source-ref "$ATTESTATION_REF" >/dev/null
           done
 
@@ -519,7 +540,7 @@ jobs:
               --signer-workflow "$REPOSITORY/.github/workflows/release.yml" \
               --bundle "$sbom_attestation" \
               --predicate-type "https://cyclonedx.org/bom" \
-              --source-digest "$COMMIT_SHA" \
+              --source-digest "$ATTESTATION_DIGEST" \
               --source-ref "$ATTESTATION_REF" >/dev/null
           done
           release_state="$(gh release view "$TAG" --repo "$REPOSITORY" \

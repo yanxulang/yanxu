@@ -58,8 +58,24 @@ jobs:
             git fetch origin "refs/tags/$tag:refs/tags/$tag"
             tagged_commit="$(git rev-list -n 1 "$tag")"
             if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
-              echo "版本 $version 已由另一提交发布；请先更新版本号" >&2
-              exit 1
+              if ! git merge-base --is-ancestor "$tagged_commit" "$GITHUB_SHA"; then
+                echo "版本 $version 已由非主线提交使用；禁止恢复" >&2
+                exit 1
+              fi
+              unexpected_paths="$(
+                git diff --name-only "$tagged_commit" "$GITHUB_SHA" |
+                  while IFS= read -r path; do
+                    case "$path" in
+                      .github/workflows/auto-release.yml|.github/workflows/dynamic-safety.yml|.github/workflows/release.yml) ;;
+                      *) printf '%s\n' "$path" ;;
+                    esac
+                  done
+              )"
+              if [[ -n "$unexpected_paths" ]]; then
+                echo "既有标签之后包含非发行工作流变更，拒绝恢复：" >&2
+                printf '%s\n' "$unexpected_paths" >&2
+                exit 1
+              fi
             fi
             # GraphQL variables must reach gh literally.
             # shellcheck disable=SC2016
