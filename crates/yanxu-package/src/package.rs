@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -851,7 +851,7 @@ fn open_external_module_file_with_hook(
 
 pub fn load(path: impl AsRef<Path>) -> Result<Manifest, ManifestError> {
     let path = path.as_ref().to_path_buf();
-    let bytes = read_stable_regular_file_snapshot(&path, MANIFEST_MAX_BYTES, "包清单")?;
+    let bytes = read_stable_metadata_file_snapshot(&path, MANIFEST_MAX_BYTES, "包清单")?;
     let text = String::from_utf8(bytes)
         .map_err(|error| manifest_error(&path, None, format!("包清单不是 UTF-8：{error}")))?;
     let root = path
@@ -880,6 +880,28 @@ pub fn load_manifest_from_roots(
     let text = std::str::from_utf8(&bytes)
         .map_err(|error| manifest_error(&path, None, format!("规范包清单不是 UTF-8：{error}")))?;
     parse(text, path, canonical_root)
+}
+
+/// 从调用方已经在可信根内绑定的规范清单句柄解析包，不再按路径重新打开。
+#[doc(hidden)]
+pub fn load_manifest_from_resolved_file(
+    resolved: ResolvedPackageFile,
+    root: &Path,
+) -> Result<Manifest, ManifestError> {
+    let path = resolved.path().to_path_buf();
+    if path.file_name().is_none_or(|name| name != MANIFEST_NAME)
+        || path.parent().is_none_or(|parent| parent != root)
+    {
+        return Err(manifest_error(
+            &path,
+            None,
+            "已打开的包清单必须是所属包根下的规范清单",
+        ));
+    }
+    let bytes = read_resolved_regular_file_snapshot(resolved, MANIFEST_MAX_BYTES, "规范包清单")?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| manifest_error(&path, None, format!("规范包清单不是 UTF-8：{error}")))?;
+    parse(text, path, root.to_path_buf())
 }
 
 pub fn resolve_dependency(base: &Path, name: &str) -> Result<PathBuf, ManifestError> {
@@ -1457,7 +1479,7 @@ pub fn update_lock(
 
 pub fn read_lock(path: impl AsRef<Path>) -> Result<LockFile, ManifestError> {
     let path = path.as_ref();
-    let bytes = read_stable_regular_file_snapshot(path, LOCK_MAX_BYTES, "锁文件")?;
+    let bytes = read_stable_metadata_file_snapshot(path, LOCK_MAX_BYTES, "锁文件")?;
     let text = String::from_utf8(bytes)
         .map_err(|error| manifest_error(path, None, format!("锁文件不是 UTF-8：{error}")))?;
     parse_lock_text(path, &text)
@@ -1518,7 +1540,7 @@ pub fn validate_lock(manifest: &Manifest) -> Result<LockFile, ManifestError> {
         ));
     }
     let manifest_bytes =
-        read_stable_regular_file_snapshot(&manifest.path, MANIFEST_MAX_BYTES, "包清单")?;
+        read_stable_metadata_file_snapshot(&manifest.path, MANIFEST_MAX_BYTES, "包清单")?;
     let checksum = format!("{:x}", Sha256::digest(&manifest_bytes));
     if lock.manifest_checksum != checksum {
         return Err(manifest_error(
@@ -1568,14 +1590,14 @@ pub fn edit_dependency(
 ) -> Result<Manifest, ManifestError> {
     validate_package_name(alias)
         .map_err(|message| manifest_error(manifest_path.as_ref(), None, message))?;
+    let manifest_path = manifest_path.as_ref();
     if let Some(dependency) = dependency {
         validate_dependency_source_security(dependency)
-            .map_err(|message| manifest_error(manifest_path.as_ref(), None, message))?;
+            .map_err(|message| manifest_error(manifest_path, None, message))?;
     }
-    let manifest_path = manifest_path.as_ref();
     let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let _project_lock = acquire_project_lock(root)?;
-    let original = String::from_utf8(read_stable_regular_file_snapshot(
+    let original = String::from_utf8(read_stable_metadata_file_snapshot(
         manifest_path,
         MANIFEST_MAX_BYTES,
         "包清单",
@@ -1651,7 +1673,7 @@ pub fn edit_application(
     let manifest_path = manifest_path.as_ref();
     let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let _project_lock = acquire_project_lock(root)?;
-    let original = String::from_utf8(read_stable_regular_file_snapshot(
+    let original = String::from_utf8(read_stable_metadata_file_snapshot(
         manifest_path,
         MANIFEST_MAX_BYTES,
         "包清单",
@@ -4573,6 +4595,7 @@ fn looks_like_uri_scheme(source: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
+/// 在来源进入网络命令、锁文件或诊断前拒绝内嵌认证信息。
 #[doc(hidden)]
 pub fn validate_source_url_security(source: &str) -> Result<(), &'static str> {
     validate_source_text(source)?;
@@ -4584,6 +4607,7 @@ pub fn validate_source_url_security(source: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// 校验本地来源路径文本，保留普通文件名中的 `#`。
 #[doc(hidden)]
 pub fn validate_local_source_path_text(source: &str) -> Result<(), &'static str> {
     validate_source_text(source)?;
@@ -4608,6 +4632,7 @@ pub fn validate_local_source_path_text(source: &str) -> Result<(), &'static str>
     Err(SOURCE_SECURITY_ERROR)
 }
 
+/// 校验 Git 来源的传输类型、认证形状和查询字段。
 #[doc(hidden)]
 pub fn validate_git_source_security(source: &str) -> Result<(), &'static str> {
     validate_source_text(source)?;
@@ -4627,6 +4652,7 @@ pub fn validate_git_source_security(source: &str) -> Result<(), &'static str> {
     validate_local_source_path_text(source)
 }
 
+/// 校验索引来源；远程索引只允许 HTTPS，本地路径与 file URL 仍可用。
 #[doc(hidden)]
 pub fn validate_registry_source_security(source: &str) -> Result<(), &'static str> {
     validate_source_text(source)?;
@@ -4641,11 +4667,13 @@ pub fn validate_registry_source_security(source: &str) -> Result<(), &'static st
     validate_local_source_path_text(source)
 }
 
+/// 校验索引制品地址；网络制品只允许 HTTPS。
 #[doc(hidden)]
 pub fn validate_artifact_source_security(source: &str) -> Result<(), &'static str> {
     validate_registry_source_security(source)
 }
 
+/// 校验漏洞参考地址；远程参考必须使用 HTTPS。
 #[doc(hidden)]
 pub fn validate_advisory_source_security(source: &str) -> Result<(), &'static str> {
     let parsed = validate_url_source(source)?;
@@ -4671,12 +4699,14 @@ fn validate_git_revision_security(revision: &str) -> Result<(), &'static str> {
     validate_local_source_path_text(revision).map_err(|_| GIT_REVISION_ERROR)
 }
 
+/// 判断远程来源是否为不携带内嵌认证信息的 HTTPS URL。
 #[doc(hidden)]
 pub fn secure_https_source(source: &str) -> bool {
     validate_url_source(source)
         .is_ok_and(|parsed| parsed.scheme() == "https" && parsed.host_str().is_some())
 }
 
+/// 校验一个公开依赖声明是否可以安全持久化和显示。
 #[doc(hidden)]
 pub fn validate_dependency_source_security(dependency: &Dependency) -> Result<(), &'static str> {
     match dependency {
@@ -4716,6 +4746,7 @@ fn validate_lock_source_security(path: &Path, lock: &LockFile) -> Result<(), Man
     Ok(())
 }
 
+/// 返回可用于诊断或结构化输出的来源值；不安全值永远不会部分回显。
 #[doc(hidden)]
 pub fn safe_source_value_for_display(source: &str) -> String {
     if validate_git_source_security(source).is_ok()
@@ -4729,6 +4760,7 @@ pub fn safe_source_value_for_display(source: &str) -> String {
     }
 }
 
+/// 返回经过本地路径策略校验的可显示文本。
 #[doc(hidden)]
 pub fn safe_local_source_path_for_display(path: &Path) -> String {
     path.to_str()
@@ -4737,6 +4769,7 @@ pub fn safe_local_source_path_for_display(path: &Path) -> String {
         .unwrap_or_else(|| HIDDEN_SOURCE_VALUE.into())
 }
 
+/// 返回经过 Git 来源策略校验的可显示文本。
 #[doc(hidden)]
 pub fn safe_git_source_value_for_display(source: &str) -> String {
     if validate_git_source_security(source).is_ok() {
@@ -4746,6 +4779,7 @@ pub fn safe_git_source_value_for_display(source: &str) -> String {
     }
 }
 
+/// 返回经过索引来源策略校验的可显示文本。
 #[doc(hidden)]
 pub fn safe_registry_source_value_for_display(source: &str) -> String {
     if validate_registry_source_security(source).is_ok() {
@@ -4755,6 +4789,7 @@ pub fn safe_registry_source_value_for_display(source: &str) -> String {
     }
 }
 
+/// 返回经过制品来源策略校验的可显示文本。
 #[doc(hidden)]
 pub fn safe_artifact_source_value_for_display(source: &str) -> String {
     if validate_artifact_source_security(source).is_ok() {
@@ -4764,6 +4799,7 @@ pub fn safe_artifact_source_value_for_display(source: &str) -> String {
     }
 }
 
+/// 返回经过漏洞参考来源策略校验的可显示文本。
 #[doc(hidden)]
 pub fn safe_advisory_source_value_for_display(source: &str) -> String {
     if validate_advisory_source_security(source).is_ok() {
@@ -4773,6 +4809,7 @@ pub fn safe_advisory_source_value_for_display(source: &str) -> String {
     }
 }
 
+/// 返回经过 Git 修订策略校验的可显示文本。
 #[doc(hidden)]
 pub fn safe_git_revision_for_display(revision: &str) -> String {
     if validate_git_revision_security(revision).is_ok() {
@@ -4782,6 +4819,7 @@ pub fn safe_git_revision_for_display(revision: &str) -> String {
     }
 }
 
+/// 对锁文件中的带类型来源执行同样的全值脱敏。
 #[doc(hidden)]
 pub fn safe_dependency_source_for_display(source: &str) -> String {
     if validate_locked_dependency_source(source).is_ok() {
@@ -5902,7 +5940,7 @@ fn read_registry_index(path: &Path) -> Result<RegistryIndex, ManifestError> {
 }
 
 fn read_registry_index_snapshot(path: &Path) -> Result<(RegistryIndex, Vec<u8>), ManifestError> {
-    let bytes = read_stable_regular_file_snapshot(path, REGISTRY_INDEX_MAX_BYTES, "索引元数据")?;
+    let bytes = read_stable_metadata_file_snapshot(path, REGISTRY_INDEX_MAX_BYTES, "索引元数据")?;
     reject_duplicate_registry_json_keys(path, &bytes)?;
     let index: RegistryIndex = serde_json::from_slice(&bytes)
         .map_err(|error| manifest_error(path, None, format!("索引元数据无效：{error}")))?;
@@ -6655,15 +6693,15 @@ fn hash_regular_file_limited(
     Ok((size, format!("{:x}", digest.finalize())))
 }
 
-fn read_stable_regular_file_snapshot(
+fn read_stable_metadata_file_snapshot(
     path: &Path,
     max_bytes: u64,
     kind: &str,
 ) -> Result<Vec<u8>, ManifestError> {
-    read_stable_regular_file_snapshot_with_hook(path, max_bytes, kind, || Ok(()))
+    read_stable_metadata_file_snapshot_with_hook(path, max_bytes, kind, || Ok(()))
 }
 
-fn read_stable_regular_file_snapshot_with_hook(
+fn read_stable_metadata_file_snapshot_with_hook(
     path: &Path,
     max_bytes: u64,
     kind: &str,
@@ -6714,15 +6752,205 @@ fn read_stable_regular_file_snapshot_with_hook(
     Ok(bytes)
 }
 
-/// 从解析阶段持有的普通文件句柄读取有界快照。
-#[doc(hidden)]
-pub fn read_resolved_regular_file_snapshot(
-    resolved: ResolvedPackageFile,
+fn read_package_file_snapshot(
+    canonical_root: &Path,
+    path: &Path,
     max_bytes: u64,
     kind: &str,
+    limit_code: Option<&str>,
 ) -> Result<Vec<u8>, ManifestError> {
-    let path = resolved.path().to_path_buf();
-    read_opened_regular_file_snapshot(resolved.into_file(), &path, max_bytes, kind, None)
+    read_package_file_snapshot_with_hook(canonical_root, path, max_bytes, kind, limit_code, || {
+        Ok(())
+    })
+}
+
+fn read_package_file_snapshot_with_hook(
+    canonical_root: &Path,
+    path: &Path,
+    max_bytes: u64,
+    kind: &str,
+    limit_code: Option<&str>,
+    before_open: impl FnOnce() -> Result<(), ManifestError>,
+) -> Result<Vec<u8>, ManifestError> {
+    let before_file = open_regular_file_for_snapshot(path)
+        .map_err(|error| manifest_error(path, None, format!("不能预先打开{kind}：{error}")))?;
+    let before = before_file.metadata().map_err(|error| {
+        manifest_error(path, None, format!("不能检查预先打开的{kind}：{error}"))
+    })?;
+    if !is_regular_file_metadata(&before) {
+        return Err(manifest_error(
+            path,
+            None,
+            format!("{kind}必须是普通文件，不得为符号链接或特殊文件"),
+        ));
+    }
+    if before.len() > max_bytes {
+        return Err(snapshot_limit_error(path, kind, max_bytes, limit_code));
+    }
+
+    before_open()?;
+    let mut file = open_regular_file_for_snapshot(path).map_err(|error| {
+        manifest_error(
+            path,
+            None,
+            format!("不能打开{kind}；文件可能在检查后被替换：{error}"),
+        )
+    })?;
+    let opened = file
+        .metadata()
+        .map_err(|error| manifest_error(path, None, format!("不能检查已打开的{kind}：{error}")))?;
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| manifest_error(path, None, format!("不能定位{kind}：{error}")))?;
+    let canonical_file = open_regular_file_for_snapshot(&canonical).map_err(|error| {
+        manifest_error(
+            &canonical,
+            None,
+            format!("不能打开已定位的{kind}以复验身份：{error}"),
+        )
+    })?;
+    let canonical_metadata = canonical_file.metadata().map_err(|error| {
+        manifest_error(&canonical, None, format!("不能检查已定位的{kind}：{error}"))
+    })?;
+    let before_matches_opened =
+        same_opened_file_identity(&before_file, &file).map_err(|error| {
+            manifest_error(path, None, format!("不能比较{kind}打开前后的身份：{error}"))
+        })?;
+    let opened_matches_canonical =
+        same_opened_file_identity(&file, &canonical_file).map_err(|error| {
+            manifest_error(path, None, format!("不能复验已定位的{kind}身份：{error}"))
+        })?;
+    if !is_regular_file_metadata(&opened)
+        || !is_regular_file_metadata(&canonical_metadata)
+        || !canonical.starts_with(canonical_root)
+        || !before_matches_opened
+        || !opened_matches_canonical
+    {
+        return Err(manifest_error(
+            path,
+            None,
+            format!("{kind}在读取前被替换、经链接越出包根目录或身份不稳定"),
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| manifest_error(path, None, format!("不能读取{kind}：{error}")))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(snapshot_limit_error(path, kind, max_bytes, limit_code));
+    }
+
+    let after_file = open_regular_file_for_snapshot(path).map_err(|error| {
+        manifest_error(
+            path,
+            None,
+            format!("不能重新打开{kind}以复验读取后身份：{error}"),
+        )
+    })?;
+    let after = after_file
+        .metadata()
+        .map_err(|error| manifest_error(path, None, format!("不能复验读取后的{kind}：{error}")))?;
+    let path_identity_unchanged =
+        same_opened_file_identity(&file, &after_file).map_err(|error| {
+            manifest_error(path, None, format!("不能复验读取后的{kind}身份：{error}"))
+        })?;
+    if !is_regular_file_metadata(&after)
+        || !path_identity_unchanged
+        || opened.len() != bytes.len() as u64
+        || after.len() != bytes.len() as u64
+        || metadata_modified_changed(&opened, &after)
+    {
+        return Err(manifest_error(
+            path,
+            None,
+            format!("{kind}在打包读取期间发生变化"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// 从已经规范化的模块路径读取一份身份稳定的 UTF-8 快照。
+///
+/// 打开前、已打开句柄和读取后路径必须始终指向同一普通文件；受支持平台会以
+/// no-follow、non-blocking 或重解析点检查避免竞态替换成链接或特殊文件后阻塞。
+#[doc(hidden)]
+pub fn read_module_source_snapshot(path: &Path) -> Result<String, ManifestError> {
+    if !path.is_absolute() {
+        return Err(manifest_error(path, None, "模块快照路径必须是规范绝对路径"));
+    }
+    let expected_root = path
+        .parent()
+        .ok_or_else(|| manifest_error(path, None, "模块快照路径缺少父目录"))?;
+    let bytes = read_package_file_snapshot(
+        expected_root,
+        path,
+        MODULE_SOURCE_MAX_BYTES,
+        "模块源码",
+        Some(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+    )?;
+    String::from_utf8(bytes)
+        .map_err(|error| manifest_error(path, None, format!("模块源码不是 UTF-8：{error}")))
+}
+
+/// 相对已经打开的可信包根读取模块；包根被重命名或同名替换时，仍只访问
+/// 原目录句柄所代表的树。包外路径沿用普通稳定快照。
+#[doc(hidden)]
+pub fn read_module_source_snapshot_in(
+    roots: &TrustedPackageRoots,
+    path: &Path,
+) -> Result<String, ManifestError> {
+    match roots
+        .resolve_existing_module_file(path)
+        .map_err(|error| package_path_manifest_error(path, error))?
+    {
+        Some(resolved) => read_resolved_module_source_snapshot(resolved),
+        None => {
+            let expected_root = path
+                .parent()
+                .ok_or_else(|| manifest_error(path, None, "模块快照路径缺少父目录"))?;
+            let bytes = read_package_file_snapshot(
+                expected_root,
+                path,
+                MODULE_SOURCE_MAX_BYTES,
+                "模块源码",
+                Some(PACKAGE_MODULE_SOURCE_LIMIT_CODE),
+            )?;
+            String::from_utf8(bytes)
+                .map_err(|error| manifest_error(path, None, format!("模块源码不是 UTF-8：{error}")))
+        }
+    }
+}
+
+/// 从已经规范化的普通文件路径读取一份身份稳定且有界的字节快照。
+#[doc(hidden)]
+pub fn read_stable_regular_file_snapshot(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ManifestError> {
+    if !path.is_absolute() {
+        return Err(manifest_error(path, None, "文件快照路径必须是规范绝对路径"));
+    }
+    let expected_root = path
+        .parent()
+        .ok_or_else(|| manifest_error(path, None, "文件快照路径缺少父目录"))?;
+    read_package_file_snapshot(expected_root, path, max_bytes, "文件", None)
+}
+
+/// 相对已经打开的可信包根读取普通文件；包外路径沿用普通稳定快照。
+#[doc(hidden)]
+pub fn read_stable_regular_file_snapshot_in(
+    roots: &TrustedPackageRoots,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ManifestError> {
+    match roots
+        .resolve_existing_file(path, PackagePathPurpose::ManifestReference)
+        .map_err(|error| package_path_manifest_error(path, error))?
+    {
+        Some(resolved) => read_resolved_regular_file_snapshot(resolved, max_bytes, "文件"),
+        None => read_stable_regular_file_snapshot(path, max_bytes),
+    }
 }
 
 /// 统一验证内存或宿主直接提供的模块源码字节数。
@@ -6759,12 +6987,34 @@ pub fn read_resolved_module_source_snapshot(
         .map_err(|error| manifest_error(&path, None, format!("模块源码不是 UTF-8：{error}")))
 }
 
+/// 从解析阶段持有的普通文件句柄读取有界快照。
+#[doc(hidden)]
+pub fn read_resolved_regular_file_snapshot(
+    resolved: ResolvedPackageFile,
+    max_bytes: u64,
+    kind: &str,
+) -> Result<Vec<u8>, ManifestError> {
+    let path = resolved.path().to_path_buf();
+    read_opened_regular_file_snapshot(resolved.into_file(), &path, max_bytes, kind, None)
+}
+
 fn read_opened_regular_file_snapshot(
+    file: fs::File,
+    path: &Path,
+    max_bytes: u64,
+    kind: &str,
+    limit_code: Option<&str>,
+) -> Result<Vec<u8>, ManifestError> {
+    read_opened_regular_file_snapshot_with_hook(file, path, max_bytes, kind, limit_code, || Ok(()))
+}
+
+fn read_opened_regular_file_snapshot_with_hook(
     mut file: fs::File,
     path: &Path,
     max_bytes: u64,
     kind: &str,
     limit_code: Option<&str>,
+    after_first_read: impl FnOnce() -> Result<(), ManifestError>,
 ) -> Result<Vec<u8>, ManifestError> {
     let before = file
         .metadata()
@@ -6788,18 +7038,60 @@ fn read_opened_regular_file_snapshot(
     if bytes.len() as u64 > max_bytes {
         return Err(snapshot_limit_error(path, kind, max_bytes, limit_code));
     }
-    let after = file
+    let after_first = file
         .metadata()
         .map_err(|error| manifest_error(path, None, format!("不能复验已打开的{kind}：{error}")))?;
-    if !after.is_file()
+    if !after_first.is_file()
         || before.len() != bytes.len() as u64
-        || after.len() != bytes.len() as u64
-        || metadata_modified_changed(&before, &after)
+        || after_first.len() != bytes.len() as u64
+        || metadata_modified_changed(&before, &after_first)
     {
         return Err(manifest_error(
             path,
             None,
             format!("{kind}在读取期间发生变化"),
+        ));
+    }
+
+    after_first_read()?;
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        manifest_error(path, None, format!("不能重新定位{kind}以复验内容：{error}"))
+    })?;
+    let offset = {
+        let mut verifier = (&mut file).take(max_bytes.saturating_add(1));
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut offset = 0_usize;
+        loop {
+            let read = verifier.read(&mut buffer).map_err(|error| {
+                manifest_error(path, None, format!("不能再次读取{kind}以复验内容：{error}"))
+            })?;
+            if read == 0 {
+                break;
+            }
+            let end = offset.saturating_add(read);
+            if end > bytes.len() || bytes[offset..end] != buffer[..read] {
+                return Err(manifest_error(
+                    path,
+                    None,
+                    format!("{kind}在快照复验期间发生同长或原地变化"),
+                ));
+            }
+            offset = end;
+        }
+        offset
+    };
+    let after_second = file
+        .metadata()
+        .map_err(|error| manifest_error(path, None, format!("不能完成{kind}内容复验：{error}")))?;
+    if offset != bytes.len()
+        || !after_second.is_file()
+        || after_second.len() != bytes.len() as u64
+        || metadata_modified_changed(&after_first, &after_second)
+    {
+        return Err(manifest_error(
+            path,
+            None,
+            format!("{kind}在快照复验期间发生变化"),
         ));
     }
     Ok(bytes)
@@ -9261,7 +9553,7 @@ fn find_vendored_package(
                     ));
                 }
             }
-            let bytes = read_stable_regular_file_snapshot(
+            let bytes = read_stable_metadata_file_snapshot(
                 &manifest_path,
                 VENDOR_MANIFEST_MAX_BYTES,
                 "辖制清单",
@@ -9623,7 +9915,7 @@ fn download(url: &str, destination: &Path) -> Result<(), ManifestError> {
             destination,
             "下载索引资源",
         )?;
-        let bytes = read_stable_regular_file_snapshot(
+        let bytes = read_stable_metadata_file_snapshot(
             &temporary,
             ARCHIVE_MAX_COMPRESSED_BYTES,
             "下载结果",
@@ -10067,7 +10359,7 @@ mod tests {
 
     fn lock_with_source(source: impl Into<String>) -> LockFile {
         LockFile {
-            lock_version: LOCK_FORMAT_VERSION,
+            lock_version: 1,
             manifest_checksum: "0".repeat(64),
             target: current_target(),
             generator: package_core_version(),
@@ -10220,6 +10512,35 @@ mod tests {
             std::env::current_dir().unwrap().join(&relative_root)
         );
         fs::remove_dir_all(relative_root).unwrap();
+    }
+
+    #[test]
+    fn pack_accepts_a_manifest_loaded_from_a_relative_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let relative_root = PathBuf::from(format!("relative-pack-{unique}"));
+        write(
+            &relative_root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='相对打包'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&relative_root.join("主.yx"), "言「相对打包」；\n");
+        let manifest = load(relative_root.join(MANIFEST_NAME)).unwrap();
+        assert!(manifest.root.is_relative());
+        let output_root = temp("relative-pack-output");
+        fs::create_dir_all(&output_root).unwrap();
+        let output = output_root.join("package.yxp");
+
+        pack_package(&manifest, &output).unwrap();
+        let unpacked = output_root.join("unpacked");
+        extract_archive_safely(&output, &unpacked).unwrap();
+        assert_eq!(
+            fs::read_to_string(unpacked.join("package/主.yx")).unwrap(),
+            "言「相对打包」；\n"
+        );
+        fs::remove_dir_all(relative_root).unwrap();
+        fs::remove_dir_all(output_root).unwrap();
     }
 
     #[test]
@@ -12772,100 +13093,6 @@ mod tests {
     }
 
     #[test]
-    fn portable_tree_checksum_accepts_legacy_paths_and_normalizes_nfc() {
-        let root = temp("portable-checksum-compatibility");
-        write(
-            &root.join(MANIFEST_NAME),
-            "[包]\n格式=2\n名称='摘要兼容'\n版本='1.0.0'\n入口='src/主.yx'\n",
-        );
-        write(&root.join("src/主.yx"), "言 1；\n");
-        write(&root.join("assets/e\u{301}.txt"), "accent\n");
-
-        let portable = tree_checksum(&root).unwrap();
-        let legacy_unix = legacy_tree_checksum(&root, "/").unwrap();
-        let legacy_windows = legacy_tree_checksum(&root, "\\").unwrap();
-        assert_ne!(portable, legacy_unix);
-        assert_ne!(portable, legacy_windows);
-        assert!(tree_checksum_matches(&root, &legacy_unix).unwrap());
-        assert!(tree_checksum_matches(&root, &legacy_windows).unwrap());
-
-        fs::rename(root.join("assets/e\u{301}.txt"), root.join("assets/é.txt")).unwrap();
-        assert_eq!(portable, tree_checksum(&root).unwrap());
-        assert!(tree_checksum_matches(&root, &legacy_unix).unwrap());
-        assert!(tree_checksum_matches(&root, &legacy_windows).unwrap());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn manifest_paths_reject_backslashes_and_package_names_require_nfc() {
-        let manifest_path = Path::new("言序.toml");
-        for kind in ["入口", "导出", "资源", "工作区成员", "原生制品", "权限文件"]
-        {
-            let error = manifest_relative_path(r"dir\file.yx", manifest_path, kind).unwrap_err();
-            assert_eq!(error.code(), PACKAGE_PATH_NON_PORTABLE_CODE, "{kind}");
-        }
-        let error = validate_package_name("e\u{301}").unwrap_err();
-        assert!(error.contains(PACKAGE_PATH_NON_PORTABLE_CODE), "{error}");
-        assert!(validate_package_name("é").is_ok());
-    }
-
-    #[cfg(all(not(windows), not(target_os = "wasi")))]
-    #[test]
-    fn pack_reads_from_the_open_root_after_root_replacement() {
-        let root = temp("pack-root-handle");
-        let backup = root.with_extension("original");
-        write(
-            &root.join(MANIFEST_NAME),
-            "[包]\n格式=2\n名称='根快照'\n版本='1.0.0'\n入口='主.yx'\n",
-        );
-        write(&root.join("主.yx"), "言「可信根」；\n");
-        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
-        let output_root = temp("pack-root-handle-output");
-        fs::create_dir_all(&output_root).unwrap();
-        let output = output_root.join("package.yxp");
-
-        pack_package_with_limits_and_hook(&manifest, &output, ARCHIVE_LIMITS, |_| {
-            fs::rename(&root, &backup).map_err(|error| {
-                manifest_error(&root, None, format!("不能模拟包根替换：{error}"))
-            })?;
-            write(
-                &root.join(MANIFEST_NAME),
-                "[包]\n格式=2\n名称='根快照'\n版本='1.0.0'\n入口='主.yx'\n",
-            );
-            write(&root.join("主.yx"), "言「替换根」；\n");
-            Ok(())
-        })
-        .unwrap();
-
-        let unpacked = output_root.join("unpacked");
-        extract_archive_safely(&output, &unpacked).unwrap();
-        assert_eq!(
-            fs::read_to_string(unpacked.join("package/主.yx")).unwrap(),
-            "言「可信根」；\n"
-        );
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(backup).ok();
-        fs::remove_dir_all(output_root).ok();
-    }
-
-    #[test]
-    fn external_module_resolution_reads_only_from_its_bound_handle() {
-        let root = temp("external-module-handle");
-        let requested = root.join("模块.yx");
-        write(&requested, "言「外部模块」；\n");
-        let mut roots = TrustedPackageRoots::default();
-        let (resolved, authority) = roots.resolve_import_file(&root, &requested, false).unwrap();
-        assert!(!authority.is_verified());
-
-        let resolved = resolved.open().unwrap();
-        assert_eq!(
-            read_resolved_module_source_snapshot(resolved).unwrap(),
-            "言「外部模块」；\n"
-        );
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
     fn module_source_reader_enforces_the_exact_byte_boundary() {
         let root = temp("module-source-byte-limit");
         fs::create_dir_all(&root).unwrap();
@@ -12913,61 +13140,6 @@ mod tests {
         assert_eq!(error.code(), PACKAGE_MODULE_SOURCE_LIMIT_CODE);
         assert_eq!(error.path, canonical);
         fs::remove_dir_all(root).ok();
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn external_module_open_rejects_replacement_before_binding() {
-        let root = temp("external-module-replacement");
-        let module = root.join("模块.yx");
-        let original = root.join("原模块.yx");
-        write(&module, "言「可信」；\n");
-        let canonical = fs::canonicalize(&module).unwrap();
-
-        let error = open_external_module_file_with_hook(&canonical, || {
-            fs::rename(&canonical, &original).map_err(|error| {
-                manifest_error(&canonical, None, format!("不能模拟模块替换：{error}"))
-            })?;
-            write(&canonical, "言「替换」；\n");
-            Ok(())
-        })
-        .unwrap_err();
-        assert!(error.message.contains("被替换"), "{error}");
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[cfg(all(not(windows), not(target_os = "wasi")))]
-    #[test]
-    fn resolved_module_handle_survives_package_root_replacement() {
-        let root = temp("resolved-module-root");
-        let requested = root.join("src/模块.yx");
-        write(
-            &root.join(MANIFEST_NAME),
-            "[包]\n格式=2\n名称='根句柄回归'\n版本='1.0.0'\n入口='src/模块.yx'\n",
-        );
-        write(&requested, "言「可信根」；\n");
-        let mut roots = TrustedPackageRoots::default();
-        roots.insert(&root).unwrap();
-        let (resolved, authority) = roots
-            .resolve_import_file(requested.parent().unwrap(), &requested, false)
-            .unwrap();
-        assert!(authority.is_verified());
-
-        let backup = root.with_extension("original");
-        fs::rename(&root, &backup).unwrap();
-        write(
-            &root.join(MANIFEST_NAME),
-            "[包]\n格式=2\n名称='根句柄回归'\n版本='1.0.0'\n入口='src/模块.yx'\n",
-        );
-        write(&requested, "言「替换根」；\n");
-
-        let resolved = resolved.open().unwrap();
-        assert_eq!(
-            read_resolved_module_source_snapshot(resolved).unwrap(),
-            "言「可信根」；\n"
-        );
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(backup).ok();
     }
 
     #[test]
@@ -13063,6 +13235,310 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn pack_reads_from_the_open_root_after_an_ordinary_root_replacement() {
+        let root = temp("pack-root-handle");
+        let backup = root.with_extension("original");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='根快照'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言「可信根」；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let output_root = temp("pack-root-handle-output");
+        fs::create_dir_all(&output_root).unwrap();
+        let output = output_root.join("package.yxp");
+
+        pack_package_with_limits_and_hook(&manifest, &output, ARCHIVE_LIMITS, |_| {
+            fs::rename(&root, &backup).map_err(|error| {
+                manifest_error(&root, None, format!("不能模拟包根替换：{error}"))
+            })?;
+            write(
+                &root.join(MANIFEST_NAME),
+                "[包]\n格式=2\n名称='根快照'\n版本='1.0.0'\n入口='主.yx'\n",
+            );
+            write(&root.join("主.yx"), "言「替换根」；\n");
+            Ok(())
+        })
+        .unwrap();
+
+        let unpacked = output_root.join("unpacked");
+        extract_archive_safely(&output, &unpacked).unwrap();
+        assert_eq!(
+            fs::read_to_string(unpacked.join("package/主.yx")).unwrap(),
+            "言「可信根」；\n"
+        );
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
+        fs::remove_dir_all(output_root).ok();
+    }
+
+    #[test]
+    fn stable_module_snapshot_rejects_replacement_between_check_and_open() {
+        let root = temp("module-snapshot-race");
+        let requested = root.join("src/模块.yx");
+        write(&requested, "言「可信」；\n");
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let canonical = fs::canonicalize(&requested).unwrap();
+        let backup = canonical_root.join("src/原模块.yx");
+        assert_eq!(
+            fs::metadata(&canonical).unwrap().len(),
+            "言「替换」；\n".len() as u64
+        );
+
+        let error = read_package_file_snapshot_with_hook(
+            &canonical_root,
+            &canonical,
+            ARCHIVE_MAX_FILE_BYTES,
+            "模块源码",
+            None,
+            || {
+                fs::rename(&canonical, &backup).map_err(|error| {
+                    manifest_error(&canonical, None, format!("不能模拟模块替换：{error}"))
+                })?;
+                fs::write(&canonical, "言「替换」；\n").map_err(|error| {
+                    manifest_error(&canonical, None, format!("不能模拟模块写入：{error}"))
+                })?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("被替换"), "{error}");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn opened_snapshot_rejects_same_length_in_place_writes_even_with_restored_mtime() {
+        let root = temp("snapshot-in-place-rewrite");
+        let path = root.join("resource.bin");
+        write(&path, "trusted-bytes");
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let file = open_regular_file_for_snapshot(&path).unwrap();
+
+        let error =
+            read_opened_regular_file_snapshot_with_hook(file, &path, 1024, "资源", None, || {
+                fs::write(&path, b"changed-bytes").map_err(|error| {
+                    manifest_error(&path, None, format!("不能模拟同长原地写入：{error}"))
+                })?;
+                let writable = OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .map_err(|error| {
+                        manifest_error(&path, None, format!("不能重开测试资源：{error}"))
+                    })?;
+                writable
+                    .set_times(fs::FileTimes::new().set_modified(original_modified))
+                    .map_err(|error| {
+                        manifest_error(&path, None, format!("不能恢复测试修改时间：{error}"))
+                    })?;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.message.contains("同长或原地变化"), "{error}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn external_module_resolution_reads_only_from_its_bound_handle() {
+        let root = temp("external-module-handle");
+        let requested = root.join("模块.yx");
+        write(&requested, "言「外部模块」；\n");
+        let mut roots = TrustedPackageRoots::default();
+        let (resolved, authority) = roots.resolve_import_file(&root, &requested, false).unwrap();
+        assert!(!authority.is_verified());
+
+        let resolved = resolved.open().unwrap();
+        assert_eq!(
+            read_resolved_module_source_snapshot(resolved).unwrap(),
+            "言「外部模块」；\n"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn external_module_open_rejects_replacement_before_binding() {
+        let root = temp("external-module-replacement");
+        let module = root.join("模块.yx");
+        let original = root.join("原模块.yx");
+        write(&module, "言「可信」；\n");
+        let canonical = fs::canonicalize(&module).unwrap();
+
+        let error = open_external_module_file_with_hook(&canonical, || {
+            fs::rename(&canonical, &original).map_err(|error| {
+                manifest_error(&canonical, None, format!("不能模拟模块替换：{error}"))
+            })?;
+            write(&canonical, "言「替换」；\n");
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.message.contains("被替换"), "{error}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn external_module_open_rejects_symlink_replacement_before_binding() {
+        let root = temp("external-module-symlink-race");
+        let module = root.join("模块.yx");
+        let original = root.join("原模块.yx");
+        let replacement = root.join("替换.yx");
+        write(&module, "言「可信」；\n");
+        write(&replacement, "言「替换」；\n");
+        let canonical = fs::canonicalize(&module).unwrap();
+
+        let error = open_external_module_file_with_hook(&canonical, || {
+            fs::rename(&canonical, &original).map_err(|error| {
+                manifest_error(&canonical, None, format!("不能模拟模块替换：{error}"))
+            })?;
+            #[cfg(all(unix, not(target_os = "wasi")))]
+            std::os::unix::fs::symlink(Path::new("替换.yx"), &canonical).map_err(|error| {
+                manifest_error(&canonical, None, format!("不能模拟模块链接：{error}"))
+            })?;
+            #[cfg(target_os = "wasi")]
+            rustix::fs::symlinkat(Path::new("替换.yx"), rustix::fs::CWD, &canonical).map_err(
+                |error| manifest_error(&canonical, None, format!("不能模拟模块链接：{error}")),
+            )?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            error.message.contains("被替换")
+                || error.message.contains("符号链接")
+                || error.message.contains("不能打开模块"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn external_module_snapshot_rejects_a_final_symlink() {
+        let root = temp("external-module-final-symlink");
+        let target = root.join("目标.yx");
+        let link = root.join("链接.yx");
+        write(&target, "言 1；\n");
+        #[cfg(all(unix, not(target_os = "wasi")))]
+        std::os::unix::fs::symlink(Path::new("目标.yx"), &link).unwrap();
+        #[cfg(target_os = "wasi")]
+        rustix::fs::symlinkat(Path::new("目标.yx"), rustix::fs::CWD, &link).unwrap();
+
+        let error = read_module_source_snapshot(&link).unwrap_err();
+        assert!(
+            error.message.contains("符号链接") || error.message.contains("不能预先打开"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn resolved_module_handle_survives_ordinary_ancestor_replacement() {
+        let root = temp("resolved-module-ancestor");
+        let source_directory = root.join("src");
+        let requested = source_directory.join("模块.yx");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='句柄回归'\n版本='1.0.0'\n入口='src/模块.yx'\n",
+        );
+        write(&requested, "言「可信」；\n");
+        let mut roots = TrustedPackageRoots::default();
+        roots.insert(&root).unwrap();
+        let (resolved, authority) = roots
+            .resolve_import_file(&source_directory, &requested, false)
+            .unwrap();
+        assert!(authority.is_verified());
+
+        let backup = root.join("src-original");
+        fs::rename(&source_directory, &backup).unwrap();
+        write(&requested, "言「替换」；\n");
+
+        let resolved = resolved.open().unwrap();
+        assert_eq!(
+            read_resolved_module_source_snapshot(resolved).unwrap(),
+            "言「可信」；\n"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "wasi")))]
+    #[test]
+    fn resolved_module_handle_survives_package_root_replacement() {
+        let root = temp("resolved-module-root");
+        let requested = root.join("src/模块.yx");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='根句柄回归'\n版本='1.0.0'\n入口='src/模块.yx'\n",
+        );
+        write(&requested, "言「可信根」；\n");
+        let mut roots = TrustedPackageRoots::default();
+        roots.insert(&root).unwrap();
+        let (resolved, authority) = roots
+            .resolve_import_file(requested.parent().unwrap(), &requested, false)
+            .unwrap();
+        assert!(authority.is_verified());
+
+        let backup = root.with_extension("original");
+        fs::rename(&root, &backup).unwrap();
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='根句柄回归'\n版本='1.0.0'\n入口='src/模块.yx'\n",
+        );
+        write(&requested, "言「替换根」；\n");
+
+        let resolved = resolved.open().unwrap();
+        assert_eq!(
+            read_resolved_module_source_snapshot(resolved).unwrap(),
+            "言「可信根」；\n"
+        );
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(backup).ok();
+    }
+
+    #[cfg(all(unix, not(target_os = "wasi")))]
+    #[test]
+    fn stable_file_snapshot_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = temp("snapshot-fifo");
+        let fifo = root.join("resource.pipe");
+        write(&fifo, "regular\n");
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let canonical = fs::canonicalize(&fifo).unwrap();
+        let fifo_name = CString::new(canonical.as_os_str().as_bytes()).unwrap();
+        let started = std::time::Instant::now();
+
+        let error = read_package_file_snapshot_with_hook(
+            &canonical_root,
+            &canonical,
+            1024,
+            "资源",
+            None,
+            || {
+                fs::remove_file(&canonical).map_err(|error| {
+                    manifest_error(&canonical, None, format!("不能模拟删除资源：{error}"))
+                })?;
+                if unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) } != 0 {
+                    return Err(manifest_error(
+                        &canonical,
+                        None,
+                        format!("不能模拟命名管道：{}", io::Error::last_os_error()),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(error.message.contains("被替换"), "{error}");
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn pack_rejects_a_noncanonical_manifest_object_from_the_same_root() {
         let root = temp("pack-manifest-identity");
@@ -13149,6 +13625,294 @@ mod tests {
     }
 
     #[test]
+    fn archive_consumer_rejects_portable_case_and_unicode_path_collisions() {
+        for (label, first, second) in [
+            ("case", "package/src/Foo.yx", "package/src/foo.yx"),
+            ("unicode", "package/src/é.yx", "package/src/e\u{301}.yx"),
+            (
+                "ancestor-case",
+                "package/src/Foo/甲.yx",
+                "package/src/foo/乙.yx",
+            ),
+            ("wrapper-case", "Package/额外.yx", "package/其他.yx"),
+        ] {
+            let root = temp(&format!("archive-portable-collision-{label}"));
+            fs::create_dir_all(&root).unwrap();
+            let archive = root.join("package.yxp");
+            write_archive(
+                &archive,
+                &[
+                    (
+                        "package/言序.toml",
+                        "[包]\n格式=2\n名称='碰撞'\n版本='1.0.0'\n入口='src/Foo.yx'\n".as_bytes(),
+                    ),
+                    (first, "言 1；\n".as_bytes()),
+                    (second, "言 2；\n".as_bytes()),
+                ],
+            );
+            let error = extract_archive_safely(&archive, &root.join("unpacked")).unwrap_err();
+            assert_eq!(
+                error.code(),
+                crate::path_policy::PACKAGE_PATH_COLLISION_CODE
+            );
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn portable_tree_checksum_accepts_legacy_windows_paths_and_normalizes_nfc() {
+        let root = temp("portable-checksum-compatibility");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='摘要兼容'\n版本='1.0.0'\n入口='src/主.yx'\n",
+        );
+        write(&root.join("src/主.yx"), "言 1；\n");
+        write(&root.join("assets/e\u{301}.txt"), "accent\n");
+
+        let portable = tree_checksum(&root).unwrap();
+        let legacy_unix = legacy_tree_checksum(&root, "/").unwrap();
+        let legacy_windows = legacy_tree_checksum(&root, "\\").unwrap();
+        assert_ne!(portable, legacy_unix);
+        assert_ne!(portable, legacy_windows);
+        assert!(tree_checksum_matches(&root, &legacy_unix).unwrap());
+        assert!(tree_checksum_matches(&root, &legacy_windows).unwrap());
+
+        fs::rename(root.join("assets/e\u{301}.txt"), root.join("assets/é.txt")).unwrap();
+        assert_eq!(portable, tree_checksum(&root).unwrap());
+        assert!(tree_checksum_matches(&root, &legacy_unix).unwrap());
+        assert!(tree_checksum_matches(&root, &legacy_windows).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nfd_manifest_paths_resolve_after_nfc_yxp_materialization() {
+        let root = temp("nfd-manifest-nfc-yxp");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='规范等价路径'\n版本='1.0.0'\n入口='src/e\u{301}.yx'\n[导出]\n默认='src/e\u{301}.yx'\n[资源]\n目录=['assets/e\u{301}']\n",
+        );
+        write(&root.join("src/e\u{301}.yx"), "言 1；\n");
+        write(&root.join("assets/e\u{301}/data.txt"), "resource\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let output_root = temp("nfd-manifest-nfc-yxp-output");
+        fs::create_dir_all(&output_root).unwrap();
+        let archive = output_root.join("package.yxp");
+        pack_package(&manifest, &archive).unwrap();
+        let unpacked = output_root.join("unpacked");
+        extract_archive_safely(&archive, &unpacked).unwrap();
+        let unpacked_root = unpacked.join("package");
+        let unpacked_manifest = load(unpacked_root.join(MANIFEST_NAME)).unwrap();
+        validate_package_root(&unpacked_manifest).unwrap();
+        assert!(
+            resolve_existing_package_path(
+                &unpacked_root,
+                &unpacked_manifest.entry,
+                PackagePathPurpose::ModuleSource,
+            )
+            .unwrap()
+            .is_file()
+        );
+        assert!(
+            resolve_existing_package_path(
+                &unpacked_root,
+                &unpacked_manifest.resources[0],
+                PackagePathPurpose::ManifestReference,
+            )
+            .unwrap()
+            .is_dir()
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn manifest_paths_reject_raw_backslashes_and_package_names_require_nfc() {
+        let manifest_path = Path::new("言序.toml");
+        for kind in ["入口", "导出", "资源", "工作区成员", "原生制品", "权限文件"]
+        {
+            let error = manifest_relative_path(r"dir\file.yx", manifest_path, kind).unwrap_err();
+            assert_eq!(error.code(), PACKAGE_PATH_NON_PORTABLE_CODE, "{kind}");
+        }
+        let error = validate_package_name("e\u{301}").unwrap_err();
+        assert!(error.contains(PACKAGE_PATH_NON_PORTABLE_CODE), "{error}");
+        assert!(validate_package_name("é").is_ok());
+    }
+
+    #[test]
+    fn package_root_resource_remains_valid_and_yxp_uses_nfc_paths() {
+        let root = temp("root-resource-nfc-yxp");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='根资源'\n版本='1.0.0'\n入口='src/主.yx'\n[资源]\n目录=['.']\n",
+        );
+        write(&root.join("src/主.yx"), "言 1；\n");
+        write(&root.join("assets/e\u{301}.txt"), "accent\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let output_root = temp("root-resource-nfc-output");
+        fs::create_dir_all(&output_root).unwrap();
+        let archive = output_root.join("package.yxp");
+        pack_package(&manifest, &archive).unwrap();
+        let decoder = flate2::read::GzDecoder::new(fs::File::open(&archive).unwrap());
+        let mut tar = tar::Archive::new(decoder);
+        let archive_paths = tar
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            archive_paths
+                .iter()
+                .any(|path| path == "package/assets/é.txt")
+        );
+        assert!(
+            archive_paths
+                .iter()
+                .all(|path| path != "package/assets/e\u{301}.txt")
+        );
+        let unpacked = output_root.join("unpacked");
+        extract_archive_safely(&archive, &unpacked).unwrap();
+        assert!(unpacked.join("package/assets/é.txt").is_file());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn yxp_path_limit_uses_the_final_nfc_archive_name() {
+        let root = temp("nfc-path-limit");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='规范路径限额'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言 1；\n");
+        let decomposed = "e\u{301}".repeat(40);
+        let relative = PathBuf::from(&decomposed).join("data.txt");
+        write(&root.join(&relative), "data\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let portable = portable_package_path(&relative).unwrap();
+        let final_archive_path = Path::new("package").join(&portable);
+        let final_length = final_archive_path.as_os_str().as_encoded_bytes().len();
+        assert!(
+            Path::new("package")
+                .join(&relative)
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                > final_length
+        );
+        assert_eq!(
+            validated_yxp_archive_path(&relative, &root.join(&relative), final_length).unwrap(),
+            final_archive_path
+        );
+        assert!(
+            validated_yxp_archive_path(&relative, &root.join(&relative), final_length - 1).is_err()
+        );
+        let limits = ArchiveLimits {
+            path_bytes: final_length,
+            ..ARCHIVE_LIMITS
+        };
+        let output_root = temp("nfc-path-limit-output");
+        fs::create_dir_all(&output_root).unwrap();
+        let output = output_root.join("package.yxp");
+
+        pack_package_with_limits(&manifest, &output, limits).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(output_root).unwrap();
+    }
+
+    #[test]
+    fn pack_output_conflicts_use_portable_case_and_unicode_identity() {
+        let root = temp("portable-output-conflicts");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='输出身份'\n版本='1.0.0'\n入口='src/Main.yx'\n[导出]\n重音='src/é.yx'\n[资源]\n目录=['Assets']\n",
+        );
+        write(&root.join("src/Main.yx"), "言 1；\n");
+        write(&root.join("src/é.yx"), "言 2；\n");
+        write(&root.join("Assets/data.txt"), "data\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+
+        let case_error =
+            validate_pack_output_conflicts(&manifest, Some(Path::new("src/main.yx"))).unwrap_err();
+        assert!(case_error.message.contains("入口"), "{case_error}");
+        let unicode_error =
+            validate_pack_output_conflicts(&manifest, Some(Path::new("src/e\u{301}.yx")))
+                .unwrap_err();
+        assert!(unicode_error.message.contains("导出"), "{unicode_error}");
+        let resource_error =
+            validate_pack_output_conflicts(&manifest, Some(Path::new("assets/package.yxp")))
+                .unwrap_err();
+        assert!(
+            resource_error.message.contains("资源目录"),
+            "{resource_error}"
+        );
+        assert!(
+            validate_pack_output_conflicts(&manifest, Some(Path::new("assets-old/package.yxp")))
+                .is_ok()
+        );
+        let mut root_resource = manifest.clone();
+        root_resource.resources = vec![PathBuf::from(".")];
+        let root_error =
+            validate_pack_output_conflicts(&root_resource, Some(Path::new("dist/package.yxp")))
+                .unwrap_err();
+        assert!(root_error.message.contains("资源目录"), "{root_error}");
+
+        let mut workspace = manifest.clone();
+        workspace.workspace_members = vec![PathBuf::from("Workspace")];
+        let workspace_error =
+            validate_pack_output_conflicts(&workspace, Some(Path::new("workspace/member.yxp")))
+                .unwrap_err();
+        assert!(
+            workspace_error.message.contains("工作区成员"),
+            "{workspace_error}"
+        );
+
+        let mut application = manifest.clone();
+        application.application = Some(ApplicationConfig {
+            kind: ApplicationKind::CommandLine,
+            name: "输出身份".into(),
+            identifier: "dev.yanxu.output-identity".into(),
+            version: Version::new(1, 0, 0),
+            icon: Some(PathBuf::from("Assets/É.png")),
+            company: None,
+            minimum_system_version: None,
+            window: WindowConfig::default(),
+        });
+        let icon_error =
+            validate_pack_output_conflicts(&application, Some(Path::new("assets/e\u{301}.png")))
+                .unwrap_err();
+        assert!(icon_error.message.contains("应用图标"), "{icon_error}");
+
+        let mut native = manifest.clone();
+        native.native = Some(NativePackage {
+            abi_version: 2,
+            artifacts: BTreeMap::from([(
+                "fixture-target".into(),
+                NativeArtifact {
+                    abi: 2,
+                    target: "fixture-target".into(),
+                    path: "Native/é.bin".into(),
+                    checksum: "0".repeat(64),
+                    size: 1,
+                },
+            )]),
+        });
+        let native_error =
+            validate_pack_output_conflicts(&native, Some(Path::new("native/e\u{301}.bin")))
+                .unwrap_err();
+        assert!(native_error.message.contains("原生制品"), "{native_error}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn source_tree_outputs_are_self_excluding_and_never_clobber_source_content() {
         let root = temp("pack-output-location");
         let valid_manifest = "[包]\n格式=2\n名称='输出位置'\n版本='1.0.0'\n入口='主.yx'\n";
@@ -13180,7 +13944,10 @@ mod tests {
         );
         let duplicate_before = fs::read(&duplicate_output).unwrap();
         let error = pack_package(&manifest, &duplicate_output).unwrap_err();
-        assert!(error.message.contains("重复路径"));
+        assert_eq!(
+            error.code(),
+            crate::path_policy::PACKAGE_PATH_COLLISION_CODE
+        );
         assert_eq!(fs::read(&duplicate_output).unwrap(), duplicate_before);
 
         let self_contained = root.join("package.yxp");
@@ -13379,10 +14146,11 @@ mod tests {
     }
 
     #[test]
-    fn gui_permission_cannot_authorize_named_path_native_packages() {
+    fn gui_permission_cannot_authorize_named_path_or_git_native_packages() {
         let root = temp("gui-native-permission");
         let path_dependency = root.join("path-dependency");
         write_native_package(&path_dependency, "yanxu-gui");
+
         let path_application = root.join("path-application");
         let path_manifest = "[包]\n格式=2\n名称='路径应用'\n版本='1.0.0'\n入口='主.yx'\n[依赖]\n言窗={包='yanxu-gui',路径='../path-dependency',版='^1'}\n[权限]\n图形界面=true\n";
         write(&path_application.join(MANIFEST_NAME), path_manifest);
@@ -13391,19 +14159,14 @@ mod tests {
         let error = plan_update(&manifest, false).unwrap_err();
         assert!(error.message.contains("原生扩展 = true"), "{error}");
         assert!(error.message.contains("图形界面权限不能代替"), "{error}");
+
         write(
             &path_application.join(MANIFEST_NAME),
             &path_manifest.replace("图形界面=true", "图形界面=true\n原生扩展=true"),
         );
         let manifest = load(path_application.join(MANIFEST_NAME)).unwrap();
         assert_eq!(plan_update(&manifest, false).unwrap().packages.len(), 1);
-        fs::remove_dir_all(root).ok();
-    }
 
-    #[cfg(not(target_os = "wasi"))]
-    #[test]
-    fn gui_permission_cannot_authorize_named_git_native_packages() {
-        let root = temp("gui-git-native-permission");
         let git_dependency = root.join("git-dependency");
         write_native_package(&git_dependency, "yanxu-gui");
         for arguments in [
@@ -13557,7 +14320,7 @@ mod tests {
         write(&path, "trusted\n");
 
         let error =
-            read_stable_regular_file_snapshot_with_hook(&path, 1024, "测试元数据", || {
+            read_stable_metadata_file_snapshot_with_hook(&path, 1024, "测试元数据", || {
                 fs::rename(&path, &backup).map_err(|error| {
                     manifest_error(&path, None, format!("不能模拟元数据替换：{error}"))
                 })?;
@@ -14110,6 +14873,58 @@ mod tests {
     }
 
     #[test]
+    fn source_url_policy_rejects_embedded_credentials_without_hiding_safe_sources() {
+        for source in [
+            "https://example.invalid/group/package.git",
+            "ssh://example.invalid/group/package.git",
+            "ssh://git@example.invalid/group/package.git",
+            "git+ssh://git@example.invalid/group/package.git",
+            "git@example.invalid:group/package.git",
+            "https://example.invalid/group/package.git?ref=stable&channel=release",
+        ] {
+            assert!(
+                validate_source_url_security(source).is_ok(),
+                "safe source was rejected: {source}"
+            );
+            assert_eq!(safe_source_value_for_display(source), source);
+        }
+        assert!(secure_git_source(
+            "https://example.invalid/group/package.git"
+        ));
+        assert!(secure_git_source("ssh://example.invalid/group/package.git"));
+        assert!(secure_git_source(
+            "ssh://git@example.invalid/group/package.git"
+        ));
+        assert!(secure_git_source(
+            "git+ssh://git@example.invalid/group/package.git"
+        ));
+        assert!(secure_git_source("git@example.invalid:group/package.git"));
+
+        let marker = "never-print-this-value";
+        for source in [
+            format!("https://user:{marker}@example.invalid/package.git"),
+            "https://user@example.invalid/package.git".into(),
+            format!("ssh://git:{marker}@example.invalid/package.git"),
+            format!("https://example.invalid/package.git#fragment-{marker}"),
+            format!("https://example.invalid/package.git?access_token={marker}"),
+            format!("https://example.invalid/package.git?%61ccess_%74oken={marker}"),
+            format!("git@example.invalid:group/package.git?api-key={marker}"),
+        ] {
+            assert_eq!(
+                validate_source_url_security(&source),
+                Err(SOURCE_SECURITY_ERROR),
+                "unsafe source was accepted"
+            );
+            let displayed = safe_source_value_for_display(&source);
+            assert!(
+                !displayed.contains(marker),
+                "source value leaked: {displayed}"
+            );
+            assert_eq!(displayed, "<已隐藏的不安全来源>");
+        }
+    }
+
+    #[test]
     fn source_policy_rejects_encoded_confusable_and_malformed_secret_shapes() {
         let marker = "source-policy-value-must-not-appear";
         let unsafe_sources = [
@@ -14167,37 +14982,56 @@ mod tests {
     }
 
     #[test]
-    fn typed_sources_and_revisions_redact_network_user_information() {
+    fn typed_source_policies_keep_safe_transports_and_local_hash_paths() {
         for source in [
             "https://example.invalid/group/package.git",
             "ssh://git@example.invalid/group/package.git",
             "ssh://deploy-user@example.invalid/group/package.git",
             "git@example.invalid:group/package.git",
+            "deploy_user@example.invalid:group/package.git",
         ] {
             assert!(validate_git_source_security(source).is_ok(), "{source}");
+            assert_eq!(safe_git_source_value_for_display(source), source);
         }
         for source in [
             "http://example.invalid/package.git",
             "ftp://example.invalid/package.git",
+            "git://example.invalid/package.git",
             "ssh://user:password@example.invalid/package.git",
             "user:password@example.invalid:group/package.git",
             "git@example.invalid@mirror.invalid:group/package.git",
         ] {
             assert!(validate_git_source_security(source).is_err(), "{source}");
+            assert_eq!(
+                safe_git_source_value_for_display(source),
+                HIDDEN_SOURCE_VALUE
+            );
         }
 
-        for revision in [
-            "HEAD",
-            "0123456789abcdef0123456789abcdef01234567",
-            "refs/heads/main",
-            "main~1",
-            "feature%ready",
+        assert!(validate_registry_source_security("https://packages.example.invalid/v1").is_ok());
+        assert!(validate_artifact_source_security("../archives/package.yxp#snapshot").is_ok());
+        assert!(
+            validate_advisory_source_security("https://security.example.invalid/YXSA-1").is_ok()
+        );
+        for source in [
+            "http://packages.example.invalid/v1",
+            "ftp://packages.example.invalid/v1",
+            "ssh://git@example.invalid/index",
         ] {
             assert!(
-                validate_git_revision_security(revision).is_ok(),
-                "{revision}"
+                validate_registry_source_security(source).is_err(),
+                "{source}"
             );
-            assert_eq!(safe_git_revision_for_display(revision), revision);
+        }
+        for source in [
+            "http://security.example.invalid/YXSA-1",
+            "file:///tmp/YXSA-1",
+            "../advisories/YXSA-1",
+        ] {
+            assert!(
+                validate_advisory_source_security(source).is_err(),
+                "{source}"
+            );
         }
         for revision in [
             "+refs/heads/main",
@@ -14210,124 +15044,29 @@ mod tests {
                 "Git refspec was accepted: {revision}"
             );
         }
-        let marker = "revision-value-must-not-appear";
-        for revision in [
-            format!("https://user:{marker}@example.invalid/repo"),
-            format!("user:{marker}@example.invalid"),
-            format!("user@example.invalid:refs/{marker}"),
-            format!("HEAD?access_token={marker}"),
-            format!("refs%3Faccess_token={marker}"),
-            format!("refs%253Fauthorization_code={marker}"),
-            format!("https%253A%252F%252Fuser%253A{marker}%2540example.invalid%252Frevision"),
-        ] {
-            assert!(validate_git_revision_security(&revision).is_err());
-            let displayed = safe_git_revision_for_display(&revision);
-            assert!(!displayed.contains(marker), "revision leaked: {displayed}");
 
-            let dependency = Dependency::Git {
-                url: "https://example.invalid/package.git".into(),
-                revision,
-                requirement: None,
-            };
-            let dependency_display = dependency.to_string();
-            assert!(
-                !dependency_display.contains(marker),
-                "dependency leaked: {dependency_display}"
-            );
-            assert!(validate_dependency_source_security(&dependency).is_err());
+        assert!(validate_local_source_path_text("../dependency#snapshot").is_ok());
+        assert!(validate_local_source_path_text("../dependency?ref=stable").is_ok());
+        for source in [
+            "",
+            "git:https://example.invalid/package.git",
+            "git@example.invalid:group/package.git",
+            "https://example.invalid/package.git",
+            "https%3A%2F%2Fuser%3Ahidden%40example.invalid%2Fpackage.git",
+            "git%40example.invalid%3Agroup%2Fpackage.git",
+            "../dependency?access_token=hidden",
+            "../dependency\nnext",
+        ] {
+            assert!(validate_local_source_path_text(source).is_err(), "{source}");
         }
+        assert_eq!(
+            safe_local_source_path_for_display(Path::new("../dependency#snapshot")),
+            "../dependency#snapshot"
+        );
     }
 
     #[test]
-    fn path_sources_fail_at_parse_and_programmatic_resolution_boundaries() {
-        let root = temp("path-source-security");
-        fs::create_dir_all(&root).unwrap();
-        let marker = "path-source-value-must-not-appear";
-        for dependency in [
-            format!("fixture = '../dependency?access_token={marker}'"),
-            format!("fixture = {{路径='../dependency?authorization_code={marker}'}}"),
-        ] {
-            let text = format!(
-                "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\n{dependency}\n"
-            );
-            let error = parse(&text, root.join(MANIFEST_NAME), root.clone())
-                .unwrap_err()
-                .to_string();
-            assert!(!error.contains(marker), "{error}");
-        }
-
-        let safe = parse(
-            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture='../dependency#snapshot'\n",
-            root.join(MANIFEST_NAME),
-            root.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            safe.dependencies.get("fixture"),
-            Some(&Dependency::Path {
-                path: PathBuf::from("../dependency#snapshot"),
-                requirement: None,
-            })
-        );
-        let percent_path = parse(
-            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture='../100%/dep'\n",
-            root.join(MANIFEST_NAME),
-            root.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            percent_path.dependencies.get("fixture"),
-            Some(&Dependency::Path {
-                path: PathBuf::from("../100%/dep"),
-                requirement: None,
-            })
-        );
-
-        let encoded_network = format!(
-            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture='https%253A%252F%252Fuser%253A{marker}%2540example.invalid%252Fdep'\n"
-        );
-        let encoded_error = parse(&encoded_network, root.join(MANIFEST_NAME), root.clone())
-            .unwrap_err()
-            .to_string();
-        assert!(!encoded_error.contains(marker), "{encoded_error}");
-
-        for encoded_query in [
-            format!("../dependency%3Faccess_token={marker}"),
-            format!("../dependency%253Fauthorization_code={marker}"),
-        ] {
-            let text = format!(
-                "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture={encoded_query:?}\n"
-            );
-            let error = parse(&text, root.join(MANIFEST_NAME), root.clone())
-                .unwrap_err()
-                .to_string();
-            assert!(!error.contains(marker), "{error}");
-        }
-
-        write(
-            &root.join(MANIFEST_NAME),
-            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n",
-        );
-        write(&root.join("main.yx"), "言 1；\n");
-        let mut manifest = load(root.join(MANIFEST_NAME)).unwrap();
-        manifest.dependencies.insert(
-            "fixture".into(),
-            Dependency::Path {
-                path: PathBuf::from(format!("../dependency?x-sig={marker}")),
-                requirement: None,
-            },
-        );
-        manifest
-            .dependency_packages
-            .insert("fixture".into(), "fixture".into());
-        let error = resolve_graph(&manifest, true).unwrap_err().to_string();
-        assert!(!error.contains(marker), "{error}");
-        assert!(!root.join(LOCK_NAME).exists());
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn lock_sources_are_exact_bounded_and_redacted() {
+    fn lock_source_dispatch_is_exact_bounded_and_redacted() {
         for source in [
             "path:../dependency#snapshot",
             "git:https://example.invalid/package.git?ref=stable",
@@ -14338,18 +15077,71 @@ mod tests {
                 validate_locked_dependency_source(source).is_ok(),
                 "{source}"
             );
+            assert_eq!(safe_dependency_source_for_display(source), source);
         }
+
         let marker = "lock-source-value-must-not-appear";
         for source in [
             "path:".to_owned(),
             format!("path:https://user:{marker}@example.invalid/package.git"),
+            format!("path:git@example.invalid:group/{marker}.git"),
             format!("git:plain?authorization_code={marker}"),
             format!("registry:https://packages.example.invalid/v1?x-sig={marker}"),
             format!("gitx:https://example.invalid/{marker}.git"),
+            format!("path:../dependency\n{marker}"),
         ] {
             assert!(validate_locked_dependency_source(&source).is_err());
-            assert!(!safe_dependency_source_for_display(&source).contains(marker));
+            let displayed = safe_dependency_source_for_display(&source);
+            assert!(
+                !displayed.contains(marker),
+                "lock source leaked: {displayed}"
+            );
         }
+        assert_eq!(
+            safe_dependency_source_for_display("path:https://user:hidden@example.invalid/repo"),
+            format!("path:{HIDDEN_SOURCE_VALUE}")
+        );
+
+        let unsafe_revision = format!("HEAD?access_token={marker}");
+        assert!(validate_git_revision_security(&unsafe_revision).is_err());
+        assert!(!safe_git_revision_for_display(&unsafe_revision).contains(marker));
+    }
+
+    #[test]
+    fn vendor_rejects_nested_network_sources_before_writing() {
+        let root = temp("unsafe-vendor-source");
+        let destination = root.join("vendor");
+        let marker = "vendor-source-value-must-not-appear";
+        let dependency = ResolvedDependency {
+            locked: LockedPackage {
+                id: "fixture@1.0.0".into(),
+                name: "fixture".into(),
+                version: "1.0.0".into(),
+                source: format!("path:https://user:{marker}@example.invalid/package.git"),
+                revision: None,
+                checksum: "a".repeat(64),
+                entry: "main.yx".into(),
+                dependencies: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                target: current_target(),
+                native: None,
+                minimum_yanxu: None,
+            },
+            root: root.join("dependency"),
+            entry: root.join("dependency/main.yx"),
+        };
+        let graph = ResolutionGraph {
+            root_dependencies: BTreeMap::from([("fixture".into(), "fixture@1.0.0".into())]),
+            root_dev_dependencies: BTreeMap::new(),
+            packages: BTreeMap::from([("fixture@1.0.0".into(), dependency)]),
+            target: current_target(),
+        };
+        let error = vendor_dependencies(&graph, &destination)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(marker), "{error}");
+        assert!(!destination.exists());
+        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(any(unix, windows))]
@@ -14972,7 +15764,61 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_manifest_lock_and_registry_sources_never_echo_values() {
+    fn credential_bearing_sources_fail_before_network_cache_or_manifest_writes() {
+        let marker = format!(
+            "never-print-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let git_url = format!("https://user:{marker}@127.0.0.1:1/package.git");
+        let git_cache = cache_root().join("git").join(short_hash(&git_url));
+        fs::remove_dir_all(&git_cache).ok();
+        let git_error = resolve_git(&git_url, "HEAD", false).unwrap_err();
+        let git_diagnostic = git_error.to_string();
+        assert!(!git_diagnostic.contains(&marker), "{git_diagnostic}");
+        assert!(!git_cache.exists(), "unsafe Git source created cache state");
+
+        let registry = format!("https://127.0.0.1:1/index?api_key={marker}");
+        let registry_cache = cache_root().join("registry").join(short_hash(&registry));
+        fs::remove_dir_all(&registry_cache).ok();
+        let registry_error =
+            resolve_registry("fixture", &VersionReq::STAR, &registry, None, None, false)
+                .unwrap_err();
+        let registry_diagnostic = registry_error.to_string();
+        assert!(
+            !registry_diagnostic.contains(&marker),
+            "{registry_diagnostic}"
+        );
+        assert!(
+            !registry_cache.exists(),
+            "unsafe registry source created cache state"
+        );
+
+        let root = temp("source-edit-fail-closed");
+        let manifest_path = root.join(MANIFEST_NAME);
+        write(
+            &manifest_path,
+            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n",
+        );
+        write(&root.join("main.yx"), "言 1；\n");
+        let before = fs::read(&manifest_path).unwrap();
+        let dependency = Dependency::Git {
+            url: git_url,
+            revision: "HEAD".into(),
+            requirement: None,
+        };
+        let edit_error =
+            edit_dependency(&manifest_path, "fixture", None, Some(&dependency), false).unwrap_err();
+        let edit_diagnostic = edit_error.to_string();
+        assert!(!edit_diagnostic.contains(&marker), "{edit_diagnostic}");
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn unsafe_manifest_and_lock_sources_fail_closed_without_echoing_values() {
         let root = temp("unsafe-persisted-source");
         let marker = "persisted-value-must-not-appear";
         let unsafe_url = format!("https://user:{marker}@example.invalid/package.git");
@@ -14986,6 +15832,7 @@ mod tests {
         write(&root.join("main.yx"), "言 1；\n");
         let manifest_error = load(&manifest_path).unwrap_err().to_string();
         assert!(!manifest_error.contains(marker), "{manifest_error}");
+        assert!(!manifest_error.contains(&unsafe_url), "{manifest_error}");
 
         let unsafe_lock = lock_with_source(format!("git:{unsafe_url}"));
         let old_lock_path = root.join("old.lock");
@@ -14995,6 +15842,7 @@ mod tests {
         );
         let read_error = read_lock(&old_lock_path).unwrap_err().to_string();
         assert!(!read_error.contains(marker), "{read_error}");
+        assert!(!read_error.contains(&unsafe_url), "{read_error}");
 
         let new_lock_path = root.join("new.lock");
         let write_error = write_lock(&new_lock_path, &unsafe_lock)
@@ -15002,15 +15850,23 @@ mod tests {
             .to_string();
         assert!(!write_error.contains(marker), "{write_error}");
         assert!(!new_lock_path.exists());
+        fs::remove_dir_all(root).ok();
+    }
 
+    #[test]
+    fn registry_index_rejects_unsafe_artifact_and_advisory_urls_without_echoing_values() {
+        let root = temp("unsafe-registry-index-source");
+        let checksum = "a".repeat(64);
+        let marker = "registry-value-must-not-appear";
+        let artifact_url = format!("https://user:{marker}@example.invalid/package.tar.gz");
         let artifact_index = root.join("artifact.json");
         write(
             &artifact_index,
             &serde_json::to_string(&serde_json::json!({
                 "versions": [{
                     "version": "1.0.0",
-                    "url": format!("https://user:{marker}@example.invalid/package.tar.gz"),
-                    "checksum": "a".repeat(64),
+                    "url": artifact_url,
+                    "checksum": checksum,
                 }]
             }))
             .unwrap(),
@@ -15020,6 +15876,7 @@ mod tests {
             .to_string();
         assert!(!artifact_error.contains(marker), "{artifact_error}");
 
+        let advisory_url = format!("https://security.example.invalid/advisory?token={marker}");
         let advisory_index = root.join("advisory.json");
         write(
             &advisory_index,
@@ -15027,12 +15884,12 @@ mod tests {
                 "versions": [{
                     "version": "1.0.0",
                     "url": "https://example.invalid/package.tar.gz",
-                    "checksum": "a".repeat(64),
+                    "checksum": checksum,
                     "vulnerabilities": [{
                         "id": "YXSA-2026-0001",
                         "severity": "high",
                         "summary": "fixture advisory",
-                        "url": format!("https://security.example.invalid/advisory?token={marker}"),
+                        "url": advisory_url,
                     }]
                 }]
             }))
@@ -15161,6 +16018,10 @@ mod tests {
             "[包]\n名='长路径Git包'\n版='1.0.0'\n入口='主.yx'\n",
         );
         write(&repository.join("主.yx"), "公 定 答：数 为 12；\n");
+        write(
+            &repository.join("pax_global_header"),
+            "Git 全局扩展头同名资源\n",
+        );
         let long_relative = PathBuf::from("甲".repeat(70))
             .join("乙".repeat(70))
             .join("深.yx");
@@ -15182,6 +16043,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(generation.join(long_relative)).unwrap(),
             "公 定 深值：数 为 13；\n"
+        );
+        assert_eq!(
+            fs::read_to_string(generation.join("pax_global_header")).unwrap(),
+            "Git 全局扩展头同名资源\n"
         );
 
         remove_git_fixture_cache(&url);
