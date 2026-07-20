@@ -535,7 +535,11 @@ fn benchmark(iterations: usize) -> ExitCode {
 
 fn document_file(path: &str, output: Option<&str>) -> ExitCode {
     let input = Path::new(path);
-    let markdown = if let Some(directory) = document_directory(input) {
+    let directory = match document_directory(input) {
+        Ok(directory) => directory,
+        Err(error) => return fail(error),
+    };
+    let markdown = if let Some(directory) = directory {
         match yanxu::docgen::markdown_directory(directory) {
             Ok(markdown) => markdown,
             Err(error) => return fail(error),
@@ -574,7 +578,11 @@ fn document_file(path: &str, output: Option<&str>) -> ExitCode {
 
 fn document_json(path: &str, output: Option<&str>) -> ExitCode {
     let input = Path::new(path);
-    if document_directory(input).is_some() {
+    let directory = match document_directory(input) {
+        Ok(directory) => directory,
+        Err(error) => return fail(error),
+    };
+    if directory.is_some() {
         return fail("yanxu 文 --json 当前要求单个模块文卷");
     }
     let (canonical, _, statements) = match source_file(path) {
@@ -611,30 +619,39 @@ fn document_json(path: &str, output: Option<&str>) -> ExitCode {
     }
 }
 
-fn document_directory(input: &Path) -> Option<PathBuf> {
+fn document_directory(input: &Path) -> Result<Option<PathBuf>, String> {
     match fs::symlink_metadata(input) {
-        Ok(metadata) => return metadata.is_dir().then(|| input.to_path_buf()),
+        Ok(metadata) => return Ok(metadata.is_dir().then(|| input.to_path_buf())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return None,
+        Err(error) => {
+            return Err(format!("不能检查文档入口“{}”：{error}", input.display()));
+        }
     }
 
     let absolute = if input.is_absolute() {
         input.to_path_buf()
     } else {
-        env::current_dir().ok()?.join(input)
+        env::current_dir()
+            .map_err(|error| format!("不能定位当前目录：{error}"))?
+            .join(input)
     };
-    let manifest = yanxu::package::discover(&absolute).ok()??;
-    let relative = absolute.strip_prefix(&manifest.root).ok()?;
-    let resolved = yanxu::package::resolve_existing_package_path(
-        &manifest.root,
-        relative,
-        yanxu::package::PackagePathPurpose::ManifestReference,
-    )
-    .ok()?;
-    fs::symlink_metadata(&resolved)
-        .ok()?
-        .is_dir()
-        .then_some(resolved)
+    let mut roots = yanxu::package::TrustedPackageRoots::default();
+    let Some(_) = roots
+        .insert_discovered(&absolute)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let Some((resolved, is_directory)) = roots
+        .resolve_existing_path(
+            &absolute,
+            yanxu::package::PackagePathPurpose::ManifestReference,
+        )
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    Ok(is_directory.then_some(resolved))
 }
 
 fn source_file(path: &str) -> Result<(PathBuf, String, Vec<yanxu::ast::Stmt>), String> {
