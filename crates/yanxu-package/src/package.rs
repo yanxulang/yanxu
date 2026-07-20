@@ -10623,10 +10623,7 @@ mod tests {
         let manifest = discover(relative_root.join("src/主.yx")).unwrap().unwrap();
         assert!(manifest.root.is_absolute());
         assert!(manifest.path.is_absolute());
-        assert_eq!(
-            manifest.root,
-            std::env::current_dir().unwrap().join(&relative_root)
-        );
+        assert_eq!(manifest.root, fs::canonicalize(&relative_root).unwrap());
         fs::remove_dir_all(relative_root).unwrap();
     }
 
