@@ -936,6 +936,13 @@ impl Vm {
                 })
                 .transpose()?
         };
+        let _resolution_cache_scope = if opened_roots.is_none() {
+            package_root
+                .as_deref()
+                .map(crate::package::resolution_cache_scope)
+        } else {
+            None
+        };
         let mut package_module_roots = opened_roots.cloned().unwrap_or_default();
         if opened_roots.is_none()
             && let Some(root) = &package_root

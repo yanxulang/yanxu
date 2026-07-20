@@ -1818,9 +1818,14 @@ fn direct_dependencies(
 }
 
 static GRAPH_CACHE: OnceLock<Mutex<HashMap<PathBuf, ResolvedGraphBundle>>> = OnceLock::new();
+static GRAPH_CACHE_SCOPES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
 fn graph_cache() -> &'static Mutex<HashMap<PathBuf, ResolvedGraphBundle>> {
     GRAPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn graph_cache_scopes() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    GRAPH_CACHE_SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn graph_cache_key(root: &Path) -> PathBuf {
@@ -1834,26 +1839,59 @@ fn cache_graph(manifest: &Manifest, resolved: ResolvedGraphBundle) {
         .insert(graph_cache_key(&manifest.root), resolved);
 }
 
-struct ScopedGraphCache {
+/// 把依赖图缓存限制在一次顶层执行或构建操作内。
+///
+/// 同一包根的嵌套或并发作用域共享缓存，最后一个作用域退出时才释放其中的
+/// 已打开目录能力。
+#[derive(Debug)]
+#[doc(hidden)]
+#[must_use = "依赖图缓存作用域守卫必须保持存活到顶层操作结束"]
+pub struct ResolutionCacheScope {
     key: PathBuf,
 }
 
-impl Drop for ScopedGraphCache {
+impl Drop for ResolutionCacheScope {
     fn drop(&mut self) {
-        graph_cache()
+        let mut scopes = graph_cache_scopes()
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&self.key);
+            .unwrap_or_else(|error| error.into_inner());
+        let should_remove = match scopes.get_mut(&self.key) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) | None => true,
+        };
+        if should_remove {
+            graph_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&self.key);
+            scopes.remove(&self.key);
+        }
     }
 }
 
-fn scoped_graph_cache(manifest: &Manifest, resolved: ResolvedGraphBundle) -> ScopedGraphCache {
-    let key = graph_cache_key(&manifest.root);
+#[doc(hidden)]
+pub fn resolution_cache_scope(root: &Path) -> ResolutionCacheScope {
+    let key = graph_cache_key(root);
+    let mut scopes = graph_cache_scopes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let count = scopes.entry(key.clone()).or_default();
+    *count = count
+        .checked_add(1)
+        .expect("resolution cache scope overflow");
+    ResolutionCacheScope { key }
+}
+
+fn scoped_graph_cache(manifest: &Manifest, resolved: ResolvedGraphBundle) -> ResolutionCacheScope {
+    let scope = resolution_cache_scope(&manifest.root);
     graph_cache()
         .lock()
         .expect("graph cache poisoned")
-        .insert(key.clone(), resolved);
-    ScopedGraphCache { key }
+        .insert(scope.key.clone(), resolved);
+    scope
 }
 
 fn cached_or_resolve_graph(
@@ -10994,6 +11032,43 @@ mod tests {
                 .contains_key(&key)
         );
 
+        drop(manifest);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_resolution_cache_scopes_release_after_outer_exit() {
+        let root = temp("nested-resolution-cache-scope");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='嵌套缓存作用域'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言 1；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let key = graph_cache_key(&manifest.root);
+        let outer = resolution_cache_scope(&manifest.root);
+
+        with_locked_resolution(&manifest, false, |_| Ok::<_, ManifestError>(())).unwrap();
+        assert!(
+            graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .contains_key(&key)
+        );
+
+        drop(outer);
+        assert!(
+            !graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .contains_key(&key)
+        );
+        assert!(
+            !graph_cache_scopes()
+                .lock()
+                .expect("graph cache scope poisoned")
+                .contains_key(&key)
+        );
         drop(manifest);
         fs::remove_dir_all(root).unwrap();
     }
