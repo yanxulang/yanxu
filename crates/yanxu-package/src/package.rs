@@ -3706,6 +3706,8 @@ fn acquire_git_cache_lock(
 fn hardened_git_command() -> Command {
     let mut command = Command::new("git");
     command
+        .arg("-c")
+        .arg("core.longpaths=true")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ALLOW_PROTOCOL", "file:https:ssh:git+ssh")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -3722,6 +3724,40 @@ fn hardened_git_command() -> Command {
     command
 }
 
+#[cfg(windows)]
+fn git_command_path(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC_PREFIX: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if let Some(remainder) = encoded.strip_prefix(VERBATIM_UNC_PREFIX) {
+        let mut compatible = vec![b'\\' as u16, b'\\' as u16];
+        compatible.extend_from_slice(remainder);
+        return PathBuf::from(OsString::from_wide(&compatible));
+    }
+    if let Some(remainder) = encoded.strip_prefix(VERBATIM_PREFIX) {
+        return PathBuf::from(OsString::from_wide(remainder));
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(windows))]
+fn git_command_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn git_store_command(store: &Path) -> Command {
     let mut command = hardened_git_command();
     command
@@ -3729,7 +3765,7 @@ fn git_store_command(store: &Path) -> Command {
         .arg("core.attributesFile=")
         .arg("--no-optional-locks")
         .arg("--git-dir")
-        .arg(store);
+        .arg(git_command_path(store));
     command
 }
 
@@ -4183,7 +4219,7 @@ fn create_git_object_store(
             .arg("--bare")
             .arg("--quiet")
             .arg("--template=")
-            .arg(temporary.path()),
+            .arg(git_command_path(temporary.path())),
         temporary.path(),
         "初始化 Git bare 对象库",
         GIT_INITIALIZE_TIMEOUT,
@@ -4223,7 +4259,7 @@ fn capture_git_commit_snapshot(
             .arg("archive")
             .arg("--format=tar")
             .arg("--output")
-            .arg(&archive_path)
+            .arg(git_command_path(&archive_path))
             .arg(exact),
         store,
         "导出精确 Git 提交",
@@ -15970,6 +16006,23 @@ mod tests {
         assert!(error.message.contains("检查 Git 精确提交失败"), "{error}");
         assert!(error.message.contains("退出码"), "{error}");
         fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_command_paths_remove_windows_verbatim_prefixes() {
+        assert_eq!(
+            git_command_path(Path::new(r"\\?\C:\缓存\objects.git")),
+            PathBuf::from(r"C:\缓存\objects.git")
+        );
+        assert_eq!(
+            git_command_path(Path::new(r"\\?\UNC\server\share\objects.git")),
+            PathBuf::from(r"\\server\share\objects.git")
+        );
+        assert_eq!(
+            git_command_path(Path::new(r"C:\缓存\objects.git")),
+            PathBuf::from(r"C:\缓存\objects.git")
+        );
     }
 
     #[test]
