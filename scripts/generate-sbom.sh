@@ -57,7 +57,10 @@ normalize_bom() {
     echo "不能从组件身份生成 CycloneDX 序列号" >&2
     exit 1
   fi
-  test -s "$input"
+  if [ ! -s "$input" ]; then
+    echo "SBOM 输入不存在或为空：$input" >&2
+    exit 1
+  fi
   mv "$input" "$destination"
   jq -S \
     --arg version "$version" \
@@ -98,7 +101,7 @@ normalize_bom() {
     ' "$destination" > "$destination.tmp"
   mv "$destination.tmp" "$destination"
 
-  jq -e \
+  if ! jq -e \
     --arg name "$expected_name" \
     --arg expected_version "$expected_version" \
     --arg serial_number "$serial_number" \
@@ -111,7 +114,10 @@ normalize_bom() {
      and ([.metadata.properties[] | select(.name == "cdx:yanxu:source:commit" and .value == $commit)] | length) == 1
      and ([.metadata.properties[] | select(.name == "cdx:yanxu:cargo-lock:sha256" and .value == $lock_sha)] | length) == 1
      and ([.. | strings | select(contains("path+file:") or contains("download_url=file://"))] | length) == 0' \
-    "$destination" >/dev/null
+    "$destination" >/dev/null; then
+    echo "SBOM 元数据或路径归一化校验失败：$destination" >&2
+    exit 1
+  fi
   if grep -F "$root" "$destination" >/dev/null; then
     echo "SBOM 不得包含构建机绝对路径" >&2
     exit 1
