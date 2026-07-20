@@ -1659,7 +1659,8 @@ impl Checker {
         }
         let current_dir = self.current_dir.clone()?;
         let (joined, package_import) = if let Some(name) = requested.strip_prefix("包:") {
-            match crate::package::resolve_dependency_scoped_with_capabilities(
+            match crate::package::resolve_dependency_scoped_with_opened_capabilities(
+                &self.package_module_roots,
                 self.package_root.as_deref(),
                 &current_dir,
                 name,
