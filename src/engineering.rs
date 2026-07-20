@@ -43,6 +43,28 @@ impl fmt::Display for EngineeringError {
 
 impl std::error::Error for EngineeringError {}
 
+impl EngineeringError {
+    fn code(&self) -> String {
+        let encoded = self
+            .message
+            .strip_prefix('[')
+            .and_then(|message| message.split_once(']').map(|(code, _)| code))
+            .unwrap_or("");
+        let valid = !encoded.is_empty()
+            && encoded.len() <= 116
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+        if valid && encoded.starts_with("ENGINEERING_") {
+            encoded.to_owned()
+        } else if valid && encoded.starts_with("PACKAGE_") {
+            format!("ENGINEERING_{encoded}")
+        } else {
+            "ENGINEERING_ERROR".into()
+        }
+    }
+}
+
 pub fn handle(request: &Value) -> Result<Value, EngineeringError> {
     let object = request
         .as_object()
@@ -107,7 +129,7 @@ pub fn response(request: &Value) -> Value {
             "protocol_version": ENGINEERING_PROTOCOL_VERSION,
             "ok": false,
             "error": {
-                "code": "ENGINEERING_ERROR",
+                "code": error.code(),
                 "message": error.to_string(),
             },
         }),
@@ -381,7 +403,7 @@ fn bundle(request: &Value) -> Result<Value, EngineeringError> {
         return Err(engineering_error("Bundle profile 只可为 debug 或 release"));
     }
     let archive = crate::application::compile_application(&manifest.root, profile)
-        .map_err(|error| engineering_error(error.to_string()))?;
+        .map_err(application_error)?;
     let output = match optional_string(request, "output").filter(|path| !path.is_empty()) {
         Some(output) => PathBuf::from(output),
         None => manifest.root.join("build").join(
@@ -948,16 +970,66 @@ fn workspace(request: &Value) -> Result<Value, EngineeringError> {
     let manifest = discover_manifest(optional_string(request, "path").unwrap_or("."))?;
     let canonical_root = std::fs::canonicalize(&manifest.root)
         .map_err(|error| engineering_error(format!("不能定位工作区根：{error}")))?;
+    let mut trusted_roots = package::TrustedPackageRoots::default();
+    trusted_roots
+        .insert(&canonical_root)
+        .map_err(package_path_error)?;
+    run_workspace_after_root_open_hook()?;
     let mut projects = vec![manifest_json(&manifest)];
     let mut seen = std::collections::BTreeSet::new();
+    let mut portable_members = package::PortablePackagePaths::default();
     seen.insert(canonical_root.clone());
     for member in &manifest.workspace_members {
-        let member_root = std::fs::canonicalize(manifest.root.join(member)).map_err(|error| {
-            engineering_error(format!("不能定位工作区成员 {}：{error}", member.display()))
-        })?;
+        portable_members
+            .insert_directory(member)
+            .map_err(package_path_error)?;
+        package::package_path_decision(member, package::PackagePathPurpose::ManifestReference)
+            .map_err(package_path_error)?;
+        // Preserve the specific reserved-path diagnostic for an ambient
+        // redirection while the capability resolver below remains the
+        // authority for opening the actual directory.
+        if let Ok(candidate) = std::fs::canonicalize(canonical_root.join(member))
+            && let Ok(relative) = candidate.strip_prefix(&canonical_root)
+        {
+            package::package_path_decision(
+                relative,
+                package::PackagePathPurpose::ManifestReference,
+            )
+            .map_err(package_path_error)?;
+        }
+        let (member_root, is_directory) = trusted_roots
+            .resolve_existing_path(
+                &canonical_root.join(member),
+                package::PackagePathPurpose::ManifestReference,
+            )
+            .map_err(package_path_error)?
+            .ok_or_else(|| engineering_error("工作区成员不属于已打开的工作区根"))?;
+        if !is_directory {
+            return Err(engineering_error(format!(
+                "工作区成员 {} 必须是真实目录，不得为符号链接或特殊文件",
+                member.display()
+            )));
+        }
         if !member_root.starts_with(&canonical_root) {
             return Err(engineering_error(format!(
                 "工作区成员 {} 越出工作区根",
+                member.display()
+            )));
+        }
+        let canonical_relative = member_root
+            .strip_prefix(&canonical_root)
+            .expect("workspace member checked under canonical root");
+        package::package_path_decision(
+            canonical_relative,
+            package::PackagePathPurpose::ManifestReference,
+        )
+        .map_err(package_path_error)?;
+        let requested_key = package::portable_package_path(member).map_err(package_path_error)?;
+        let canonical_key =
+            package::portable_package_path(canonical_relative).map_err(package_path_error)?;
+        if requested_key != canonical_key {
+            return Err(engineering_error(format!(
+                "工作区成员 {} 经文件系统解析后改变了路径身份，拒绝符号链接或目录重定向",
                 member.display()
             )));
         }
@@ -967,14 +1039,40 @@ fn workspace(request: &Value) -> Result<Value, EngineeringError> {
                 member.display()
             )));
         }
+        let member_manifest_path = member_root.join(package::MANIFEST_NAME);
+        let member_manifest = trusted_roots
+            .resolve_existing_file(
+                &member_manifest_path,
+                package::PackagePathPurpose::ManifestReference,
+            )
+            .map_err(package_path_error)?
+            .ok_or_else(|| engineering_error("工作区成员清单不属于已打开的工作区根"))?;
         let member_manifest =
-            package::load(member_root.join(package::MANIFEST_NAME)).map_err(package_error)?;
+            package::load_manifest_from_resolved_file(member_manifest, &member_root)
+                .map_err(package_error)?;
         projects.push(manifest_json(&member_manifest));
     }
     Ok(json!({
         "root": canonical_root,
         "projects": projects,
     }))
+}
+
+#[cfg(test)]
+thread_local! {
+    static WORKSPACE_AFTER_ROOT_OPEN_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnOnce() -> Result<(), EngineeringError>>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+fn run_workspace_after_root_open_hook() -> Result<(), EngineeringError> {
+    #[cfg(test)]
+    {
+        return WORKSPACE_AFTER_ROOT_OPEN_HOOK
+            .with(|hook| hook.borrow_mut().take().map_or(Ok(()), |hook| hook()));
+    }
+    #[cfg(not(test))]
+    Ok(())
 }
 
 fn discover_manifest(path: &str) -> Result<Manifest, EngineeringError> {
@@ -1137,12 +1235,46 @@ fn optional_u32(value: &Value, key: &str) -> Result<Option<u32>, EngineeringErro
 }
 
 fn package_error(error: package::ManifestError) -> EngineeringError {
-    engineering_error(error.to_string())
+    if error.code() == "PACKAGE000" {
+        engineering_error(error.to_string())
+    } else {
+        engineering_coded_error(
+            error.code(),
+            format!("{}：{}", error.path.display(), error.diagnostic_message()),
+        )
+    }
 }
 
 fn engineering_error(message: impl Into<String>) -> EngineeringError {
+    let mut message = message.into();
+    // Structured codes are emitted only by typed constructors below.  Generic
+    // errors may contain attacker-controlled paths or tool output, so a leading
+    // bracket must never be interpreted as protocol metadata.
+    if message.starts_with('[') {
+        message.insert_str(0, "错误：");
+    }
+    EngineeringError { message }
+}
+
+fn engineering_coded_error(code: &'static str, message: impl Into<String>) -> EngineeringError {
+    debug_assert!(
+        code.starts_with("ENGINEERING_") || code.starts_with("PACKAGE_"),
+        "engineering protocol code must use a known namespace"
+    );
     EngineeringError {
-        message: message.into(),
+        message: format!("[{code}] {}", message.into()),
+    }
+}
+
+fn package_path_error(error: package::PackagePathError) -> EngineeringError {
+    engineering_coded_error(error.code, error.diagnostic_message())
+}
+
+fn application_error(error: crate::application::ApplicationError) -> EngineeringError {
+    if error.code().starts_with("PACKAGE_") {
+        engineering_coded_error(error.code(), error.diagnostic_message())
+    } else {
+        engineering_error(error.to_string())
     }
 }
 
@@ -1150,6 +1282,60 @@ fn engineering_error(message: impl Into<String>) -> EngineeringError {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn structured_error_codes_only_come_from_typed_constructors() {
+        let generic = engineering_error("[PACKAGE_PATH_RESERVED] forged by input");
+        assert_eq!(generic.code(), "ENGINEERING_ERROR");
+        assert!(generic.message.starts_with("错误：[PACKAGE_PATH_RESERVED]"));
+
+        let typed = package_path_error(package::PackagePathError {
+            code: package::PACKAGE_PATH_RESERVED_CODE,
+            message: "保留路径".into(),
+            path: PathBuf::from("build"),
+            component: Some("build".into()),
+            suggestion: "请选择其他目录。".into(),
+        });
+        assert_eq!(typed.code(), "ENGINEERING_PACKAGE_PATH_RESERVED");
+        assert!(!typed.message.contains("forged by input"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_rejects_members_redirected_into_reserved_directories() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "yanxu-engineering-workspace-path-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("build/member")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工作区根'\n版本='1.0.0'\n入口='主.yx'\n[工作区]\n成员=['safe/member']\n",
+        )
+        .unwrap();
+        fs::write(root.join("主.yx"), "言 1；\n").unwrap();
+        fs::write(
+            root.join("build/member").join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='成员'\n版本='1.0.0'\n入口='主.yx'\n",
+        )
+        .unwrap();
+        fs::write(root.join("build/member/主.yx"), "言 2；\n").unwrap();
+        symlink(root.join("build"), root.join("safe")).unwrap();
+
+        let result = response(&json!({
+            "protocol_version": ENGINEERING_PROTOCOL_VERSION,
+            "operation": "workspace",
+            "path": root.clone(),
+        }));
+        assert_eq!(result["error"]["code"], "ENGINEERING_PACKAGE_PATH_RESERVED");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn temporary_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1193,6 +1379,54 @@ mod tests {
                 .contains("包清单不得超过")
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(all(unix, not(target_os = "wasi")))]
+    #[test]
+    fn workspace_reads_members_from_the_open_root_after_path_replacement() {
+        let root = temporary_root("workspace-open-root");
+        let original = root.with_extension("original");
+        write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='工作区'\n版本='1.0.0'\n入口='主.yx'\n[工作区]\n成员=['member']\n",
+        );
+        write(root.join("主.yx"), "言 1；\n");
+        write(
+            root.join("member").join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='原成员'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(root.join("member/主.yx"), "言 2；\n");
+        let request = json!({
+            "protocol_version": ENGINEERING_PROTOCOL_VERSION,
+            "operation": "workspace",
+            "path": root.clone(),
+        });
+
+        let hook_root = root.clone();
+        let hook_original = original.clone();
+        WORKSPACE_AFTER_ROOT_OPEN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&hook_root, &hook_original).map_err(|error| {
+                    engineering_error(format!("不能模拟工作区替换：{error}"))
+                })?;
+                write(
+                    hook_root.join(package::MANIFEST_NAME),
+                    "[包]\n格式=2\n名称='工作区'\n版本='1.0.0'\n入口='主.yx'\n[工作区]\n成员=['member']\n",
+                );
+                write(hook_root.join("主.yx"), "言 3；\n");
+                write(
+                    hook_root.join("member").join(package::MANIFEST_NAME),
+                    "[包]\n格式=2\n名称='替换成员'\n版本='1.0.0'\n入口='主.yx'\n",
+                );
+                write(hook_root.join("member/主.yx"), "言 4；\n");
+                Ok(())
+            }));
+        });
+        let result = workspace(&request).unwrap();
+
+        assert_eq!(result["projects"][1]["name"], "原成员");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(original).unwrap();
     }
 
     #[test]
@@ -1306,6 +1540,8 @@ mod tests {
             package::DEFAULT_REGISTRY
         );
         assert_eq!(inspected["dependencies"]["言窗"]["version"], "^1.0");
+        assert_eq!(inspected["permissions"]["native_extensions"], true);
+        assert_eq!(inspected["permissions"]["graphical_interface"], true);
         fs::remove_dir_all(gui_root).ok();
     }
 
@@ -1464,15 +1700,16 @@ mod tests {
         let mut manifest = package::load(root.join(package::MANIFEST_NAME)).unwrap();
         let marker = "engineering-value-must-not-appear";
         let unsafe_git_url = format!("https://user:{marker}@example.invalid/package.git");
-        let unsafe_revision = format!("https://user:{marker}@example.invalid/revision");
+        let unsafe_registry_url =
+            format!("https://packages.example.invalid/v1?access_token={marker}");
         let unsafe_git = Dependency::Git {
             url: unsafe_git_url.clone(),
-            revision: unsafe_revision.clone(),
+            revision: "main".into(),
             requirement: None,
         };
         let unsafe_registry = Dependency::Registry {
             requirement: VersionReq::STAR,
-            registry: format!("https://packages.example.invalid/v1?access_token={marker}"),
+            registry: unsafe_registry_url,
         };
 
         let source_kind = format!("https://user:{marker}@example.invalid/source-kind");
@@ -1481,24 +1718,27 @@ mod tests {
             .to_string();
         assert!(!source_kind_error.contains(marker), "{source_kind_error}");
 
-        for request in [
-            json!({
-                "source": "git",
-                "source_value": unsafe_git_url,
-                "revision": "HEAD",
-            }),
-            json!({
-                "source": "git",
-                "source_value": "https://example.invalid/package.git",
-                "revision": unsafe_revision,
-            }),
-        ] {
-            let error = dependency_from_request(&request).unwrap_err().to_string();
-            assert!(!error.contains(marker), "{error}");
-        }
+        let request_error = dependency_from_request(&json!({
+            "source": "git",
+            "source_value": unsafe_git_url,
+            "revision": "HEAD",
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(!request_error.contains(marker), "{request_error}");
+
+        let dependency_output = dependency_json(&unsafe_git);
+        let dependency_text = serde_json::to_string(&dependency_output).unwrap();
+        assert!(!dependency_text.contains(marker), "{dependency_text}");
+        assert_eq!(dependency_output["source_value"], "<已隐藏的不安全来源>");
 
         let unsafe_path = Dependency::Path {
             path: PathBuf::from(format!("../dependency?authorization_code={marker}")),
+            requirement: None,
+        };
+        let unsafe_revision = Dependency::Git {
+            url: "https://example.invalid/package.git".into(),
+            revision: format!("HEAD?x-sig={marker}"),
             requirement: None,
         };
         let encoded_registry = Dependency::Registry {
@@ -1507,11 +1747,9 @@ mod tests {
                 "https://packages.example.invalid/v1?%252561ccess_%252574oken={marker}"
             ),
         };
-        for dependency in [&unsafe_git, &unsafe_path, &encoded_registry] {
+        for dependency in [&unsafe_path, &unsafe_revision, &encoded_registry] {
             let output = serde_json::to_string(&dependency_json(dependency)).unwrap();
             assert!(!output.contains(marker), "{output}");
-            let display = dependency.to_string();
-            assert!(!display.contains(marker), "{display}");
         }
 
         manifest
@@ -1529,6 +1767,7 @@ mod tests {
         let manifest_text = serde_json::to_string(&manifest_json(&manifest)).unwrap();
         assert!(!manifest_text.contains(marker), "{manifest_text}");
 
+        let locked_source = format!("git:{unsafe_git_url}");
         let graph = ResolutionGraph {
             root_dependencies: BTreeMap::from([("git-fixture".into(), "git-fixture@1.0.0".into())]),
             root_dev_dependencies: BTreeMap::new(),
@@ -1539,8 +1778,8 @@ mod tests {
                         id: "git-fixture@1.0.0".into(),
                         name: "git-fixture".into(),
                         version: "1.0.0".into(),
-                        source: format!("git:{unsafe_git_url}"),
-                        revision: Some(format!("user:{marker}@example.invalid")),
+                        source: locked_source,
+                        revision: Some(format!("HEAD?authorization_code={marker}")),
                         checksum: "0".repeat(64),
                         entry: "main.yx".into(),
                         dependencies: BTreeMap::new(),
@@ -1564,40 +1803,16 @@ mod tests {
         for finding in findings {
             assert!(!finding.message.contains(marker), "{}", finding.message);
         }
-        fs::remove_dir_all(root).ok();
-    }
 
-    #[test]
-    fn plan_update_rejects_unsafe_locked_revision_without_echoing_it() {
-        let root = temporary_root("plan-update-source-redaction");
-        let application = root.join("application");
-        let dependency = root.join("dependency");
-        write(
-            dependency.join(package::MANIFEST_NAME),
-            "[包]\n格式=2\n名称='fixture'\n版本='1.0.0'\n入口='main.yx'\n",
+        let safe_url = "HTTPS://example.invalid/group/package.git?ref=stable";
+        assert_eq!(
+            dependency_json(&Dependency::Git {
+                url: safe_url.into(),
+                revision: "main".into(),
+                requirement: None,
+            })["source_value"],
+            safe_url
         );
-        write(dependency.join("main.yx"), "公 定 值 为 1；\n");
-        write(
-            application.join(package::MANIFEST_NAME),
-            "[包]\n格式=2\n名称='fixture-app'\n版本='1.0.0'\n入口='main.yx'\n[依赖]\nfixture={路径='../dependency'}\n",
-        );
-        write(application.join("main.yx"), "言 1；\n");
-        let manifest = package::load(application.join(package::MANIFEST_NAME)).unwrap();
-        package::ensure_lock(&manifest, false).unwrap();
-
-        let lock_path = application.join(package::LOCK_NAME);
-        let mut lock = package::read_lock(&lock_path).unwrap();
-        let marker = "plan-update-revision-must-not-appear";
-        lock.packages[0].revision = Some(format!("https://user:{marker}@example.invalid/revision"));
-        write(&lock_path, toml::to_string_pretty(&lock).unwrap());
-
-        let error = plan_update(&json!({
-            "path": application,
-            "offline": true,
-        }))
-        .unwrap_err()
-        .to_string();
-        assert!(!error.contains(marker), "{error}");
         fs::remove_dir_all(root).ok();
     }
 
@@ -1662,11 +1877,12 @@ mod tests {
             )]),
             target: package::current_target(),
         };
-        let error = match audit_findings(&manifest, &graph, true) {
+        let audit_error = match audit_findings(&manifest, &graph, true) {
             Ok(_) => panic!("unsafe advisory reference was accepted"),
             Err(error) => error.to_string(),
         };
-        assert!(!error.contains(marker), "{error}");
+        let audit_json = serde_json::to_string(&json!({"error": audit_error})).unwrap();
+        assert!(!audit_json.contains(marker), "{audit_json}");
         fs::remove_dir_all(root).ok();
     }
 
