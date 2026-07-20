@@ -1,5 +1,7 @@
 #![cfg(not(target_family = "wasm"))]
 
+mod support;
+
 use sha2::{Digest, Sha256};
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -18,9 +20,6 @@ fn library_path() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let target = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root.join("target"));
         let status = std::process::Command::new(env!("CARGO"))
             .args([
                 "build",
@@ -29,10 +28,11 @@ fn library_path() -> PathBuf {
                     .to_str()
                     .unwrap(),
             ])
+            .current_dir(&root)
             .status()
             .unwrap();
         assert!(status.success());
-        target.join("debug").join(format!(
+        support::cargo_target_dir(&root).join("debug").join(format!(
             "{}yanxu_native_v2_example{}",
             std::env::consts::DLL_PREFIX,
             std::env::consts::DLL_SUFFIX
