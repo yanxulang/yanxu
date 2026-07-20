@@ -58,7 +58,7 @@ normalize_bom() {
   fi
   test -s "$input"
   mv "$input" "$destination"
-  jq \
+  jq -S \
     --arg version "$version" \
     --arg package_version "$package_version" \
     --arg native_v1_version "$native_v1_version" \
@@ -90,6 +90,7 @@ normalize_bom() {
           {name: "cdx:yanxu:cargo-lock:sha256", value: $lock_sha},
           {name: "cdx:yanxu:build:profile", value: "release"}
         ]
+      | walk(if type == "array" then sort_by(tojson) else . end)
     ' "$destination" > "$destination.tmp"
   mv "$destination.tmp" "$destination"
 
