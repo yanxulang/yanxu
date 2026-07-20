@@ -338,7 +338,7 @@ impl Formatter {
                 self.output.push_str(method);
             }
             ExprKind::List(items) => self.items(items, '【', '】'),
-            ExprKind::Tuple(items) => self.items(items, '（', '）'),
+            ExprKind::Tuple(items) => self.tuple(items),
             ExprKind::Map(entries) => {
                 self.output.push('{');
                 for (index, (key, value)) in entries.iter().enumerate() {
@@ -421,6 +421,20 @@ impl Formatter {
         self.output.push(close);
     }
 
+    fn tuple(&mut self, items: &[Expr]) {
+        self.output.push('（');
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                self.output.push('，');
+            }
+            self.expression(item);
+        }
+        if items.len() == 1 {
+            self.output.push('，');
+        }
+        self.output.push('）');
+    }
+
     fn type_ref(&mut self, type_ref: Option<&TypeRef>) {
         if let Some(type_ref) = type_ref {
             self.output.push('：');
@@ -469,6 +483,23 @@ mod tests {
         let second = format(&crate::parse(&first).unwrap());
         assert_eq!(first, second);
         assert!(first.starts_with("公 异 法 求和"));
+    }
+
+    #[test]
+    fn single_element_tuple_keeps_its_disambiguating_comma() {
+        let first = format(&crate::parse("言 （值，）；").unwrap());
+        assert_eq!(first, "言 （值，）；\n");
+
+        let reparsed = crate::parse(&first).unwrap();
+        let StmtKind::Print(Expr {
+            kind: ExprKind::Tuple(items),
+            ..
+        }) = &reparsed[0].kind
+        else {
+            panic!("单元素元组格式化后必须仍为元组");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(format(&reparsed), first);
     }
 
     #[test]
