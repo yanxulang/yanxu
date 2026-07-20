@@ -70,6 +70,7 @@ fn reserved_dependency_module_is_rejected_consistently_after_graph_cache_hit() {
     let (root, app, source) = package_fixture("../dependency", "build");
     let entry = app.join("src/主.yx");
     let manifest = package::load(app.join(package::MANIFEST_NAME)).unwrap();
+    let cache_scope = package::resolution_cache_scope(&manifest.root);
     package::ensure_lock_with_dev(&manifest, false).unwrap();
     let statements = yanxu::parse_named(&source, entry.display().to_string()).unwrap();
 
@@ -117,6 +118,7 @@ fn reserved_dependency_module_is_rejected_consistently_after_graph_cache_hit() {
         "{doc_error}"
     );
 
+    drop(cache_scope);
     fs::remove_dir_all(root).unwrap();
 }
 
