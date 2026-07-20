@@ -15,20 +15,21 @@ use yanxu::permissions::PermissionSet;
 fn example_library() -> &'static PathBuf {
     static LIBRARY: OnceLock<PathBuf> = OnceLock::new();
     LIBRARY.get_or_init(|| {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target"));
         let status = std::process::Command::new(env!("CARGO"))
             .args(["build", "-p", "yanxu-native-example"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .current_dir(&root)
             .status()
             .unwrap();
         assert!(status.success(), "example extension failed to build");
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("debug")
-            .join(format!(
-                "{}yanxu_native_example{}",
-                std::env::consts::DLL_PREFIX,
-                std::env::consts::DLL_SUFFIX
-            ))
+        target.join("debug").join(format!(
+            "{}yanxu_native_example{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ))
     })
 }
 
@@ -209,15 +210,27 @@ fn rejects_fifo_native_artifacts_without_blocking() {
 fn loads_verified_native_artifacts_from_relative_paths() {
     let library = example_library();
     let current = std::env::current_dir().unwrap();
-    let relative = library.strip_prefix(&current).unwrap();
+    let local = current.join(format!(
+        ".yanxu-native-relative-{}-{}{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        std::env::consts::DLL_SUFFIX
+    ));
+    std::fs::copy(library, &local).unwrap();
+    let relative = local.strip_prefix(&current).unwrap();
     let extension = NativeExtension::load_verified(
         relative,
-        &artifact(library),
+        &artifact(&local),
         &PermissionSet::sandboxed().allow_native_extensions(),
         "example",
     )
     .unwrap();
     assert_eq!(extension.name(), "example");
+    drop(extension);
+    std::fs::remove_file(local).unwrap();
 }
 
 #[test]
