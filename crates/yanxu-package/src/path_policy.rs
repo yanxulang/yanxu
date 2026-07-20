@@ -3167,6 +3167,7 @@ mod tests {
         assert_eq!(error.code, PACKAGE_MODULE_RESERVED_PATH_CODE);
         assert_eq!(error.component.as_deref(), Some("vendor"));
 
+        drop(roots);
         fs::remove_dir_all(app).unwrap();
     }
 
@@ -3184,6 +3185,7 @@ mod tests {
         let error = roots.authorize_module(&requested, &canonical).unwrap_err();
         assert_eq!(error.code, PACKAGE_MODULE_RESERVED_PATH_CODE);
 
+        drop(roots);
         fs::remove_dir_all(app).unwrap();
     }
 
@@ -3220,6 +3222,7 @@ mod tests {
             ModuleAuthority::VerifiedPackageContent
         );
 
+        drop(roots);
         fs::remove_dir_all(app).unwrap();
     }
 
@@ -3558,6 +3561,7 @@ mod tests {
             .read_to_string(&mut source)
             .unwrap();
         assert_eq!(source, "言「替换后」；\n");
+        drop(roots);
         fs::remove_dir_all(root).unwrap();
     }
 
