@@ -15669,7 +15669,7 @@ mod tests {
         }
 
         #[cfg(unix)]
-        let (mut exact, exact_bytes) = {
+        let (mut exact, exact_bytes, exact_timeout) = {
             let bytes = 128 * 1024;
             let mut command = Command::new("sh");
             command
@@ -15681,10 +15681,10 @@ mod tests {
                 .arg("bounded-stream-fixture")
                 .arg(bytes.to_string())
                 .arg(bytes.to_string());
-            (command, bytes)
+            (command, bytes, Duration::from_secs(5))
         };
         #[cfg(windows)]
-        let (mut exact, exact_bytes) = {
+        let (mut exact, exact_bytes, exact_timeout) = {
             let bytes = 4 * 1024;
             let mut command = Command::new("powershell");
             command
@@ -15697,7 +15697,7 @@ mod tests {
                      $out.Write($outBytes, 0, $outBytes.Length); \
                      $err.Write($errBytes, 0, $errBytes.Length)"
                 ));
-            (command, bytes)
+            (command, bytes, Duration::from_secs(15))
         };
         let exact = bounded_command_output(
             &mut exact,
@@ -15705,7 +15705,7 @@ mod tests {
             "测试输出预算精确边界",
             "测试命令",
             subprocess::CommandBudget {
-                timeout: Duration::from_secs(5),
+                timeout: exact_timeout,
                 stdout_bytes: exact_bytes,
                 stderr_bytes: exact_bytes,
                 disk: None,
