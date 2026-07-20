@@ -61,9 +61,22 @@ jobs:
           mkdir -p "$first" "$second"
           scripts/generate-sbom.sh "$first/yanxu-$version.cdx.json"
           scripts/generate-sbom.sh "$second/yanxu-$version.cdx.json"
-          test "$(find "$first" -maxdepth 1 -name '*.cdx.json' -type f | wc -l)" -eq 4
-          test "$(find "$second" -maxdepth 1 -name '*.cdx.json' -type f | wc -l)" -eq 4
-          diff -ru "$first" "$second"
+          first_count="$(find "$first" -maxdepth 1 -name '*.cdx.json' -type f | wc -l | tr -d '[:space:]')"
+          second_count="$(find "$second" -maxdepth 1 -name '*.cdx.json' -type f | wc -l | tr -d '[:space:]')"
+          if [[ "$first_count" -ne 4 ]]; then
+            printf '第一轮 SBOM 数量错误：期望 4，实际 %s\n' "$first_count" >&2
+            find "$first" -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+          if [[ "$second_count" -ne 4 ]]; then
+            printf '第二轮 SBOM 数量错误：期望 4，实际 %s\n' "$second_count" >&2
+            find "$second" -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+          if ! diff -ru "$first" "$second"; then
+            printf '两轮 SBOM 内容不一致\n' >&2
+            exit 1
+          fi
 
   coverage:
     name: 覆盖率门禁
