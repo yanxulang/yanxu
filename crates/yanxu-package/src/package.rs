@@ -15687,11 +15687,17 @@ mod tests {
         #[cfg(windows)]
         let (mut exact, exact_bytes) = {
             let bytes = 4 * 1024;
-            let mut command = Command::new("cmd");
-            command.args(["/D", "/Q", "/C"]).arg(format!(
-                "for /L %i in (1,1,{bytes}) do @<nul set /p \"=x\" & \
-                 for /L %i in (1,1,{bytes}) do @<nul set /p \"=y\" 1>&2"
-            ));
+            let mut command = Command::new("powershell");
+            command
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+                .arg(format!(
+                    "$out = [Console]::OpenStandardOutput(); \
+                     $err = [Console]::OpenStandardError(); \
+                     $outBytes = [Text.Encoding]::ASCII.GetBytes(('x' * {bytes})); \
+                     $errBytes = [Text.Encoding]::ASCII.GetBytes(('y' * {bytes})); \
+                     $out.Write($outBytes, 0, $outBytes.Length); \
+                     $err.Write($errBytes, 0, $errBytes.Length)"
+                ));
             (command, bytes)
         };
         let exact = bounded_command_output(
