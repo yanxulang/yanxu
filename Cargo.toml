@@ -1,6 +1,6 @@
 [package]
 name = "yanxu"
-version = "1.1.19"
+version = "1.1.20"
 edition = "2024"
 rust-version = "1.89"
 description = "言序：以 Rust 编写的文言风格解释型编程语言"
@@ -73,7 +73,7 @@ spdx = "0.13.4"
 toml = "0.8"
 tar = "0.4"
 url = "2"
-yanxu-package = { path = "crates/yanxu-package", version = "1.1.19" }
+yanxu-package = { path = "crates/yanxu-package", version = "1.1.20" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 goblin = "0.10.7"
