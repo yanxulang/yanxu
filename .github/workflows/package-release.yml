@@ -323,8 +323,10 @@ jobs:
             "$prefix/src/lib.rs" \
             "$prefix/src/package/archive.rs" \
             "$prefix/src/package.rs" \
+            "$prefix/src/path_policy.rs" \
             "$prefix/src/permissions.rs" \
-            "$prefix/src/storage.rs" | LC_ALL=C sort)"
+            "$prefix/src/storage.rs" \
+            "$prefix/src/subprocess.rs" | LC_ALL=C sort)"
           actual_entries="$(tar -tzf "dist/$crate" | LC_ALL=C sort)"
           if [[ "$actual_entries" != "$expected_entries" ]]; then
             echo "共享包归档不符合严格文件允许清单" >&2
@@ -334,7 +336,7 @@ jobs:
           mkdir -p "$extracted"
           tar -xzf "dist/$crate" -C "$extracted"
           package_root="$extracted/$prefix"
-          test "$(find "$package_root" -type f | wc -l)" -eq 10
+          test "$(find "$package_root" -type f | wc -l)" -eq 12
           jq -e --arg commit "$COMMIT_SHA" \
             '.git.sha1 == $commit and (.git.dirty // false) == false
              and .path_in_vcs == "crates/yanxu-package"' \
@@ -503,8 +505,10 @@ jobs:
             "$prefix/src/lib.rs" \
             "$prefix/src/package/archive.rs" \
             "$prefix/src/package.rs" \
+            "$prefix/src/path_policy.rs" \
             "$prefix/src/permissions.rs" \
-            "$prefix/src/storage.rs" | LC_ALL=C sort)"
+            "$prefix/src/storage.rs" \
+            "$prefix/src/subprocess.rs" | LC_ALL=C sort)"
           actual_entries="$(tar -tzf "$release_dir/$crate" | LC_ALL=C sort)"
           [[ "$actual_entries" == "$expected_entries" ]]
           tar -xzf "$release_dir/$crate" -C "$extracted"
