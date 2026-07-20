@@ -150,7 +150,7 @@ fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-#[cfg(all(not(windows), not(target_os = "wasi")))]
+#[cfg(not(windows))]
 fn metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
     false
 }
@@ -200,7 +200,11 @@ impl AtomicFile {
             sequence,
             committed: false,
         };
-        if let Ok(metadata) = fs::metadata(path) {
+        if let Ok(metadata) = fs::symlink_metadata(path)
+            && metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && !metadata_is_reparse(&metadata)
+        {
             pending.file_mut().set_permissions(metadata.permissions())?;
         }
 
