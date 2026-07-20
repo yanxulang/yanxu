@@ -10940,6 +10940,65 @@ mod tests {
     }
 
     #[test]
+    fn locked_capability_cache_is_removed_after_operation_exit() {
+        let root = temp("locked-capability-cache");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='能力缓存'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言 1；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let key = graph_cache_key(&manifest.root);
+
+        with_locked_resolution_capabilities(&manifest, false, |_, capabilities| {
+            assert!(
+                graph_cache()
+                    .lock()
+                    .expect("graph cache poisoned")
+                    .contains_key(&key)
+            );
+            assert!(capabilities.roots().matching_root(&root).is_some());
+            Ok::<_, ManifestError>(())
+        })
+        .unwrap();
+        assert!(
+            !graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .contains_key(&key)
+        );
+
+        let error = with_locked_resolution_capabilities(&manifest, false, |_, _| {
+            Err::<(), _>(manifest_error(&manifest.path, None, "构建操作失败"))
+        })
+        .unwrap_err();
+        assert_eq!(error.message, "构建操作失败");
+        assert!(
+            !graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .contains_key(&key)
+        );
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), ManifestError> =
+                with_locked_resolution_capabilities(&manifest, false, |_, _| {
+                    panic!("构建操作中断")
+                });
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            !graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .contains_key(&key)
+        );
+
+        drop(manifest);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cached_resolution_rejects_replaced_source_root_and_keeps_verified_generation() {
         let root = temp("resolution-root-replacement");
         let application = root.join("application");

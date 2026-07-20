@@ -2157,6 +2157,7 @@ mod tests {
         assert_eq!(error.code(), package::PACKAGE_PATH_NON_PORTABLE_CODE);
         let error = list_declared_resource_directory(Some(&root), &roots, "assets").unwrap_err();
         assert_eq!(error.code(), package::PACKAGE_PATH_NON_PORTABLE_CODE);
+        drop(roots);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2294,6 +2295,7 @@ mod tests {
         let listed = list_declared_resource_directory(Some(&root), &roots, ".").unwrap();
         assert!(!listed.iter().any(|name| name == package::LOCK_NAME));
         assert!(!listed.iter().any(|name| name == "build"));
+        drop(roots);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2390,6 +2392,7 @@ mod tests {
         assert_eq!(module.file, format!("native/{checksum}/é.bin"));
         assert_eq!(normalize_resource_key(&module.file).unwrap(), module.file);
 
+        drop(capabilities);
         fs::remove_dir_all(root).unwrap();
     }
 
