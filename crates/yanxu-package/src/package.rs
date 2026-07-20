@@ -14028,9 +14028,8 @@ mod tests {
         }
         #[cfg(not(windows))]
         {
-            let error =
-                manifest_dependency_path(r"/absolute\dependency", manifest_path, "依赖")
-                    .unwrap_err();
+            let error = manifest_dependency_path(r"/absolute\dependency", manifest_path, "依赖")
+                .unwrap_err();
             assert_eq!(error.code(), PACKAGE_PATH_NON_PORTABLE_CODE);
         }
         #[cfg(windows)]
