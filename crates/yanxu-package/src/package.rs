@@ -2555,7 +2555,7 @@ fn parse_dependency(
         validate_local_source_path_text(path)
             .map_err(|message| manifest_error(manifest_path, None, message))?;
         let dependency = Dependency::Path {
-            path: manifest_relative_path(path, manifest_path, &format!("依赖“{name}”路径"))?,
+            path: manifest_dependency_path(path, manifest_path, &format!("依赖“{name}”路径"))?,
             requirement: None,
         };
         validate_dependency_source_security(&dependency)
@@ -2583,7 +2583,7 @@ fn parse_dependency(
         validate_local_source_path_text(path)
             .map_err(|message| manifest_error(manifest_path, None, message))?;
         let dependency = Dependency::Path {
-            path: manifest_relative_path(path, manifest_path, &format!("依赖“{name}”路径"))?,
+            path: manifest_dependency_path(path, manifest_path, &format!("依赖“{name}”路径"))?,
             requirement,
         };
         validate_dependency_source_security(&dependency)
@@ -3005,6 +3005,21 @@ fn manifest_relative_path(
         ));
     }
     Ok(PathBuf::from(raw))
+}
+
+fn manifest_dependency_path(
+    raw: &str,
+    manifest_path: &Path,
+    kind: &str,
+) -> Result<PathBuf, ManifestError> {
+    #[cfg(windows)]
+    {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+    }
+    manifest_relative_path(raw, manifest_path, kind)
 }
 
 fn validate_relative_path(path: &Path, kind: &str) -> Result<(), ManifestError> {
@@ -14010,6 +14025,22 @@ mod tests {
             let error = manifest_relative_path(r"dir\file.yx", manifest_path, kind).unwrap_err();
             assert_eq!(error.code(), PACKAGE_PATH_NON_PORTABLE_CODE, "{kind}");
         }
+        for path in [r"dir\dependency", r"C:relative\dependency"] {
+            let error = manifest_dependency_path(path, manifest_path, "依赖").unwrap_err();
+            assert_eq!(error.code(), PACKAGE_PATH_NON_PORTABLE_CODE, "{path}");
+        }
+        #[cfg(not(windows))]
+        {
+            let error =
+                manifest_dependency_path(r"/absolute\dependency", manifest_path, "依赖")
+                    .unwrap_err();
+            assert_eq!(error.code(), PACKAGE_PATH_NON_PORTABLE_CODE);
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            manifest_dependency_path(r"C:\absolute\dependency", manifest_path, "依赖").unwrap(),
+            PathBuf::from(r"C:\absolute\dependency")
+        );
         let error = validate_package_name("e\u{301}").unwrap_err();
         assert!(error.contains(PACKAGE_PATH_NON_PORTABLE_CODE), "{error}");
         assert!(validate_package_name("é").is_ok());
