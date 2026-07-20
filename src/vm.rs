@@ -3452,19 +3452,19 @@ impl Vm {
                 let requested = vm_string(&arguments[0], "资源.读取", span)?;
                 let bytes = if let Some(resources) = &self.application_resources {
                     let key = crate::application::normalize_resource_key(requested)
-                        .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
+                        .map_err(|runtime_error| application_error(span, runtime_error))?;
                     resources
                         .get(&key)
                         .cloned()
                         .ok_or_else(|| error(span, format!("YXB 中没有资源“{requested}”")))?
                 } else {
-                    let path = crate::application::resolve_declared_resource(
+                    crate::application::read_declared_resource_snapshot(
                         self.package_root.as_deref(),
+                        &self.package_module_roots,
                         requested,
+                        crate::stdlib::BYTES_MAX_VALUE_BYTES as u64,
                     )
-                    .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
-                    crate::stdlib::read_file_bytes(&path)
-                        .map_err(|runtime_error| error(span, format!("{runtime_error:?}")))?
+                    .map_err(|runtime_error| application_error(span, runtime_error))?
                 };
                 if matches!(function, Std::ResourceReadBytes) {
                     Ok(VmValue::Bytes(Rc::new(bytes)))
@@ -3477,9 +3477,13 @@ impl Vm {
             Std::ResourceList => {
                 let requested = vm_string(&arguments[0], "资源.目录", span)?;
                 let mut names: Vec<String> = if let Some(resources) = &self.application_resources {
-                    let key = crate::application::normalize_resource_key(requested)
-                        .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
-                    let prefix = format!("{}/", key.trim_end_matches('/'));
+                    let key = crate::application::normalize_resource_directory_key(requested)
+                        .map_err(|runtime_error| application_error(span, runtime_error))?;
+                    let prefix = if key.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}/", key.trim_end_matches('/'))
+                    };
                     resources
                         .keys()
                         .filter_map(|path| {
@@ -3489,18 +3493,12 @@ impl Vm {
                         })
                         .collect()
                 } else {
-                    let path = crate::application::resolve_declared_resource(
+                    crate::application::list_declared_resource_directory(
                         self.package_root.as_deref(),
+                        &self.package_module_roots,
                         requested,
                     )
-                    .map_err(|runtime_error| error(span, runtime_error.to_string()))?;
-                    fs::read_dir(path)
-                        .map_err(|runtime_error| error(span, runtime_error.to_string()))?
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|runtime_error| error(span, runtime_error.to_string()))?
-                        .into_iter()
-                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                        .collect()
+                    .map_err(|runtime_error| application_error(span, runtime_error))?
                 };
                 names.sort();
                 names.dedup();
@@ -5684,6 +5682,14 @@ fn package_error(span: &Span, source: crate::package::ManifestError) -> VmError 
             source.code(),
             format!("{}：{}", source.path.display(), source.diagnostic_message()),
         )
+    }
+}
+
+fn application_error(span: &Span, source: crate::application::ApplicationError) -> VmError {
+    if source.code().starts_with("PACKAGE_") {
+        coded_error(span, source.code(), source.diagnostic_message())
+    } else {
+        error(span, source.to_string())
     }
 }
 

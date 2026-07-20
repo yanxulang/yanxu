@@ -35,6 +35,8 @@ pub const YXB_MAX_DEBUG_SPANS: usize = 1_000_000;
 pub const RESOURCE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 pub const RESOURCE_MAX_SINGLE_BYTES: u64 = 16 * 1024 * 1024;
 pub const RESOURCE_MAX_ENTRIES: usize = 4_096;
+const RESOURCE_MAX_SCANNED_ENTRIES: usize = 100_000;
+const RESOURCE_MAX_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationArchive {
@@ -309,14 +311,49 @@ pub fn compile_application(
             &manifest,
             false,
             |graph, capabilities| {
+                package::package_path_decision(
+                    &manifest.entry,
+                    package::PackagePathPurpose::ManifestReference,
+                )
+                .map_err(application_path_error)?;
                 let canonical_root = fs::canonicalize(&manifest.root).map_err(io_error)?;
-                let entry = canonical_root.join(&manifest.entry);
-                let resources = collect_resources(&manifest)?;
+                let requested_entry = canonical_root.join(&manifest.entry);
+                let entry = package::resolve_existing_package_path(
+                    &canonical_root,
+                    &manifest.entry,
+                    package::PackagePathPurpose::ManifestReference,
+                )
+                .map_err(application_path_error)?;
+                let metadata = fs::symlink_metadata(&entry).map_err(|error| {
+                    application_error(format!(
+                        "不能检查入口 {}：{error}",
+                        manifest.entry.display()
+                    ))
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(application_error(format!(
+                        "入口 {} 必须是普通文件，不得为符号链接或特殊文件",
+                        manifest.entry.display()
+                    )));
+                }
+                let mut roots = package::TrustedPackageRoots::default();
+                capabilities
+                    .extend(&mut roots)
+                    .map_err(application_path_error)?;
+                roots.insert_discovered(&entry).map_err(package_error)?;
+                roots
+                    .authorize_import(&canonical_root, &requested_entry, &entry, false)
+                    .map_err(application_path_error)?;
+                let resources = collect_resources(&manifest, &roots)?;
                 let lock_checksum = checksum_file(&manifest.root.join(package::LOCK_NAME)).ok();
                 let summary =
                     PermissionSummary::from_permissions(&manifest.permissions, &manifest.root);
                 let native_modules = collect_native_modules(&graph, &capabilities)?;
-                let application = manifest.application.as_ref().map(application_metadata);
+                let application = manifest
+                    .application
+                    .as_ref()
+                    .map(application_metadata)
+                    .transpose()?;
                 let licenses = collect_licenses(&manifest, &graph, &capabilities)?;
                 compile_resolved_application(
                     entry,
@@ -611,14 +648,10 @@ impl ApplicationCompiler {
             })
         {
             let relative = canonical.strip_prefix(&dependency.root).expect("prefix");
-            let relative =
-                package::portable_package_path(relative).map_err(application_path_error)?;
-            return Ok(format!("pkg:{id}:{relative}"));
+            return Ok(format!("pkg:{id}:{}", relative_string(relative)?));
         }
         if let Some(relative) = application_relative {
-            let relative =
-                package::portable_package_path(relative).map_err(application_path_error)?;
-            return Ok(format!("app:{relative}"));
+            return Ok(format!("app:{}", relative_string(relative)?));
         }
         Err(application_error(format!(
             "模块 {} 不属于项目或锁定依赖图",
@@ -680,31 +713,78 @@ fn compact_span_source(
 
 fn collect_resources(
     manifest: &Manifest,
+    trusted_roots: &package::TrustedPackageRoots,
 ) -> Result<BTreeMap<String, ApplicationResource>, ApplicationError> {
-    let canonical_root = fs::canonicalize(&manifest.root).map_err(io_error)?;
-    let mut files = Vec::new();
+    let canonical_root = trusted_roots
+        .matching_root(&manifest.root)
+        .ok_or_else(|| application_error("应用包根不属于解析阶段的已打开根能力"))?
+        .to_path_buf();
+    let mut files = BTreeMap::new();
+    let mut portable_paths = package::PortablePackagePaths::default();
+    let mut scanned_entries = 0_usize;
     for resource in &manifest.resources {
-        let path = manifest.root.join(resource);
-        collect_resource_files(&manifest.root, &path, &mut files)?;
+        let (path, is_directory) = if resource == Path::new(".") {
+            (canonical_root.clone(), true)
+        } else {
+            package::package_path_decision(
+                resource,
+                package::PackagePathPurpose::ManifestReference,
+            )
+            .map_err(application_path_error)?;
+            trusted_roots
+                .resolve_existing_path(
+                    &canonical_root.join(resource),
+                    package::PackagePathPurpose::ManifestReference,
+                )
+                .map_err(application_path_error)?
+                .ok_or_else(|| application_error("资源不属于解析阶段的已打开包根"))?
+        };
+        collect_resource_files(
+            trusted_roots,
+            &canonical_root,
+            &path,
+            is_directory,
+            &mut files,
+            &mut portable_paths,
+            &mut scanned_entries,
+        )?;
     }
     if let Some(icon) = manifest
         .application
         .as_ref()
         .and_then(|application| application.icon.as_ref())
     {
-        collect_resource_files(&manifest.root, &manifest.root.join(icon), &mut files)?;
-    }
-    files.sort();
-    files.dedup();
-    if files.len() > RESOURCE_MAX_ENTRIES {
-        return Err(application_error(format!(
-            "资源条目不得超过 {RESOURCE_MAX_ENTRIES}"
-        )));
+        package::package_path_decision(icon, package::PackagePathPurpose::ManifestReference)
+            .map_err(application_path_error)?;
+        let (icon, is_directory) = trusted_roots
+            .resolve_existing_path(
+                &canonical_root.join(icon),
+                package::PackagePathPurpose::ManifestReference,
+            )
+            .map_err(application_path_error)?
+            .ok_or_else(|| application_error("应用图标不属于解析阶段的已打开包根"))?;
+        if is_directory {
+            return Err(application_error("应用图标必须是普通文件，不能是目录"));
+        }
+        collect_resource_files(
+            trusted_roots,
+            &canonical_root,
+            &icon,
+            false,
+            &mut files,
+            &mut portable_paths,
+            &mut scanned_entries,
+        )?;
     }
     let mut total = 0_u64;
     let mut resources = BTreeMap::new();
-    for path in files {
-        let bytes = fs::read(&path).map_err(io_error)?;
+    for (relative, resolved) in files {
+        let bytes = package::read_resolved_regular_file_snapshot(
+            resolved,
+            RESOURCE_MAX_SINGLE_BYTES,
+            "资源",
+        )
+        .map_err(package_error)?;
         total = total
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| application_error("资源总大小溢出"))?;
@@ -713,10 +793,6 @@ fn collect_resources(
                 "资源总大小不得超过 {RESOURCE_MAX_BYTES} 字节"
             )));
         }
-        let relative = relative_string(
-            path.strip_prefix(&canonical_root)
-                .map_err(|_| application_error("资源越出包根目录"))?,
-        );
         resources.insert(
             relative.clone(),
             ApplicationResource {
@@ -727,6 +803,99 @@ fn collect_resources(
         );
     }
     Ok(resources)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_resource_files(
+    trusted_roots: &package::TrustedPackageRoots,
+    canonical_root: &Path,
+    path: &Path,
+    is_directory: bool,
+    output: &mut BTreeMap<String, package::ResolvedPackageFile>,
+    portable_paths: &mut package::PortablePackagePaths,
+    scanned_entries: &mut usize,
+) -> Result<(), ApplicationError> {
+    if !is_directory {
+        return insert_resource_file(trusted_roots, canonical_root, path, output, portable_paths);
+    }
+
+    let initial_depth = path
+        .strip_prefix(canonical_root)
+        .map_err(|_| application_error("资源目录越出包根目录"))?
+        .components()
+        .count();
+    if initial_depth > RESOURCE_MAX_DEPTH {
+        return Err(application_error(format!(
+            "资源目录深度不得超过 {RESOURCE_MAX_DEPTH} 层"
+        )));
+    }
+    let mut pending = vec![(path.to_path_buf(), initial_depth)];
+    while let Some((directory, depth)) = pending.pop() {
+        let entries = trusted_roots
+            .list_existing_directory(&directory, package::PackagePathPurpose::TreeChecksum)
+            .map_err(application_path_error)?
+            .ok_or_else(|| application_error("资源目录不属于解析阶段的已打开包根"))?;
+        *scanned_entries = scanned_entries
+            .checked_add(entries.len())
+            .filter(|count| *count <= RESOURCE_MAX_SCANNED_ENTRIES)
+            .ok_or_else(|| {
+                application_error(format!(
+                    "资源目录扫描不得超过 {RESOURCE_MAX_SCANNED_ENTRIES} 项"
+                ))
+            })?;
+        for entry in entries.into_iter().rev() {
+            let child = directory.join(&entry.name);
+            if entry.is_directory {
+                let child_depth = depth.saturating_add(1);
+                if child_depth > RESOURCE_MAX_DEPTH {
+                    return Err(application_error(format!(
+                        "资源目录深度不得超过 {RESOURCE_MAX_DEPTH} 层"
+                    )));
+                }
+                pending.push((child, child_depth));
+            } else {
+                insert_resource_file(
+                    trusted_roots,
+                    canonical_root,
+                    &child,
+                    output,
+                    portable_paths,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_resource_file(
+    trusted_roots: &package::TrustedPackageRoots,
+    canonical_root: &Path,
+    path: &Path,
+    output: &mut BTreeMap<String, package::ResolvedPackageFile>,
+    portable_paths: &mut package::PortablePackagePaths,
+) -> Result<(), ApplicationError> {
+    let resolved = trusted_roots
+        .resolve_existing_file(path, package::PackagePathPurpose::TreeChecksum)
+        .map_err(application_path_error)?
+        .ok_or_else(|| application_error("资源文件不属于解析阶段的已打开包根"))?;
+    let relative_path = resolved
+        .path()
+        .strip_prefix(canonical_root)
+        .map_err(|_| application_error("资源文件越出包根目录"))?;
+    let relative = package::portable_package_path(relative_path).map_err(application_path_error)?;
+    if output.contains_key(&relative) {
+        return Ok(());
+    }
+    if output.len() >= RESOURCE_MAX_ENTRIES {
+        return Err(application_error(format!(
+            "资源条目不得超过 {RESOURCE_MAX_ENTRIES}"
+        )));
+    }
+    portable_paths
+        .insert(relative_path)
+        .map_err(application_path_error)?;
+    output.insert(relative, resolved);
+    Ok(())
 }
 
 fn collect_native_modules(
@@ -802,10 +971,11 @@ fn collect_native_modules(
                 package::NATIVE_ARTIFACT_MAX_TOTAL_BYTES
             )));
         }
-        let file_name = Path::new(&artifact.path)
+        let file_name = source
             .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| application_error("原生制品文件名不是 UTF-8"))?;
+            .ok_or_else(|| application_error("原生制品缺少文件名"))?;
+        let file_name =
+            package::portable_package_path(Path::new(file_name)).map_err(application_path_error)?;
         let module = ApplicationNativeModule {
             name: dependency.locked.name.clone(),
             abi: artifact.abi,
@@ -862,13 +1032,19 @@ fn collect_licenses(
     Ok(licenses)
 }
 
-fn application_metadata(application: &package::ApplicationConfig) -> ApplicationMetadata {
-    ApplicationMetadata {
+fn application_metadata(
+    application: &package::ApplicationConfig,
+) -> Result<ApplicationMetadata, ApplicationError> {
+    Ok(ApplicationMetadata {
         kind: application.kind.as_str().into(),
         name: application.name.clone(),
         identifier: application.identifier.clone(),
         version: application.version.to_string(),
-        icon: application.icon.as_ref().map(|path| relative_string(path)),
+        icon: application
+            .icon
+            .as_ref()
+            .map(|path| relative_string(path))
+            .transpose()?,
         company: application.company.clone(),
         minimum_system_version: application.minimum_system_version.clone(),
         window: ApplicationWindowMetadata {
@@ -881,45 +1057,7 @@ fn application_metadata(application: &package::ApplicationConfig) -> Application
             resizable: application.window.resizable,
             high_dpi: application.window.high_dpi,
         },
-    }
-}
-
-fn collect_resource_files(
-    root: &Path,
-    path: &Path,
-    output: &mut Vec<PathBuf>,
-) -> Result<(), ApplicationError> {
-    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
-    if metadata.file_type().is_symlink() {
-        return Err(application_error(format!(
-            "资源不得包含符号链接：{}",
-            path.display()
-        )));
-    }
-    if metadata.is_file() {
-        let canonical = fs::canonicalize(path).map_err(io_error)?;
-        let root = fs::canonicalize(root).map_err(io_error)?;
-        if !canonical.starts_with(root) {
-            return Err(application_error("资源越出包根目录"));
-        }
-        output.push(canonical);
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        let mut entries = fs::read_dir(path)
-            .map_err(io_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(io_error)?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            collect_resource_files(root, &entry.path(), output)?;
-        }
-        return Ok(());
-    }
-    Err(application_error(format!(
-        "资源只可为普通文件或目录：{}",
-        path.display()
-    )))
+    })
 }
 
 pub fn serialize(archive: &ApplicationArchive) -> Result<Vec<u8>, ApplicationError> {
@@ -1568,15 +1706,18 @@ fn validate_resources(
     }
     let max_encoded = RESOURCE_MAX_SINGLE_BYTES.div_ceil(3) * 4 + 4;
     let mut total = 0_u64;
-    let mut paths = BTreeSet::new();
+    let mut paths = package::PortablePackagePaths::default();
     let mut decoded = BTreeMap::new();
     for (path, resource) in &archive.resources {
         let normalized = normalize_resource_key(path)?;
-        if normalized != *path || resource.path != *path || !paths.insert(resource.path.clone()) {
+        if normalized != *path || resource.path != *path {
             return Err(application_error(format!(
                 "资源路径非法、重复或与索引不一致：{path}"
             )));
         }
+        paths
+            .insert(Path::new(&resource.path))
+            .map_err(application_path_error)?;
         if resource.bytes_base64.len() as u64 > max_encoded {
             return Err(application_error(format!(
                 "资源 {path} 的编码体积超过单项限制"
@@ -1616,26 +1757,10 @@ fn validate_resources(
 }
 
 fn read_limited_file(path: &Path, limit: u64, kind: &str) -> Result<Vec<u8>, ApplicationError> {
-    let metadata = fs::metadata(path).map_err(io_error)?;
-    if !metadata.is_file() {
-        return Err(application_error(format!("{kind}不是普通文件")));
-    }
-    if metadata.len() > limit {
-        return Err(application_error(format!(
-            "{kind}不得超过 {} MiB",
-            limit / 1024 / 1024
-        )));
-    }
-    let mut file = fs::File::open(path).map_err(io_error)?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    Read::by_ref(&mut file)
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(io_error)?;
-    if bytes.len() as u64 > limit {
-        return Err(application_error(format!("{kind}读取过程中超过大小限制")));
-    }
-    Ok(bytes)
+    let canonical = fs::canonicalize(path).map_err(io_error)?;
+    package::read_stable_regular_file_snapshot(&canonical, limit).map_err(|error| {
+        application_error(format!("不能读取{kind}“{}”：{error}", canonical.display()))
+    })
 }
 
 pub fn resolve_declared_resource(
@@ -1646,7 +1771,111 @@ pub fn resolve_declared_resource(
     let manifest = package::discover(root)
         .map_err(package_error)?
         .ok_or_else(|| application_error("未找到包清单"))?;
-    let relative = Path::new(requested);
+    let (relative, package_root_request) = declared_resource_request(&manifest, requested)?;
+    let root = fs::canonicalize(&manifest.root).map_err(io_error)?;
+    let path = if package_root_request {
+        root.clone()
+    } else {
+        package::resolve_existing_package_path(
+            &root,
+            &relative,
+            package::PackagePathPurpose::ManifestReference,
+        )
+        .map_err(application_path_error)?
+    };
+    let requested_metadata = fs::symlink_metadata(&path).map_err(io_error)?;
+    if requested_metadata.file_type().is_symlink() {
+        return Err(application_error("资源路径不得为符号链接"));
+    }
+    if !requested_metadata.is_file() && !requested_metadata.is_dir() {
+        return Err(application_error("资源路径必须是普通文件或真实目录"));
+    }
+    if !path.starts_with(&root) {
+        return Err(application_error("资源路径越出包根"));
+    }
+    let canonical_relative = path
+        .strip_prefix(&root)
+        .map_err(|_| application_error("资源路径越出包根"))?;
+    if !canonical_relative.as_os_str().is_empty() {
+        package::package_path_decision(
+            canonical_relative,
+            package::PackagePathPurpose::ManifestReference,
+        )
+        .map_err(application_path_error)?;
+    }
+    let requested_key = if package_root_request {
+        String::new()
+    } else {
+        package::portable_package_path(&relative).map_err(application_path_error)?
+    };
+    let canonical_key = if canonical_relative.as_os_str().is_empty() {
+        String::new()
+    } else {
+        package::portable_package_path(canonical_relative).map_err(application_path_error)?
+    };
+    if requested_key != canonical_key {
+        return Err(application_error(
+            "资源路径经文件系统解析后改变了身份，拒绝符号链接或目录重定向",
+        ));
+    }
+    Ok(path)
+}
+
+pub(crate) fn read_declared_resource_snapshot(
+    package_root: Option<&Path>,
+    trusted_roots: &package::TrustedPackageRoots,
+    requested: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ApplicationError> {
+    let path = opened_declared_resource_path(package_root, trusted_roots, requested, "读取")?;
+    let resolved = trusted_roots
+        .resolve_existing_file(&path, package::PackagePathPurpose::ManifestReference)
+        .map_err(application_path_error)?
+        .ok_or_else(|| application_error("资源不属于已打开的包根"))?;
+    package::read_resolved_regular_file_snapshot(resolved, max_bytes, "资源").map_err(package_error)
+}
+
+pub(crate) fn list_declared_resource_directory(
+    package_root: Option<&Path>,
+    trusted_roots: &package::TrustedPackageRoots,
+    requested: &str,
+) -> Result<Vec<String>, ApplicationError> {
+    let directory = opened_declared_resource_path(package_root, trusted_roots, requested, "列出")?;
+    let entries = trusted_roots
+        .list_existing_directory(&directory, package::PackagePathPurpose::TreeChecksum)
+        .map_err(application_path_error)?
+        .ok_or_else(|| application_error("资源目录不属于已打开的包根"))?;
+    Ok(entries.into_iter().map(|entry| entry.name).collect())
+}
+
+fn opened_declared_resource_path(
+    package_root: Option<&Path>,
+    trusted_roots: &package::TrustedPackageRoots,
+    requested: &str,
+    operation: &str,
+) -> Result<PathBuf, ApplicationError> {
+    let package_root = package_root
+        .ok_or_else(|| application_error(format!("当前程序不属于包，不能{operation}包资源")))?;
+    let root = trusted_roots
+        .matching_root(package_root)
+        .ok_or_else(|| application_error("当前包根不属于执行阶段的已打开根能力"))?
+        .to_path_buf();
+    let manifest =
+        package::load_manifest_from_roots(trusted_roots, &root).map_err(package_error)?;
+    let (relative, package_root_request) = declared_resource_request(&manifest, requested)?;
+    Ok(if package_root_request {
+        root
+    } else {
+        root.join(relative)
+    })
+}
+
+fn declared_resource_request(
+    manifest: &Manifest,
+    requested: &str,
+) -> Result<(PathBuf, bool), ApplicationError> {
+    package::validate_portable_path_text(requested).map_err(application_path_error)?;
+    let relative = PathBuf::from(requested);
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
         || relative.components().any(|component| {
@@ -1658,26 +1887,50 @@ pub fn resolve_declared_resource(
     {
         return Err(application_error("资源路径须为包内非空相对路径"));
     }
-    let root = fs::canonicalize(&manifest.root).map_err(io_error)?;
-    let path = fs::canonicalize(manifest.root.join(relative)).map_err(io_error)?;
-    if !path.starts_with(&root) {
-        return Err(application_error("资源路径越出包根"));
+    let package_root_request = relative
+        .components()
+        .all(|component| matches!(component, Component::CurDir));
+    let requested_key = if package_root_request {
+        String::new()
+    } else {
+        package::package_path_decision(&relative, package::PackagePathPurpose::ManifestReference)
+            .map_err(application_path_error)?;
+        package::portable_package_path(&relative).map_err(application_path_error)?
+    };
+    let mut declared = false;
+    for resource in &manifest.resources {
+        let resource_key = if resource == Path::new(".") {
+            String::new()
+        } else {
+            package::package_path_decision(
+                resource,
+                package::PackagePathPurpose::ManifestReference,
+            )
+            .map_err(application_path_error)?;
+            package::portable_package_path(resource).map_err(application_path_error)?
+        };
+        if resource_key.is_empty()
+            || requested_key == resource_key
+            || requested_key
+                .strip_prefix(&resource_key)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            declared = true;
+            break;
+        }
     }
-    let declared = manifest.resources.iter().any(|resource| {
-        fs::canonicalize(manifest.root.join(resource))
-            .is_ok_and(|resource| path == resource || path.starts_with(resource))
-    });
     if !declared {
         return Err(application_error(format!(
             "资源“{requested}”未在【资源】中声明"
         )));
     }
-    Ok(path)
+    Ok((relative, package_root_request))
 }
 
 pub fn normalize_resource_key(requested: &str) -> Result<String, ApplicationError> {
-    if requested.contains(['\\', '\0']) {
-        return Err(application_error("资源路径须使用正斜杠且不得包含空字符"));
+    package::validate_portable_path_text(requested).map_err(application_path_error)?;
+    if requested.contains('\0') {
+        return Err(application_error("资源路径不得包含空字符"));
     }
     let path = Path::new(requested);
     if path.as_os_str().is_empty()
@@ -1694,7 +1947,25 @@ pub fn normalize_resource_key(requested: &str) -> Result<String, ApplicationErro
     {
         return Err(application_error("资源路径须为包内非空相对路径"));
     }
-    Ok(relative_string(path))
+    package::package_path_decision(path, package::PackagePathPurpose::ManifestReference)
+        .map_err(application_path_error)?;
+    package::portable_package_path(path).map_err(application_path_error)
+}
+
+pub(crate) fn normalize_resource_directory_key(
+    requested: &str,
+) -> Result<String, ApplicationError> {
+    package::validate_portable_path_text(requested).map_err(application_path_error)?;
+    let path = Path::new(requested);
+    if !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::CurDir))
+    {
+        Ok(String::new())
+    } else {
+        normalize_resource_key(requested)
+    }
 }
 
 fn checksum_file(path: &Path) -> Result<String, ApplicationError> {
@@ -1703,14 +1974,8 @@ fn checksum_file(path: &Path) -> Result<String, ApplicationError> {
         .map_err(io_error)
 }
 
-fn relative_string(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+fn relative_string(path: &Path) -> Result<String, ApplicationError> {
+    package::portable_package_path(path).map_err(application_path_error)
 }
 
 fn package_error(error: package::ManifestError) -> ApplicationError {
@@ -1749,16 +2014,22 @@ fn application_path_error(error: package::PackagePathError) -> ApplicationError 
 }
 
 fn unsupported_yxb_format(detected: u64) -> ApplicationError {
-    application_error(format!(
-        "[{YXB_FORMAT_UNSUPPORTED_CODE}] 检测到 YXB 格式 {detected}；当前支持 YXB 格式 {YXB_FORMAT_VERSION}；安全自动迁移：否。请使用支持该制品的言序导出源码，再执行：yanxu compile <源码或项目> -o <新制品.yxb> --release"
-    ))
+    application_coded_error(
+        YXB_FORMAT_UNSUPPORTED_CODE,
+        format!(
+            "检测到 YXB 格式 {detected}；当前支持 YXB 格式 {YXB_FORMAT_VERSION}；安全自动迁移：否。请使用支持该制品的言序导出源码，再执行：yanxu compile <源码或项目> -o <新制品.yxb> --release"
+        ),
+    )
 }
 
 fn unsupported_yxb_bytecode(yxb_format: u64, bytecode_format: u64) -> ApplicationError {
-    application_error(format!(
-        "[{YXB_BYTECODE_UNSUPPORTED_CODE}] 检测到 YXB 格式 {yxb_format}、字节码格式 {bytecode_format}；当前支持 YXB 格式 {YXB_FORMAT_VERSION}、字节码格式 {}；安全自动迁移：否。格式 {bytecode_format} 不含当前运行时要求的完整模块与类型身份，请从原源码或项目重新构建：yanxu compile <源码或项目> -o <新制品.yxb> --release",
-        bytecode::BYTECODE_FORMAT_VERSION
-    ))
+    application_coded_error(
+        YXB_BYTECODE_UNSUPPORTED_CODE,
+        format!(
+            "检测到 YXB 格式 {yxb_format}、字节码格式 {bytecode_format}；当前支持 YXB 格式 {YXB_FORMAT_VERSION}、字节码格式 {}；安全自动迁移：否。格式 {bytecode_format} 不含当前运行时要求的完整模块与类型身份，请从原源码或项目重新构建：yanxu compile <源码或项目> -o <新制品.yxb> --release",
+            bytecode::BYTECODE_FORMAT_VERSION
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -1853,6 +2124,276 @@ mod tests {
         let mut tampered = decoded;
         tampered.package.name = "篡改".into();
         assert!(serialize(&tampered).is_err());
+    }
+
+    #[test]
+    fn source_resources_use_the_same_reserved_path_policy_as_yxb() {
+        let root = temporary_root("resource-path-policy");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("assets/build")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='资源边界'\n版本='0.1.0'\n入口='src/主.yx'\n[资源]\n目录=['assets']\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/主.yx"), "言 1；\n").unwrap();
+        fs::write(root.join("assets/可见.txt"), "visible\n").unwrap();
+        fs::write(root.join("assets/build/隐藏.txt"), "hidden\n").unwrap();
+
+        let archive = compile_application(&root, "release").unwrap();
+        assert!(archive.resources.contains_key("assets/可见.txt"));
+        assert!(!archive.resources.contains_key("assets/build/隐藏.txt"));
+        let mut roots = package::TrustedPackageRoots::default();
+        roots.insert(&root).unwrap();
+        let listed = list_declared_resource_directory(Some(&root), &roots, "assets").unwrap();
+        assert_eq!(listed, ["可见.txt"]);
+
+        let error = resolve_declared_resource(Some(&root), "assets/build/隐藏.txt").unwrap_err();
+        assert_eq!(error.code(), package::PACKAGE_PATH_RESERVED_CODE);
+        let error = normalize_resource_key(r"assets\可见.txt").unwrap_err();
+        assert_eq!(error.code(), package::PACKAGE_PATH_NON_PORTABLE_CODE);
+
+        fs::remove_dir_all(root.join("assets/build")).unwrap();
+        fs::create_dir_all(root.join("assets/Build")).unwrap();
+        fs::write(root.join("assets/Build/别名.txt"), "alias\n").unwrap();
+        let error = compile_application(&root, "release").unwrap_err();
+        assert_eq!(error.code(), package::PACKAGE_PATH_NON_PORTABLE_CODE);
+        let error = list_declared_resource_directory(Some(&root), &roots, "assets").unwrap_err();
+        assert_eq!(error.code(), package::PACKAGE_PATH_NON_PORTABLE_CODE);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(unix, not(target_os = "wasi")))]
+    #[test]
+    fn source_resource_reads_and_listings_stay_bound_to_the_open_package_root() {
+        let root = temporary_root("resource-open-root");
+        let original = root.with_extension("original");
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='资源根句柄'\n版本='1.0.0'\n入口='主.yx'\n[资源]\n目录=['assets']\n",
+        )
+        .unwrap();
+        fs::write(root.join("主.yx"), "言 1；\n").unwrap();
+        fs::write(root.join("assets/data.txt"), "trusted\n").unwrap();
+        let mut roots = package::TrustedPackageRoots::default();
+        roots.insert(&root).unwrap();
+
+        fs::rename(&root, &original).unwrap();
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='资源根句柄'\n版本='1.0.0'\n入口='主.yx'\n[资源]\n目录=['assets']\n",
+        )
+        .unwrap();
+        fs::write(root.join("主.yx"), "言 2；\n").unwrap();
+        fs::write(root.join("assets/data.txt"), "replacement\n").unwrap();
+        fs::write(root.join("assets/extra.txt"), "extra\n").unwrap();
+
+        let bytes =
+            read_declared_resource_snapshot(Some(&root), &roots, "assets/data.txt", 1024).unwrap();
+        assert_eq!(bytes, b"trusted\n");
+        assert_eq!(
+            list_declared_resource_directory(Some(&root), &roots, "assets").unwrap(),
+            ["data.txt"]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(original).unwrap();
+    }
+
+    #[test]
+    fn unicode_equivalent_manifest_entry_and_resources_compile_to_portable_keys() {
+        let root = temporary_root("unicode-equivalent-manifest-paths");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("assets/é")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='规范路径应用'\n版本='0.1.0'\n入口='src/e\u{301}.yx'\n[导出]\n默认='src/e\u{301}.yx'\n[资源]\n目录=['assets/e\u{301}']\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/é.yx"), "言 1；\n").unwrap();
+        fs::write(root.join("assets/é/data.txt"), "resource\n").unwrap();
+
+        let archive = compile_application(&root, "release").unwrap();
+        assert_eq!(archive.entry_module, "app:src/é.yx");
+        assert!(archive.resources.contains_key("assets/é/data.txt"));
+        assert_eq!(
+            resolve_declared_resource(Some(&root), "assets/e\u{301}/data.txt").unwrap(),
+            fs::canonicalize(root.join("assets/é/data.txt")).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_resource_rejects_unix_socket_before_reading() {
+        use std::os::unix::net::UnixListener;
+
+        let root = PathBuf::from("/tmp").join(format!(
+            "yx-resource-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='特殊资源'\n版本='0.1.0'\n入口='src/主.yx'\n[资源]\n目录=['assets']\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/主.yx"), "言 1；\n").unwrap();
+        let socket_path = root.join("assets/服务.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let error = resolve_declared_resource(Some(&root), "assets/服务.sock").unwrap_err();
+        assert!(error.to_string().contains("普通文件或真实目录"), "{error}");
+
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn application_imports_reject_raw_backslashes_before_path_parsing() {
+        let root = temporary_root("raw-backslash-import");
+        fs::create_dir_all(root.join("src/子")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='反斜杠导入'\n版本='0.1.0'\n入口='src/主.yx'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/主.yx"),
+            "引「子\\\\模块.yx」为 模块；言 模块.值；\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/子/模块.yx"), "公 定 值：数 为 1；\n").unwrap();
+        let error = compile_application(&root, "release").unwrap_err();
+        assert_eq!(error.code(), package::PACKAGE_PATH_NON_PORTABLE_CODE);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_root_resource_declaration_remains_accepted() {
+        let root = temporary_root("root-resource-compatibility");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='根资源兼容'\n版本='0.1.0'\n入口='src/主.yx'\n[资源]\n目录=['.']\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/主.yx"), "言 1；\n").unwrap();
+        fs::write(root.join("build/隐藏.txt"), "hidden\n").unwrap();
+        let archive = compile_application(&root, "release").unwrap();
+        assert!(archive.resources.contains_key("src/主.yx"));
+        assert!(!archive.resources.contains_key("build/隐藏.txt"));
+        assert!(!archive.resources.contains_key(package::LOCK_NAME));
+        let mut roots = package::TrustedPackageRoots::default();
+        roots.insert(&root).unwrap();
+        let listed = list_declared_resource_directory(Some(&root), &roots, ".").unwrap();
+        assert!(!listed.iter().any(|name| name == package::LOCK_NAME));
+        assert!(!listed.iter().any(|name| name == "build"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn application_entry_cannot_cross_into_an_undeclared_nested_package() {
+        let root = temporary_root("nested-entry-boundary");
+        let nested = root.join("packages/nested");
+        fs::create_dir_all(nested.join("src")).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='外层应用'\n版本='0.1.0'\n入口='packages/nested/src/主.yx'\n",
+        )
+        .unwrap();
+        fs::write(
+            nested.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='内层包'\n版本='0.1.0'\n入口='src/主.yx'\n",
+        )
+        .unwrap();
+        fs::write(nested.join("src/主.yx"), "言 42；\n").unwrap();
+
+        let error = compile_application(&root, "release").unwrap_err();
+        assert_eq!(error.code(), package::PACKAGE_MODULE_OUTSIDE_ROOT_CODE);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unicode_equivalent_nested_package_input_compiles_the_inner_application() {
+        let root = temporary_root("unicode-nested-application");
+        let nested = root.join("packages/é");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            root.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='外层应用'\n版本='0.1.0'\n入口='主.yx'\n",
+        )
+        .unwrap();
+        fs::write(root.join("主.yx"), "言「外层」；\n").unwrap();
+        fs::write(
+            nested.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='内层应用'\n版本='0.1.0'\n入口='主.yx'\n",
+        )
+        .unwrap();
+        fs::write(nested.join("主.yx"), "言「内层」；\n").unwrap();
+
+        let archive = compile_application(root.join("packages/e\u{301}"), "release").unwrap();
+        assert_eq!(archive.package.name, "内层应用");
+        assert_eq!(archive.entry_module, "app:主.yx");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_module_archive_path_uses_the_resolved_portable_file_name() {
+        let root = temporary_root("unicode-native-artifact");
+        let application = root.join("application");
+        let dependency = root.join("dependency");
+        let artifact_path = dependency.join("native/é.bin");
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        let bytes = b"native artifact";
+        fs::write(&artifact_path, bytes).unwrap();
+        fs::write(dependency.join("主.yx"), "公 定 值：数 为 1；\n").unwrap();
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let os = if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "linux") {
+            "linux"
+        } else {
+            std::env::consts::OS
+        };
+        fs::write(
+            dependency.join(package::MANIFEST_NAME),
+            format!(
+                "[包]\n格式=2\n名称='原生包'\n版本='1.0.0'\n入口='主.yx'\n\
+                 [原生]\nABI=2\n[原生.{os}.{}]\n文件='native/é.bin'\n校验和='{checksum}'\n",
+                std::env::consts::ARCH
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(&application).unwrap();
+        fs::write(application.join("主.yx"), "言 1；\n").unwrap();
+        fs::write(
+            application.join(package::MANIFEST_NAME),
+            "[包]\n格式=2\n名称='应用'\n版本='1.0.0'\n入口='主.yx'\n\
+             [依赖]\n原生包='../dependency'\n[权限]\n原生扩展=true\n",
+        )
+        .unwrap();
+        let manifest = package::load(application.join(package::MANIFEST_NAME)).unwrap();
+        let (graph, capabilities) =
+            package::resolve_graph_with_capabilities(&manifest, false).unwrap();
+
+        let modules = collect_native_modules(&graph, &capabilities).unwrap();
+        let module = modules.get("原生包").unwrap();
+        assert_eq!(module.file, format!("native/{checksum}/é.bin"));
+        assert_eq!(normalize_resource_key(&module.file).unwrap(), module.file);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

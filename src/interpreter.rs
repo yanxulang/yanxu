@@ -234,6 +234,14 @@ impl RuntimeError {
         }
     }
 
+    fn application(error: crate::application::ApplicationError) -> Self {
+        if error.code().starts_with("PACKAGE_") {
+            Self::coded(error.code(), error.diagnostic_message())
+        } else {
+            Self::new(error.to_string())
+        }
+    }
+
     fn network(error: crate::stdlib::NetworkError) -> Self {
         Self {
             code: error.code,
@@ -2119,14 +2127,13 @@ impl Interpreter {
             }
             GuardedNative::ResourceReadBytes | GuardedNative::ResourceReadText => {
                 let requested = string_argument(arguments, 0, "资源.读取")?;
-                let path = crate::application::resolve_declared_resource(
+                let bytes = crate::application::read_declared_resource_snapshot(
                     self.package_root.as_deref(),
+                    &self.package_module_roots,
                     requested,
+                    crate::stdlib::BYTES_MAX_VALUE_BYTES as u64,
                 )
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                let bytes = crate::stdlib::read_file_bytes(&path).map_err(|error| {
-                    RuntimeError::new(format!("不能读取资源“{requested}”：{error:?}"))
-                })?;
+                .map_err(RuntimeError::application)?;
                 if matches!(function, GuardedNative::ResourceReadBytes) {
                     Ok(Value::Bytes(Rc::new(bytes)))
                 } else {
@@ -2137,23 +2144,14 @@ impl Interpreter {
             }
             GuardedNative::ResourceList => {
                 let requested = string_argument(arguments, 0, "资源.目录")?;
-                let path = crate::application::resolve_declared_resource(
+                let entries = crate::application::list_declared_resource_directory(
                     self.package_root.as_deref(),
+                    &self.package_module_roots,
                     requested,
                 )
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                let mut entries = fs::read_dir(path)
-                    .map_err(|error| RuntimeError::new(error.to_string()))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                entries.sort_by_key(std::fs::DirEntry::file_name);
+                .map_err(RuntimeError::application)?;
                 Ok(Value::List(Rc::new(RefCell::new(
-                    entries
-                        .into_iter()
-                        .map(|entry| {
-                            Value::String(entry.file_name().to_string_lossy().into_owned())
-                        })
-                        .collect(),
+                    entries.into_iter().map(Value::String).collect(),
                 ))))
             }
         }

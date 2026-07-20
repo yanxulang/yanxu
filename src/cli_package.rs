@@ -102,7 +102,14 @@ pub(crate) fn package_run(path: &str, arguments: &[String]) -> ExitCode {
     if let Err(error) = yanxu::package::ensure_lock(&manifest, false) {
         return fail(error.to_string());
     }
-    let entry = manifest.root.join(&manifest.entry);
+    let entry = match yanxu::package::resolve_existing_package_path(
+        &manifest.root,
+        &manifest.entry,
+        yanxu::package::PackagePathPurpose::ModuleSource,
+    ) {
+        Ok(entry) => entry,
+        Err(error) => return fail(error.to_string()),
+    };
     let mut interpreter = Interpreter::with_permissions(manifest.permissions);
     match configured_budget() {
         Ok(Some(budget)) => interpreter.set_budget(budget),

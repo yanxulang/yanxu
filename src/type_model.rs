@@ -46,7 +46,8 @@ impl ModuleId {
             if let Ok(relative) = canonical.strip_prefix(&root) {
                 return Self::Package {
                     package: format!("{}@{}", manifest.name, manifest.version),
-                    module: portable_path(relative),
+                    module: crate::package::portable_package_path(relative)
+                        .unwrap_or_else(|_| portable_path(relative)),
                 };
             }
         }
