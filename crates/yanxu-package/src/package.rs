@@ -15669,7 +15669,7 @@ mod tests {
         }
 
         #[cfg(unix)]
-        let (mut exact, exact_bytes, exact_timeout) = {
+        let (mut exact, exact_bytes, exact_timeout, exact_root) = {
             let bytes = 128 * 1024;
             let mut command = Command::new("sh");
             command
@@ -15681,23 +15681,21 @@ mod tests {
                 .arg("bounded-stream-fixture")
                 .arg(bytes.to_string())
                 .arg(bytes.to_string());
-            (command, bytes, Duration::from_secs(5))
+            (command, bytes, Duration::from_secs(5), None::<PathBuf>)
         };
         #[cfg(windows)]
-        let (mut exact, exact_bytes, exact_timeout) = {
+        let (mut exact, exact_bytes, exact_timeout, exact_root) = {
             let bytes = 4 * 1024;
-            let mut command = Command::new("powershell");
+            let root = temp("subprocess-output-exact");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("stdout.bin"), vec![b'x'; bytes]).unwrap();
+            fs::write(root.join("stderr.bin"), vec![b'y'; bytes]).unwrap();
+            let mut command = Command::new("cmd");
             command
-                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-                .arg(format!(
-                    "$out = [Console]::OpenStandardOutput(); \
-                     $err = [Console]::OpenStandardError(); \
-                     $outBytes = [Text.Encoding]::ASCII.GetBytes(('x' * {bytes})); \
-                     $errBytes = [Text.Encoding]::ASCII.GetBytes(('y' * {bytes})); \
-                     $out.Write($outBytes, 0, $outBytes.Length); \
-                     $err.Write($errBytes, 0, $errBytes.Length)"
-                ));
-            (command, bytes, Duration::from_secs(15))
+                .args(["/D", "/Q", "/C"])
+                .arg("type stdout.bin & type stderr.bin 1>&2")
+                .current_dir(&root);
+            (command, bytes, Duration::from_secs(15), Some(root))
         };
         let exact = bounded_command_output(
             &mut exact,
@@ -15711,8 +15709,11 @@ mod tests {
                 disk: None,
                 cancellation: None,
             },
-        )
-        .unwrap();
+        );
+        if let Some(root) = exact_root {
+            fs::remove_dir_all(root).unwrap();
+        }
+        let exact = exact.unwrap();
         assert!(exact.status.success());
         assert_eq!(exact.stdout.len(), exact_bytes);
 
