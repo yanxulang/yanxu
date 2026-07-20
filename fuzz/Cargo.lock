@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "yanxu"
-version = "1.1.18"
+version = "1.1.19"
 dependencies = [
  "base64",
  "editpe",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "yanxu-package"
-version = "1.1.18"
+version = "1.1.19"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
