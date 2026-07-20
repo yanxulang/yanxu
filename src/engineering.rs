@@ -1059,19 +1059,22 @@ fn workspace(request: &Value) -> Result<Value, EngineeringError> {
 }
 
 #[cfg(test)]
+type WorkspaceAfterRootOpenHook = Box<dyn FnOnce() -> Result<(), EngineeringError>>;
+
+#[cfg(test)]
 thread_local! {
-    static WORKSPACE_AFTER_ROOT_OPEN_HOOK: std::cell::RefCell<
-        Option<Box<dyn FnOnce() -> Result<(), EngineeringError>>>
-    > = const { std::cell::RefCell::new(None) };
+    static WORKSPACE_AFTER_ROOT_OPEN_HOOK: std::cell::RefCell<Option<WorkspaceAfterRootOpenHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 fn run_workspace_after_root_open_hook() -> Result<(), EngineeringError> {
-    #[cfg(test)]
-    {
-        return WORKSPACE_AFTER_ROOT_OPEN_HOOK
-            .with(|hook| hook.borrow_mut().take().map_or(Ok(()), |hook| hook()));
-    }
-    #[cfg(not(test))]
+    WORKSPACE_AFTER_ROOT_OPEN_HOOK
+        .with(|hook| hook.borrow_mut().take().map_or(Ok(()), |hook| hook()))
+}
+
+#[cfg(not(test))]
+fn run_workspace_after_root_open_hook() -> Result<(), EngineeringError> {
     Ok(())
 }
 
