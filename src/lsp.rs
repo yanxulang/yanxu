@@ -1747,6 +1747,7 @@ mod tests {
         std::fs::write(&entry, "").unwrap();
         let manifest = crate::package::load(app.join(crate::package::MANIFEST_NAME)).unwrap();
         crate::package::ensure_lock(&manifest, false).unwrap();
+        let lock_before = std::fs::read(app.join(crate::package::LOCK_NAME)).unwrap();
         let uri = url::Url::from_file_path(&entry).unwrap().to_string();
 
         let alias_source = "引「包:工";
@@ -1800,6 +1801,10 @@ mod tests {
                 .unwrap()
                 .contains("锁文件与清单不一致")
         }));
+        assert_eq!(
+            std::fs::read(app.join(crate::package::LOCK_NAME)).unwrap(),
+            lock_before
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
