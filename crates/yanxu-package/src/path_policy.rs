@@ -1642,6 +1642,18 @@ impl TrustedPackageRoots {
         &self,
         requested_or_joined: &Path,
     ) -> Result<Option<PathBuf>, PackagePathError> {
+        self.resolve_existing_path(requested_or_joined, PackagePathPurpose::ModuleSource)
+            .map(|resolved| resolved.map(|(path, _)| path))
+    }
+
+    /// 在可信包根内逐组件绑定现有文件或目录，并返回实际可移植拼写和类型。
+    /// 返回的路径只可用于身份与诊断；读取和枚举仍须使用保存的根能力。
+    #[doc(hidden)]
+    pub fn resolve_existing_path(
+        &self,
+        requested_or_joined: &Path,
+        purpose: PackagePathPurpose,
+    ) -> Result<Option<(PathBuf, bool)>, PackagePathError> {
         if self.roots.is_empty() {
             return Ok(None);
         }
@@ -1654,17 +1666,11 @@ impl TrustedPackageRoots {
             .expect("matching root is a path prefix");
         #[cfg(not(target_os = "wasi"))]
         {
-            resolve_capability_package_path_from_root(
-                root,
-                relative,
-                PackagePathPurpose::ModuleSource,
-            )
-            .map(Some)
+            resolve_capability_package_path_from_root(root, relative, purpose).map(Some)
         }
         #[cfg(target_os = "wasi")]
         {
-            resolve_wasi_package_path_from_root(root, relative, PackagePathPurpose::ModuleSource)
-                .map(Some)
+            resolve_wasi_package_path_from_root(root, relative, purpose).map(Some)
         }
     }
 
@@ -2251,7 +2257,7 @@ fn resolve_wasi_package_path_from_root(
     root: TrustedRootMatch<'_>,
     relative: &Path,
     purpose: PackagePathPurpose,
-) -> Result<PathBuf, PackagePathError> {
+) -> Result<(PathBuf, bool), PackagePathError> {
     require_included_path(relative, purpose)?;
     let components = portable_relative_components(relative)?;
     let mut directory = root
@@ -2283,16 +2289,20 @@ fn resolve_wasi_package_path_from_root(
                 })?;
             continue;
         }
-        directory
-            .open_entry_nofollow(&entry)
-            .map_err(|error| PackagePathError {
-                code: PACKAGE_PATH_INVALID_CODE,
-                message: format!("不能安全绑定包路径“{}”：{error}。", relative.display()),
-                path: relative.to_path_buf(),
-                component: Some(component.clone()),
-                suggestion: "请确保路径没有被替换为链接或特殊文件。".into(),
-            })?;
-        return Ok(root.identity.join(resolved_relative));
+        let is_directory =
+            match directory
+                .open_entry_nofollow(&entry)
+                .map_err(|error| PackagePathError {
+                    code: PACKAGE_PATH_INVALID_CODE,
+                    message: format!("不能安全绑定包路径“{}”：{error}。", relative.display()),
+                    path: relative.to_path_buf(),
+                    component: Some(component.clone()),
+                    suggestion: "请确保路径没有被替换为链接或特殊文件。".into(),
+                })? {
+                WasiPackageEntry::Directory(_) => true,
+                WasiPackageEntry::File(_) => false,
+            };
+        return Ok((root.identity.join(resolved_relative), is_directory));
     }
     Err(invalid_path_error(relative, "包内路径不得为空"))
 }
@@ -2353,7 +2363,7 @@ fn resolve_capability_package_path_from_root(
     root: TrustedRootMatch<'_>,
     relative: &Path,
     purpose: PackagePathPurpose,
-) -> Result<PathBuf, PackagePathError> {
+) -> Result<(PathBuf, bool), PackagePathError> {
     require_included_path(relative, purpose)?;
     let components = portable_relative_components(relative)?;
     let mut directory = root
@@ -2373,8 +2383,18 @@ fn resolve_capability_package_path_from_root(
     for (index, component) in components.iter().enumerate() {
         let entry = select_capability_package_component(&directory, relative, component)?;
         resolved_relative.push(&entry.name);
-        if index + 1 < components.len() || entry.is_directory {
+        if index + 1 < components.len() {
             directory = open_capability_package_directory(
+                &directory,
+                &entry,
+                relative,
+                component,
+                &resolved_relative,
+            )?;
+            continue;
+        }
+        if entry.is_directory {
+            open_capability_package_directory(
                 &directory,
                 &entry,
                 relative,
@@ -2384,8 +2404,9 @@ fn resolve_capability_package_path_from_root(
         } else {
             open_capability_package_file(&directory, &entry, relative, component)?;
         }
+        return Ok((root.identity.join(resolved_relative), entry.is_directory));
     }
-    Ok(root.identity.join(resolved_relative))
+    Err(invalid_path_error(relative, "包内路径不得为空"))
 }
 
 #[cfg(not(target_os = "wasi"))]
