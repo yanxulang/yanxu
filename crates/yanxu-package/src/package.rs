@@ -1445,7 +1445,7 @@ where
     let _project_lock = acquire_project_lock(&manifest.root).map_err(E::from)?;
     let resolved = resolve_graph_mode_locked(manifest, offline, true, true).map_err(E::from)?;
     let graph = resolved.graph.clone();
-    cache_graph(manifest, resolved);
+    let _cache_scope = scoped_graph_cache(manifest, resolved);
     operation(graph)
 }
 
@@ -1463,7 +1463,7 @@ where
     let resolved = resolve_graph_mode_locked(manifest, offline, true, true).map_err(E::from)?;
     let graph = resolved.graph.clone();
     let capabilities = resolved.capabilities.clone();
-    cache_graph(manifest, resolved);
+    let _cache_scope = scoped_graph_cache(manifest, resolved);
     operation(graph, capabilities)
 }
 
@@ -1832,6 +1832,28 @@ fn cache_graph(manifest: &Manifest, resolved: ResolvedGraphBundle) {
         .lock()
         .expect("graph cache poisoned")
         .insert(graph_cache_key(&manifest.root), resolved);
+}
+
+struct ScopedGraphCache {
+    key: PathBuf,
+}
+
+impl Drop for ScopedGraphCache {
+    fn drop(&mut self) {
+        graph_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.key);
+    }
+}
+
+fn scoped_graph_cache(manifest: &Manifest, resolved: ResolvedGraphBundle) -> ScopedGraphCache {
+    let key = graph_cache_key(&manifest.root);
+    graph_cache()
+        .lock()
+        .expect("graph cache poisoned")
+        .insert(key.clone(), resolved);
+    ScopedGraphCache { key }
 }
 
 fn cached_or_resolve_graph(
@@ -10867,7 +10889,7 @@ mod tests {
     }
 
     #[test]
-    fn locked_build_cache_uses_one_key_for_relative_and_canonical_roots() {
+    fn locked_build_cache_uses_canonical_key_only_during_operation() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -10890,7 +10912,31 @@ mod tests {
             Ok::<_, ManifestError>(())
         })
         .unwrap();
-        fs::remove_dir_all(relative).ok();
+        assert!(
+            !graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .contains_key(&canonical)
+        );
+
+        let error = with_locked_resolution(&manifest, false, |_| {
+            assert!(
+                graph_cache()
+                    .lock()
+                    .expect("graph cache poisoned")
+                    .contains_key(&canonical)
+            );
+            Err::<(), _>(manifest_error(&manifest.path, None, "构建操作失败"))
+        })
+        .unwrap_err();
+        assert_eq!(error.message, "构建操作失败");
+        assert!(
+            !graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .contains_key(&canonical)
+        );
+        fs::remove_dir_all(relative).unwrap();
     }
 
     #[test]
