@@ -535,8 +535,8 @@ fn benchmark(iterations: usize) -> ExitCode {
 
 fn document_file(path: &str, output: Option<&str>) -> ExitCode {
     let input = Path::new(path);
-    let markdown = if fs::symlink_metadata(input).is_ok_and(|metadata| metadata.is_dir()) {
-        match yanxu::docgen::markdown_directory(input) {
+    let markdown = if let Some(directory) = document_directory(input) {
+        match yanxu::docgen::markdown_directory(directory) {
             Ok(markdown) => markdown,
             Err(error) => return fail(error),
         }
@@ -574,7 +574,7 @@ fn document_file(path: &str, output: Option<&str>) -> ExitCode {
 
 fn document_json(path: &str, output: Option<&str>) -> ExitCode {
     let input = Path::new(path);
-    if fs::symlink_metadata(input).is_ok_and(|metadata| metadata.is_dir()) {
+    if document_directory(input).is_some() {
         return fail("yanxu 文 --json 当前要求单个模块文卷");
     }
     let (canonical, _, statements) = match source_file(path) {
@@ -609,6 +609,32 @@ fn document_json(path: &str, output: Option<&str>) -> ExitCode {
         print!("{document}");
         ExitCode::SUCCESS
     }
+}
+
+fn document_directory(input: &Path) -> Option<PathBuf> {
+    match fs::symlink_metadata(input) {
+        Ok(metadata) => return metadata.is_dir().then(|| input.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+
+    let absolute = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        env::current_dir().ok()?.join(input)
+    };
+    let manifest = yanxu::package::discover(&absolute).ok()??;
+    let relative = absolute.strip_prefix(&manifest.root).ok()?;
+    let resolved = yanxu::package::resolve_existing_package_path(
+        &manifest.root,
+        relative,
+        yanxu::package::PackagePathPurpose::ManifestReference,
+    )
+    .ok()?;
+    fs::symlink_metadata(&resolved)
+        .ok()?
+        .is_dir()
+        .then_some(resolved)
 }
 
 fn source_file(path: &str) -> Result<(PathBuf, String, Vec<yanxu::ast::Stmt>), String> {
