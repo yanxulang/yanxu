@@ -1026,6 +1026,7 @@ pub fn resolve_native_dependency_scoped_with_opened_capabilities(
             error
         }
     })?;
+    let _cache_scope = resolution_cache_scope(&manifest.root);
     let offline = std::env::var_os("YANXU_OFFLINE").is_some();
     let resolved = cached_or_resolve_graph_read_only(&manifest, offline)?;
     let expected_application_root = opened_roots
@@ -1187,6 +1188,7 @@ fn resolve_dependency_scoped_with_capabilities_inner(
             )
         })?,
     };
+    let _cache_scope = resolution_cache_scope(&manifest.root);
     let offline = std::env::var_os("YANXU_OFFLINE").is_some();
     let resolved = if opened_roots.is_some() {
         cached_or_resolve_graph_read_only(&manifest, offline)?
@@ -1833,10 +1835,16 @@ fn graph_cache_key(root: &Path) -> PathBuf {
 }
 
 fn cache_graph(manifest: &Manifest, resolved: ResolvedGraphBundle) {
-    graph_cache()
+    let key = graph_cache_key(&manifest.root);
+    let scopes = graph_cache_scopes()
         .lock()
-        .expect("graph cache poisoned")
-        .insert(graph_cache_key(&manifest.root), resolved);
+        .unwrap_or_else(|error| error.into_inner());
+    if scopes.contains_key(&key) {
+        graph_cache()
+            .lock()
+            .expect("graph cache poisoned")
+            .insert(key, resolved);
+    }
 }
 
 /// 把依赖图缓存限制在一次顶层执行或构建操作内。
@@ -1887,10 +1895,7 @@ pub fn resolution_cache_scope(root: &Path) -> ResolutionCacheScope {
 
 fn scoped_graph_cache(manifest: &Manifest, resolved: ResolvedGraphBundle) -> ResolutionCacheScope {
     let scope = resolution_cache_scope(&manifest.root);
-    graph_cache()
-        .lock()
-        .expect("graph cache poisoned")
-        .insert(scope.key.clone(), resolved);
+    cache_graph(manifest, resolved);
     scope
 }
 
@@ -11074,6 +11079,29 @@ mod tests {
     }
 
     #[test]
+    fn unscoped_resolution_does_not_retain_open_capabilities() {
+        let root = temp("unscoped-resolution-cache");
+        write(
+            &root.join(MANIFEST_NAME),
+            "[包]\n格式=2\n名称='无作用域缓存'\n版本='1.0.0'\n入口='主.yx'\n",
+        );
+        write(&root.join("主.yx"), "言 1；\n");
+        let manifest = load(root.join(MANIFEST_NAME)).unwrap();
+        let key = graph_cache_key(&manifest.root);
+
+        ensure_lock(&manifest, false).unwrap();
+        assert!(
+            !graph_cache()
+                .lock()
+                .expect("graph cache poisoned")
+                .contains_key(&key)
+        );
+
+        drop(manifest);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cached_resolution_rejects_replaced_source_root_and_keeps_verified_generation() {
         let root = temp("resolution-root-replacement");
         let application = root.join("application");
@@ -11448,6 +11476,7 @@ mod tests {
         );
         write(&application.join("主.yx"), "言 1；\n");
         let manifest = load(&manifest_path).unwrap();
+        let _cache_scope = resolution_cache_scope(&manifest.root);
         ensure_lock(&manifest, false).unwrap();
         let key = graph_cache_key(&manifest.root);
         let initial_manifest_checksum = graph_cache()
