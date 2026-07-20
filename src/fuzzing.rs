@@ -108,6 +108,7 @@ mod tests {
     fn fixed_regression_seeds_do_not_panic() {
         for seed in [
             &b"\x00\xff\xe8"[..],
+            &b"(\0,);"[..],
             "异 法 求（）：数 则 归 1；终 言 候 求（）；".as_bytes(),
             "令 表 为 {「未闭」：【1，2；".as_bytes(),
             br#"{"format_version":999,"code":[]}"#,
