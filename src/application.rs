@@ -344,7 +344,7 @@ pub fn compile_application(
                 roots
                     .authorize_import(&canonical_root, &requested_entry, &entry, false)
                     .map_err(application_path_error)?;
-                let resources = collect_resources(&manifest, &roots)?;
+                let resources = collect_resources(&manifest, &roots, &canonical_root)?;
                 let lock_checksum = checksum_file(&manifest.root.join(package::LOCK_NAME)).ok();
                 let summary =
                     PermissionSummary::from_permissions(&manifest.permissions, &manifest.root);
@@ -714,17 +714,14 @@ fn compact_span_source(
 fn collect_resources(
     manifest: &Manifest,
     trusted_roots: &package::TrustedPackageRoots,
+    canonical_root: &Path,
 ) -> Result<BTreeMap<String, ApplicationResource>, ApplicationError> {
-    let canonical_root = trusted_roots
-        .matching_root(&manifest.root)
-        .ok_or_else(|| application_error("应用包根不属于解析阶段的已打开根能力"))?
-        .to_path_buf();
     let mut files = BTreeMap::new();
     let mut portable_paths = package::PortablePackagePaths::default();
     let mut scanned_entries = 0_usize;
     for resource in &manifest.resources {
         let (path, is_directory) = if resource == Path::new(".") {
-            (canonical_root.clone(), true)
+            (canonical_root.to_path_buf(), true)
         } else {
             package::package_path_decision(
                 resource,
@@ -741,7 +738,7 @@ fn collect_resources(
         };
         collect_resource_files(
             trusted_roots,
-            &canonical_root,
+            canonical_root,
             &path,
             is_directory,
             &mut files,
@@ -768,7 +765,7 @@ fn collect_resources(
         }
         collect_resource_files(
             trusted_roots,
-            &canonical_root,
+            canonical_root,
             &icon,
             false,
             &mut files,
